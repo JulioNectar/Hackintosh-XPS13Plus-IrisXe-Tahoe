@@ -8,7 +8,7 @@ log) on a different driver build.
 The fixes below are active with the boot-args shipped in `EFI/OC/config.plist`:
 
 ```
--vi2c-force-polling IGLogLevel=3 msgbuf=400000 -ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp
+IGLogLevel=3 msgbuf=400000 -ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp
 -ngreenv189 -ngreenkeepefi -ngreenxefix -ngreenfixbootmode amfi_get_out_of_my_way=1 ngreenSched=4 ngreenV142=3
 ngreenblmax=48000
 ```

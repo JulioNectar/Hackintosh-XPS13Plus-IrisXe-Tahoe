@@ -1,0 +1,11 @@
+diff --git a/VoodooGPIO/TigerLake-LP/VoodooGPIOTigerLakeLP.cpp b/VoodooGPIO/TigerLake-LP/VoodooGPIOTigerLakeLP.cpp
+index 5eae359..977a0b0 100644
+--- a/VoodooGPIO/TigerLake-LP/VoodooGPIOTigerLakeLP.cpp
++++ b/VoodooGPIO/TigerLake-LP/VoodooGPIOTigerLakeLP.cpp
+@@ -22,5 +22,5 @@ bool VoodooGPIOTigerLakeLP::start(IOService *provider) {
+ 
+     IOLog("%s::Loading GPIO Data for TigerLake-LP\n", getName());
+ 
+-    return VoodooGPIO::start(provider);
++    return VoodooGPIOIntel::start(provider);
+ }

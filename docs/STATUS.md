@@ -20,7 +20,7 @@
 | System Settings › Displays | can panic; mode switches sometimes go black until reboot | `tools/xe-res` |
 | Colour profile changes | selecting another profile (e.g. ITU-709) in Displays caused three page-fault panics in GPU memory management (`newResourceWithClientBuffer`, `orphanIt`/`releaseDescriptors`, `IGHardwarePageTable::commitRange`) | keep the factory profile (`tools/xe-perfil padrao` restores it) |
 | Brightness keys | the TGL framebuffer never writes the PWM duty | `xe-brilho` |
-| Trackpad | intermittent: I2C bus stuck ("Timeout waiting for bus not to be busy") in some boots | reboot |
+| Trackpad / touchscreen | fixed 2026-10-20: GPIO/APIC interrupts instead of forced polling (the I2C bus used to get stuck, "Timeout waiting for bus not to be busy") | — |
 | Hardware video decode/encode | off (XE-NOGVA) | software decode |
 | Extended range 10-bit (`w30r` / BGR10_XR) | not supported by the 16.0.32 Metal driver | — |
 | Small glitch on the lock-screen clock | cosmetic | — |

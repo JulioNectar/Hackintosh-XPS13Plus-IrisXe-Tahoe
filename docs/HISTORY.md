@@ -36,7 +36,7 @@ over about six days in October 2026.
 | GPU | Iris Xe, `8086:A7A0`: Xe-LP Gen12 "RPL-P", 96 EU in 6 DSS, display IP version 13 ("display 13"). Spoofed as Tiger Lake `9A49`. |
 | Panel | 3840×2400 eDP, 4-lane HBR3 |
 | macOS | Sequoia 15.8.1 for the first, self-written stack; Tahoe 26.7.1 (25G241) on an external SSD from 16 Oct; Tahoe clean-installed on the internal SSD on 20 Oct. The Sequoia install was used for most of the work to read Tahoe's logs after each test boot. |
-| Other kexts | itlwm + HeliPort (Wi-Fi, Intel AX211 CNVi), IntelBluetoothFirmware, VoodooI2C in polling mode (`-vi2c-force-polling`), WhateverGreen (still loading next to NootedGreen). |
+| Other kexts | itlwm + HeliPort (Wi-Fi, Intel AX211 CNVi), IntelBluetoothFirmware, VoodooI2C in polling mode (`-vi2c-force-polling`; replaced by GPIO interrupts on 2026-10-20), WhateverGreen (still loading next to NootedGreen). |
 | Constraint | Lilu/the kernel truncate boot-args at about **228 characters**. Debug arguments repeatedly had to be dropped to make room. |
 
 ## Timeline at a glance
@@ -1123,7 +1123,6 @@ NOGVA. Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2.
 
 ## Open items
 
-- Display does not wake after display sleep.
 - System Settings › Displays and colour-profile changes panic in GPU memory management; some mode switches go black
   until reboot.
 - "corrupt list" panic at shutdown (`IOAccelSysMemory::free → IOAccelOrphanedMemoryPool::addMemory`).
@@ -1131,6 +1130,6 @@ NOGVA. Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2.
   root-caused.
 - Video: Safari/VideoToolbox software decode with an output format (−6680); no hardware decode; Chrome's GPU path draws
   blank windows.
-- Brightness keys; intermittent trackpad; `w30r`/BGR10_XR; lock-screen clock glitch; Blit3D sampler-state tail beyond
+- Brightness keys; `w30r`/BGR10_XR; lock-screen clock glitch; Blit3D sampler-state tail beyond
   `0xd000`; a fixed 1100 MHz floor instead of a real governor; E-cores off.
 - MTL18 verification.

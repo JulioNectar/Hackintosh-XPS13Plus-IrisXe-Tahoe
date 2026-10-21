@@ -63,7 +63,7 @@ A feature marked "default ON" inside those hooks is therefore ON only when `-ngr
 - the bootmode route installation, keepefi, stride/xtile/max2560 and engine-inert.
 
 The release `config.plist` (`EFI/OC/config.plist`) uses these boot-args:
-`-vi2c-force-polling IGLogLevel=3 msgbuf=400000 -ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp -ngreenv189 -ngreenkeepefi -ngreenxefix -ngreenfixbootmode amfi_get_out_of_my_way=1 ngreenSched=4 ngreenV142=3 ngreenblmax=48000`.
+`IGLogLevel=3 msgbuf=400000 -ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp -ngreenv189 -ngreenkeepefi -ngreenxefix -ngreenfixbootmode amfi_get_out_of_my_way=1 ngreenSched=4 ngreenV142=3 ngreenblmax=48000`.
 
 ### 1.1 Display / framebuffer
 

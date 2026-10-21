@@ -24,7 +24,8 @@ the **E-cores disabled**. Change one setting at a time and keep a way to boot ba
 2. Generate an SMBIOS for **MacBookPro16,2** (e.g. with GenSMBIOS) and fill `PlatformInfo > Generic`
    (SystemSerialNumber, MLB, SystemUUID, ROM) in **both** `config.plist` and `config-install.plist`.
 3. `HfsPlus.efi` is not shipped (Apple binary): add it from acidanthera/OcBinaryData if you boot HFS+ installer media.
-4. USB ports are mapped for this laptop (USBToolBox + `UTBDefault.kext`), and the trackpad uses `SSDT-XPS-I2C`.
+4. USB ports are mapped for this laptop (USBToolBox + `UTBDefault.kext`), and the trackpad/touchscreen use `SSDT-XPS-I2C` (source in `acpi/`) with the patched
+   `VoodooGPIO` inside `VoodooI2C.kext` (rebuild it with `zsh build-voodoogpio.sh`), so they run on interrupts, not polling.
 
 ## 3. Install macOS
 
