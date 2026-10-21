@@ -1813,7 +1813,9 @@ private:
 	mach_vm_address_t oSetFramebufferPowerState {};
 	mach_vm_address_t oIGAccelResourcefree {};
 	static void wrapSetGTFrequencyMMIO(void *that, uint32_t val);
+	static void wrapWaitForGpuIdle(void *that);
 	mach_vm_address_t oSetGTFrequencyMMIO {};
+	mach_vm_address_t oWaitForGpuIdle {};
 	
 	static bool  initHardwareCaps(void *this_ptr);  // query HW capabilities
 	mach_vm_address_t oinitHardwareCaps {};

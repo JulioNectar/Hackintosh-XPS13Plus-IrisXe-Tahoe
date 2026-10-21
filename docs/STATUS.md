@@ -13,7 +13,8 @@
 
 | Problem | Details | Workaround |
 |---|---|---|
-| GPU hang in long sessions | after ~1 h or heavy browser work: gpuRestart → WindowServer watchdog → reboot | save often |
+| WindowServer hang | occasionally before login and on some UI-scale changes: a context left pending by the CSB guard → stuck stamp → watchdog. Fix in testing (csbresync) | reboot |
+| Slow shutdown / watchdog panic | fixed 2026-10-21 (XE-IDLEBOUND): shutdown no longer waits on a GPU that never goes idle | — |
 | Panic at shutdown | "corrupt list" in `IOAccelOrphanedMemoryPool` (release path) | none yet |
 | Safari video | VideoToolbox decode with an explicit output format → `-6680` | use Chrome (no GPU) |
 | Chrome with GPU on | blank windows (ANGLE/Metal) | `--disable-gpu --disable-gpu-compositing` |

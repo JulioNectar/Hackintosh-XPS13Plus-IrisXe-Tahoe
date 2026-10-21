@@ -8,6 +8,8 @@ The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
 
 | Date | Change | Status |
 |---|---|---|
+| 2026-10-21 | **XE-IDLEBOUND**: shutdown/restart no longer stalls. During shutdown WindowServer called `IGScheduler5::waitForGpuIdle` (up to 25000 × 100 µs) several times on a GPU with stuck stamps, until the watchdog panicked (~3.5 min). Now, once a wait runs ≥ 2 s, the waits of the next 30 s return at once. Same machine: ~11 s, no panic. `-ngreennoidlebound` disables | confirmed |
+| 2026-10-21 | **csbresync** (for the WindowServer hang before login / on UI-scale changes): CSB guard dropped a real active→idle event when a very short context finished before its idle→active bookkeeping, leaving the context pending forever. Before dropping, if the pending slot holds the same context, run the original `csbProcessIdleToActive` first. `-ngreennocsbresync` disables | testing |
 | 2026-10-21 | **XE-BLITALIGN v2**: only misaligned large copies go to the copy engine; aligned ones use the 3D blit again. Fixes the missing Chrome toolbar/page icons caused by v1 (confirmed by a boot with the patch off); screen recording and video conversions still pass | confirmed |
 | 2026-10-21 | AppleGVA `hwgva-id` is now the real board-id (was iMacPro1,1 from NootedRed, which makes AppleGVA accept only AMD plugins) and XE-GVAID (IOVARendererID 0x1080080 with `-ngreengva`) | testing |
 | 2026-10-21 | Hardware decode bring-up (WIP, off by default): `macos/vadriver/` patches the TGL VA plugin (device-id 9A49, VAME name, Tahoe bitstream request, unknown driver parameter, capability-node layout 0x430→0x438); install in `/Library/GPUBundles`. AppleGVA now creates the decoder up to the NV12 output surface. Tracer: `tools/diagnostics/xe-vatrace.c` | in progress |

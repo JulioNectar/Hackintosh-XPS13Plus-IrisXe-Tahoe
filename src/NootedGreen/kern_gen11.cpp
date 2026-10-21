@@ -352,6 +352,7 @@ static void xeDispStamp(void *that, int idx, uint32_t stamp) {
 static mach_vm_address_t gOrgS5Push = 0, gOrgS5Notify = 0, gOrgCs5Submit = 0, gOrgS5Pause = 0, gOrgS5Resume = 0;
 static volatile uint32_t gS5PushN = 0, gS5NotifyN = 0, gCs5SubmitN = 0, gS5PauseN = 0, gS5ResumeN = 0;
 static uint32_t gThrtN = 0, gThrtSimN = 0;
+static volatile uint32_t gCsbResyncN = 0;  // 21/10: active->idle salvos pelo xeCsbResync (CSBR)
 static volatile uint32_t gCsbSkipN = 0;  // 19/10: eventos active->idle descartados pelo xeCsbA2I
 // 20/10: brilho (PWM sul 0xC8254 período / 0xC8258 duty), estilo BacklightRegistersFix do WhateverGreen
 static volatile uint32_t gBlHwFreq = 0, gBlAppleFreq = 0, gBlLastDuty = 0, gBlMaxDuty = 0, gBlLastOut = 0, gBlFreqWrites = 0;
@@ -411,8 +412,8 @@ static void xeCsStateWorker(thread_call_param_t, thread_call_param_t) {
 			  c[0x1c00], *reinterpret_cast<volatile uint32_t *>(c + 0x1c38), c[0x1c3c]);
 	}
 	if (gAccelObj && tick % 8 == 0)
-		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u dpms=%u fbdpms=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
-			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeDpmsBlocked, gXeFbDpmsN, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut);
+		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u csbr=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u dpms=%u fbdpms=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
+			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gCsbResyncN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeDpmsBlocked, gXeFbDpmsN, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut);
 	if (tick < 2400 && gCsStateTc) {  // a cada 250 ms por ~10 min
 		uint64_t deadline;
 		clock_interval_to_deadline(250, kMillisecondScale, &deadline);
@@ -694,8 +695,37 @@ static bool xeCsbEventoInvalido(void *that, const uint32_t *e, bool exigeEl1, ui
 	}
 	return false;
 }
+// xe/csbresync (21/10): hang do WindowServer (antes do login e após troca de modo/DPI). Em todo travamento o
+// CSBX descartou o "active->idle" REAL de um contexto curto (~200 us após o EXEC): o "idle->active" correspondente
+// não foi processado, então o elemento ficou no slot pendente (1-cur) e EL[cur] estava vazio. Descartar deixa a
+// execlist "ocupada" para sempre com a GPU ociosa (EXECLIST_STATUS 0x18001): o stamp nunca anda, o IOAF chama
+// eventTimeout -> checkForProgress (3,3 s) -> getActiveContexts vazio -> "GPURestartSkipped / no channel" a cada 5 s.
+// Em vez de descartar: se EL[cur] está vazio e o slot pendente tem exatamente esse contexto, sintetiza o
+// idle->active que faltou (csbProcessIdleToActive original: troca cur e limpa o slot velho) e processa o evento.
+// Eventos realmente repetidos/atrasados (nenhum slot bate) continuam descartados. -ngreennocsbresync desliga.
+static mach_vm_address_t gOrgCsbI2A = 0;  // só resolvido, não roteado
+static bool xeCsbResync(void *that, const uint32_t *e) {
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennocsbresync") ? 0 : 1;
+	if (on != 1 || !gOrgCsbI2A || !that || !e) return false;
+	auto *cs = static_cast<uint8_t *>(that);
+	uint32_t idx = *reinterpret_cast<uint32_t *>(cs + 0x50);
+	if (idx > 1) return false;
+	uint32_t pend = 1 - idx;
+	auto *elCur = *reinterpret_cast<uint8_t **>(cs + 0x30 + (uint64_t)idx * 16);
+	auto *elPend = *reinterpret_cast<uint8_t **>(cs + 0x30 + (uint64_t)pend * 16);
+	auto *ctxPend = elPend ? *reinterpret_cast<uint8_t **>(elPend) : nullptr;
+	uint32_t id = (e[1] >> 5) & 0x7ff;
+	if (elCur || !ctxPend || *reinterpret_cast<uint32_t *>(ctxPend + 0x7c) != id) return false;
+	reinterpret_cast<void (*)(void *, const uint32_t *)>(gOrgCsbI2A)(that, e);  // não lê 'e'; cur := pend
+	xeEv('CSBR', idx, id, ++gCsbResyncN);
+	return true;
+}
 static void xeCsbA2I(void *that, const uint32_t *e) {
-	if (xeCsbEventoInvalido(that, e, false, 'CSBX')) return;
+	if (xeCsbEventoInvalido(that, e, false, 'CSBX')) {
+		if (!xeCsbResync(that, e)) return;
+		if (xeCsbEventoInvalido(that, e, false, 'CSBY')) return;  // não deveria acontecer
+	}
 	FunctionCast(xeCsbA2I, gOrgCsbA2I)(that, e);
 }
 static void xeCsbPreempt(void *that, const uint32_t *e) {
@@ -1788,6 +1818,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 {"__ZN15IGAccelResource4freeEv", IGAccelResourcefree, this->oIGAccelResourcefree},
 			 // 20/10 (XE-GTFREQ): sem GuC o pedido de frequência da Apple é sempre 0 -> GPU presa em 100 MHz.
 			 {"__ZN26IGHardwareCommandStreamer518setGTFrequencyMMIOEj", wrapSetGTFrequencyMMIO, this->oSetGTFrequencyMMIO},
+			 // 21/10 (XE-IDLEBOUND): IGScheduler5::waitForGpuIdle (stopGraphicsEngine no desligamento) espera até 25000 x 100 us.
+			 {"__ZN12IGScheduler514waitForGpuIdleEv", wrapWaitForGpuIdle, this->oWaitForGpuIdle},
 			 // V143: Register operator new for IGHardwareBlit3DContext so getBlit3DContext can
 			 // actually allocate the context object. Without this, oIGHardwareBlit3DContextoperatornew
 			 // is always null → alloc always returns nullptr → ctx=0 forever → NULL-task submitBlit
@@ -1883,6 +1915,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{"__ZN17IGHardwareContext20restoreFromSafeImageEv", xeRestoreSafe, gOrgRestoreSafe},
 			};
 			SolveRequestPlus poshSolve[] = {{"__ZNK20IGSharedMappedBuffer17getVirtualAddressEv", gSmbGetVA}};
+			SolveRequestPlus csbI2ASolve[] = {{"__ZN26IGHardwareCommandStreamer522csbProcessIdleToActiveEPK28SGfxContextStatusBufferEntry", gOrgCsbI2A}};
+			if (!SolveRequestPlus::solveAll(patcher, index, csbI2ASolve, address, size)) { patcher.clearError(); gOrgCsbI2A = 0; }
+			IOLog("XeNG CSBRESYNC: idleToActive=%s\n", gOrgCsbI2A ? "ok" : "NAO");
 			gPmapFindPhys = patcher.solveSymbol(KernelPatcher::KernelID, "_pmap_find_phys");
 			if (!gPmapFindPhys) patcher.clearError();
 			gKernelPmap = patcher.solveSymbol(KernelPatcher::KernelID, "_kernel_pmap");
@@ -6515,6 +6550,26 @@ void Gen11::wrapSetGTFrequencyMMIO(void *that, uint32_t val)
 		if (ratio < piso) val = piso << 23;
 	}
 	FunctionCast(wrapSetGTFrequencyMMIO, callback->oSetGTFrequencyMMIO)(that, val);
+}
+
+// 21/10 (XE-IDLEBOUND): desligamentos de 60 a 185 s (e o pânico do watchdog): o WindowServer fica em CGXShutdownDisplays ->
+// IOFBSetDisplayModeAndDepth -> IntelAccelerator::stopGraphicsEngine -> IGScheduler5::waitForGpuIdle (até 25000 x 100 us),
+// chamado várias vezes, com stamps que nunca retornam. Se uma espera esgota (>= 2 s), as esperas dos próximos 30 s
+// retornam na hora (a marca expira, para não afetar o uso normal). -ngreennoidlebound desliga.
+static volatile uint64_t gXeWedgedUntil = 0; static volatile uint32_t gXeIdleSkips = 0;
+void Gen11::wrapWaitForGpuIdle(void *that)
+{
+	static int off = -1;
+	if (off < 0) off = checkKernelArgument("-ngreennoidlebound") ? 1 : 0;
+	uint64_t now = mach_absolute_time();
+	if (!off && now < gXeWedgedUntil) { gXeIdleSkips++; return; }
+	FunctionCast(wrapWaitForGpuIdle, callback->oWaitForGpuIdle)(that);
+	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - now, &ns);
+	if (ns >= 2000000000ULL) {
+		uint64_t d = 0; nanoseconds_to_absolutetime(30ULL * 1000000000ULL, &d);
+		gXeWedgedUntil = mach_absolute_time() + d;
+		SYSLOG("ngreen", "XE-IDLEBOUND: waitForGpuIdle levou %llu ms; esperas puladas por 30 s", ns / 1000000ULL);
+	}
 }
 
 // 20/10 (XE-FBDPMS): a tela não acordava do repouso. AppleIntelFramebuffer::setFramebufferPowerState(state) (2=Wake,

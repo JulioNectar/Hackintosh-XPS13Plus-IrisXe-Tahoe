@@ -29,7 +29,8 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | Hardware video decode (H.264/HEVC) | 🚧 in progress (off by default; video plays decoded on the CPU) — see [docs/STATUS.md](docs/STATUS.md) |
 | Brightness keys | ❌ use `tools/xe-brilho` |
 | System Settings › Displays | ⚠️ may panic, change resolution with `tools/xe-res` |
-| WindowServer hang | ⚠️ occasionally before login, and sometimes when changing the UI scale (reboot recovers) |
+| Shutdown / restart | ✅ fast (XE-IDLEBOUND; used to stall ~3 min and panic) |
+| WindowServer hang | ⚠️ occasionally before login, and sometimes when changing the UI scale (reboot recovers); fix in testing (csbresync) |
 
 Everything else about the laptop (Wi-Fi via itlwm/HeliPort, Bluetooth, keyboard/trackpad/touchscreen via VoodooI2C, NVMe, battery) is a regular OpenCore setup. Internal audio (SoundWire RT714/RT1316) and the camera do **not** work on macOS.
 

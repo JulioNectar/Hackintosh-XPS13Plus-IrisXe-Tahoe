@@ -39,6 +39,8 @@ The GuC firmware is disabled (`-disablegfxfirmware`), so the driver runs its hos
 | Patch | Problem | Fix | Disable |
 |---|---|---|---|
 | CSB guard | "EL[0] was invalidated" panics: context-switch events for a context that was already replaced | skip CSB events whose context ID doesn't match | `-ngreennocsbguard` |
+| csbresync | WindowServer hang: CSB guard dropped a real active→idle event for a context still in the pending slot (finished before its idle→active was processed) → stuck stamp → watchdog | run the original `csbProcessIdleToActive` for that context, then let the event through | `-ngreennocsbresync` |
+| XE-IDLEBOUND | slow shutdown / watchdog panic: `IGScheduler5::waitForGpuIdle` waits up to 2.5 s each time on a GPU that never idles | after one wait ≥ 2 s, skip the waits of the next 30 s | `-ngreennoidlebound` |
 | SAMETAIL | the same context resubmitted with the same tail confused the execlist state | mark it as a lite restore | `-ngreennosametail` |
 | ELSQ idle wait | submissions while the ELSP was busy | wait up to 5 ms for idle | `-ngreennoelsqidle` |
 | XE-NOPOSH | RPL has no POSH pipe | clear the POSH bit in `MI_BATCH_BUFFER_START` | opt-in `-ngreennoposh` |
