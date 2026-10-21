@@ -27,7 +27,7 @@
 | Internal audio / camera | SoundWire audio (RT714/RT1316) and the camera have no macOS driver | Bluetooth / USB audio, BlackHole for apps that need an output |
 | Extended range 10-bit (`w30r` / BGR10_XR) | not supported by the 16.0.32 Metal driver | — |
 | Small glitch on the lock-screen clock | cosmetic | — |
-| Chrome UI broken when it starts with a GPU disk cache | toolbar icons missing, Google logo drawn as a bar. First launch with empty caches is correct; the next launch, which loads the pipelines Chrome cached (Graphite/Dawn), is broken. Root cause under investigation (loading cached pipelines through the 16.0.32 Metal driver/libxedrv) | `zsh tools/xe-chrome-limpa.sh`, then lock the cache folders with `chflags uchg` so Chrome always compiles |
+| Chrome UI broken when it starts with a GPU disk cache | toolbar icons missing, `border-radius` ignored, Google logo drawn as a bar. **Cause found (21/10):** not the cache itself but a race in the 16.0.32 Metal driver's blits: a `fillBuffer`/aligned copy (2D blit path) is not ordered before later 3D work in the same command buffer, so Dawn's zero-fill overwrote Graphite's static index buffer after the upload (it stayed all zero; per-launch race, almost always lost when the cache makes startup faster). **Fix: libxedrv v16** routes every buffer fill/copy through the 3D path ([METAL.md](METAL.md) §3 item 6); test Chrome profile: 12/12 launches correct with v16 vs 2/12 without. Needs installing (sudo) | until v16 is installed: `zsh tools/xe-chrome-limpa.sh` + `chflags uchg` on the cache folders (only lowers the odds) |
 | Transition glitch | a brief wrong frame when going from the login screen to the desktop and during UI-scale changes (`xe-res`) | cosmetic |
 
 ## E-cores

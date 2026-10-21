@@ -4,7 +4,7 @@ Everything here is built by `macos/build-all.sh` from Apple's 16.0.32 bundles pl
 installed by `macos/install-macos.sh`.
 
 **Version history.** The Metal driver went through builds v1–v12 and MTL13–MTL17 (18–19 Oct); **MTL18** (20 Oct, in
-test) is MTL17 with two bytes restored — see the L3 row below. libxedrv went through v7–v15 and the LLVM bridge through
+test) is MTL17 with two bytes restored — see the L3 row below. libxedrv went through v7–v16 and the LLVM bridge through
 v1–v2. Every build, with its evidence and result, is in [HISTORY.md](HISTORY.md) and [CATALOG.md](CATALOG.md) §4;
 abandoned approaches are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
@@ -66,8 +66,26 @@ An ObjC dylib loaded into every Metal client (WindowServer included) by the driv
    **copies** the pixels. The caller's deallocator still runs when the texture is released.
 5. **Diagnostics**: per-process log in `/tmp/xedrv-<process>.log` with texture formats, pipeline failures and the
    crash handler. Lines are throttled.
+6. **Buffer writes on the 3D blit path (v16, the Chrome fix)**: the driver runs `copyFromBuffer:toBuffer:` and
+   `fillBuffer:` on one of two paths, chosen by `IGBL::shouldUse2DBlit` (driver `+0x8bf48`): the **2D** path (blitter
+   commands in their own segment of the command buffer) for fills and for copies where
+   `(srcOffset - dstOffset) % 64 == 0`, and the **3D** path (shader copy) for the other copies. On this system 3D work
+   in a command buffer does **not** wait for earlier 2D writes in the *same* command buffer: a fill or aligned copy
+   followed by a misaligned copy or a draw that reads the buffer races (fill→misaligned copy 11–17/20 wrong, aligned
+   copy→draw 17/20 wrong; across separate command buffers it is fine). Dawn zero-fills every new buffer with
+   `fillBuffer` and then uploads Graphite's static vertex/index data with mostly misaligned copies in the same blit
+   encoder, so the zero fill often landed last: the static **index buffer stayed all zero** and every rounded rect,
+   path and stroke drew nothing (missing toolbar icons, `border-radius` ignored, the Google logo as a bar). It was a
+   per-launch race; with a populated cache Chrome starts faster and lost it almost every time, which is why it looked
+   cache-related. v16 never writes buffers on the 2D path: `fillBuffer:range:value:` (and `pattern4:`) becomes a copy
+   from a shared pattern buffer with a relative offset of 4, and an aligned buffer→buffer copy becomes two misaligned
+   copies through a pooled temporary buffer (`src → tmp[(so+4)%64] → dst`). Everything then runs on the 3D path, which
+   is ordered. Tests: `~/xe/build/chromecache/tests` (`fillcopy`, `paths`, `fcoff`, `blitrender`, `bigcopy`).
+   The underlying 2D↔3D segment fence is a kernel-side gap (BCS/RCS sync) and still applies to 2D texture blits,
+   which have not been seen to fail.
 
-Environment switches: `XE_COMPRESSAO=1` keeps compression, `XE_NOCOPY_ZERO=1` disables fix 4.
+Environment switches: `XE_COMPRESSAO=1` keeps compression, `XE_NOCOPY_ZERO=1` disables fix 4, `XE_FILL_NATIVO=1`
+disables fix 6, `XE_COPIA_NATIVA=1` keeps aligned buffer copies on the 2D path (fills stay fixed).
 
 ## 4. Shader compiler (xe.bundle)
 
@@ -114,3 +132,4 @@ has it, the TGL one doesn't; without it HEVC fails with `-12906`). Safari can't 
 - Hardware video decode needs `-ngreengva` and the plugin above (section 5); Safari still decodes on the CPU, and
   hardware encode is untested. Without `-ngreengva` (XE-NOGVA) VideoToolbox decodes and converts in software.
 - Chrome's own GPU path (ANGLE/Metal) draws blank windows.
+- Chrome (Graphite/Dawn) rendering with a populated GPU cache: fixed in libxedrv v16 (item 6 above).

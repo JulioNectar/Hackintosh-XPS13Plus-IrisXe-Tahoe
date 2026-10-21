@@ -1,4 +1,4 @@
-// libxedrv v8 — injetado no driver Metal TGL 16.0.32 (LC_LOAD_DYLIB). Adapta o driver (era Big Sur) ao Metal do Tahoe 25G241.
+// libxedrv v16 — injetado no driver Metal TGL 16.0.32 (LC_LOAD_DYLIB). Adapta o driver (era Big Sur) ao Metal do Tahoe 25G241. v16: escritas em buffer pelo caminho 3D (ver "v16").
 // Mudanças em relação à v7 (xe/build/llvm-bridge/xedrv.m), comparando com o adaptador do IntelIGPU-Tahoe (25G83) e com o layout medido:
 //  1. _descriptorPrivate: o deslocamento de 0x10 começa em 0xa8 (o driver antigo também tem shaderValidation em 0xa0; a v7 punha
 //     textureWriteRoundingMode ali). Layout antigo lido da codificação de tipo do próprio driver:
@@ -33,7 +33,7 @@ static FILE* g_logf;
 static void xe_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void xe_log(const char* fmt, ...) {
   char b[1024]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
-  syslog(LOG_ERR, "xedrv15: %s", b);
+  syslog(LOG_ERR, "xedrv16: %s", b);
   if (!g_logf) { char p[256]; snprintf(p, sizeof p, "/tmp/xedrv-%s.log", getprogname()); g_logf = fopen(p, "a"); if (g_logf) setvbuf(g_logf, NULL, _IOLBF, 0); }
   if (g_logf) fprintf(g_logf, "%ld %s\n", (long)time(NULL), b);
 }
@@ -437,19 +437,126 @@ static void install_nocopyfix(void) {
   g_nc4 = troca(k, "newTiledTextureWithBytesNoCopy:length:deallocator:descriptor:offset:bytesPerRow:", (IMP)w_nc4);
   LOG("nocopyfix: %d %d", !!g_nc3, !!g_nc4);
 }
+// v16 (21/10): CHROME SEM ÍCONES / LOGO COMO BARRA. No driver 16.0.32 o copyFromBuffer:toBuffer: e o fillBuffer usam dois
+// caminhos (IGBL::shouldUse2DBlit, driver+0x8bf48): "2D" (comandos do blitter, segmento próprio do command buffer) quando
+// (srcOffset - dstOffset) % 64 == 0 e para fills; "3D" (cópia por shader) quando o deslocamento relativo não é múltiplo de 64.
+// Neste sistema o trabalho 3D de um command buffer NÃO espera as escritas 2D anteriores do MESMO command buffer (a
+// sincronização entre segmentos não funciona): fill/cópia alinhada seguidos de cópia desalinhada ou render -> corrida.
+// O Dawn (Chrome/Graphite) zera cada buffer novo com fillBuffer e logo depois sobe os dados com cópias quase todas
+// desalinhadas no mesmo encoder: o zero chegava DEPOIS e o index buffer estático do Graphite ficava zerado -> rrects,
+// paths e ícones sumiam (por processo, ao acaso; com cache cheio o Chrome inicia mais rápido e perde quase sempre).
+// Correção: nenhuma escrita em buffer usa mais o caminho 2D. fillBuffer vira cópia de um buffer-padrão (compartilhado) com
+// deslocamento relativo 4, e a cópia alinhada vira duas cópias desalinhadas por um temporário (abaixo); tudo no caminho 3D,
+// que fica em ordem com as cópias e renders seguintes. Provas: ~/xe/build/chromecache/tests (fillcopy, paths, fcoff,
+// blitrender). XE_FILL_NATIVO=1 desliga tudo; XE_COPIA_NATIVA=1 desliga só a parte das cópias. A causa de fundo (fence
+// entre segmentos 2D/3D) é do lado do kernel e continua lá para cópias buffer<->textura pelo caminho 2D (não vistas falhar).
+#define XE_PAT_LEN 65536
+static IMP g_fill, g_fill4, g_b2b; static long g_fill_n;
+static Class g_igblit;
+static const void* kXePat = &kXePat;
+static pthread_mutex_t g_patm = PTHREAD_MUTEX_INITIALIZER;
+static id<MTLBuffer> xe_pattern(id<MTLDevice> dev, uint32_t pat4) {
+  pthread_mutex_lock(&g_patm);
+  NSMutableDictionary* m = objc_getAssociatedObject(dev, kXePat);
+  if (!m) { m = [NSMutableDictionary dictionary]; objc_setAssociatedObject(dev, kXePat, m, OBJC_ASSOCIATION_RETAIN); }
+  id<MTLBuffer> b = m[@(pat4)];
+  if (!b) {
+    b = [dev newBufferWithLength:XE_PAT_LEN + 64 options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+    if (b) { uint32_t* p = (uint32_t*)b.contents; for (NSUInteger i = 0; i < (XE_PAT_LEN + 64) / 4; i++) p[i] = pat4; m[@(pat4)] = b; [b release]; }
+  }
+  pthread_mutex_unlock(&g_patm);
+  return b;
+}
+static BOOL xe_fill_as_copy(id enc, id<MTLBuffer> buf, NSRange r, uint32_t pat4) {
+  if (!g_b2b || !buf || !r.length || ![enc isKindOfClass:g_igblit]) return NO;
+  id<MTLBuffer> p = xe_pattern(buf.device, pat4); if (!p) return NO;
+  SEL cs = sel_registerName("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:");
+  for (NSUInteger off = 0; off < r.length; off += XE_PAT_LEN) {
+    NSUInteger dst = r.location + off, n = MIN((NSUInteger)XE_PAT_LEN, r.length - off), so = (dst + 4) & 63;   // (so - dst) % 64 == 4
+    ((void(*)(id, SEL, id, NSUInteger, id, NSUInteger, NSUInteger))g_b2b)(enc, cs, p, so, buf, dst, n);
+  }
+  long k = __sync_add_and_fetch(&g_fill_n, 1);
+  if (k <= 3 || (k & (k - 1)) == 0) LOG("FILL buffer len=%lu range=%lu+%lu padrão=%08x -> cópia (caminho 3D) (n=%ld)", (unsigned long)buf.length,
+      (unsigned long)r.location, (unsigned long)r.length, pat4, k);
+  return YES;
+}
+static void w_fill(id s, SEL c, id<MTLBuffer> b, NSRange r, uint8_t v) {
+  if (xe_fill_as_copy(s, b, r, v * 0x01010101u)) return;
+  ((void(*)(id, SEL, id, NSRange, uint8_t))g_fill)(s, c, b, r, v); }
+static void w_fill4(id s, SEL c, id<MTLBuffer> b, NSRange r, uint32_t v) {
+  if (!(r.location & 3) && !(r.length & 3) && xe_fill_as_copy(s, b, r, v)) return;
+  ((void(*)(id, SEL, id, NSRange, uint32_t))g_fill4)(s, c, b, r, v); }
+// Cópia ALINHADA buffer->buffer (caminho 2D) vira duas cópias desalinhadas (caminho 3D) por um buffer temporário:
+// src -> tmp[t] -> dst com t = (so + 4) % 64, assim (so - t) % 64 = 60 e (t - do) % 64 = 4. Tudo no caminho 3D fica em
+// ordem (3D->3D e 3D->render testados). O temporário vem de um pool por device e volta ao pool quando o command buffer
+// termina (addCompletedHandler). XE_COPIA_NATIVA=1 desliga só esta parte.
+#define XE_TMP_SMALL (65536 + 128)
+#define XE_TMP_BIG ((4u << 20) + 128)
+static int g_copia_nativa; static long g_b2b_n;
+static const void* kXeTmp = &kXeTmp;
+static id<MTLBuffer> xe_tmp_get(id<MTLDevice> dev, NSUInteger need) {
+  NSUInteger sz = need <= XE_TMP_SMALL ? XE_TMP_SMALL : XE_TMP_BIG;
+  id<MTLBuffer> b = nil;
+  pthread_mutex_lock(&g_patm);
+  NSMutableArray* pool = objc_getAssociatedObject(dev, kXeTmp);
+  if (!pool) { pool = [NSMutableArray array]; objc_setAssociatedObject(dev, kXeTmp, pool, OBJC_ASSOCIATION_RETAIN); }
+  for (NSUInteger i = 0; i < pool.count; i++) if ([pool[i] length] == sz) { b = [pool[i] retain]; [pool removeObjectAtIndex:i]; break; }
+  pthread_mutex_unlock(&g_patm);
+  if (!b) b = [dev newBufferWithLength:sz options:MTLResourceStorageModePrivate];
+  return b;   // +1
+}
+static void xe_tmp_put(id<MTLDevice> dev, id<MTLBuffer> b) {
+  pthread_mutex_lock(&g_patm);
+  NSMutableArray* pool = objc_getAssociatedObject(dev, kXeTmp);
+  if (pool && pool.count < 8) [pool addObject:b];
+  pthread_mutex_unlock(&g_patm);
+}
+static void w_b2b(id s, SEL c, id<MTLBuffer> src, NSUInteger so, id<MTLBuffer> dst, NSUInteger dof, NSUInteger n) {
+  typedef void (*CP)(id, SEL, id, NSUInteger, id, NSUInteger, NSUInteger);
+  if (g_copia_nativa || !n || ((so - dof) & 63) || !src || !dst || ![s isKindOfClass:g_igblit]) { ((CP)g_b2b)(s, c, src, so, dst, dof, n); return; }
+  id<MTLCommandBuffer> cb = [s respondsToSelector:@selector(commandBuffer)] ? ((id(*)(id, SEL))objc_msgSend)(s, @selector(commandBuffer)) : nil;
+  id<MTLDevice> dev = dst.device;
+  NSUInteger chunk = n <= XE_TMP_SMALL - 128 ? n : (XE_TMP_BIG - 128);
+  id<MTLBuffer> tmp = cb ? xe_tmp_get(dev, chunk + 128) : nil;
+  if (!tmp) { ((CP)g_b2b)(s, c, src, so, dst, dof, n); return; }
+  for (NSUInteger off = 0; off < n; off += chunk) {
+    NSUInteger k = MIN(chunk, n - off), t = (so + off + 4) & 63;
+    ((CP)g_b2b)(s, c, src, so + off, tmp, t, k);
+    ((CP)g_b2b)(s, c, tmp, t, dst, dof + off, k);
+  }
+  [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { xe_tmp_put(dev, tmp); [tmp release]; }];
+  long q = __sync_add_and_fetch(&g_b2b_n, 1);
+  if (q <= 3 || (q & (q - 1)) == 0) LOG("COPIA alinhada %lu bytes (%lu->%lu) -> 2 cópias pelo caminho 3D (n=%ld)", (unsigned long)n, (unsigned long)so, (unsigned long)dof, q);
+}
+static void install_fillfix(void) {
+  if (getenv("XE_FILL_NATIVO")) { LOG("fillfix desligado (XE_FILL_NATIVO)"); g_fill = (IMP)1; return; }
+  Class k = objc_getClass("MTLIGAccelBlitCommandEncoder"), io = objc_getClass("MTLIOAccelBlitCommandEncoder");
+  Method cm = k ? class_getInstanceMethod(k, sel_registerName("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:")) : NULL;
+  if (!cm) return;
+  static int done; if (done) return; done = 1;
+  g_igblit = k; g_b2b = method_getImplementation(cm);
+  g_fill = troca(k, "fillBuffer:range:value:", (IMP)w_fill);
+  if (io) g_fill4 = troca(io, "fillBuffer:range:pattern4:", (IMP)w_fill4);
+  g_copia_nativa = getenv("XE_COPIA_NATIVA") != NULL;
+  method_setImplementation(cm, (IMP)w_b2b);
+  LOG("fillfix: fill=%d fill4=%d cópia2D->3D=%d", !!g_fill, !!g_fill4, !g_copia_nativa);
+  if (!g_fill) g_fill = (IMP)1;   // sem o método: não tentar de novo
+}
+
 // fallback: só se algo não existia no constructor (não deveria acontecer: o Metal é carregado antes do driver)
 static void* late(void* a) {
   int e = 0, p = 0, r = 0;
-  for (int t = 0; t < 20000 && !(e && p && r && g_tex_dev); t++) {
+  for (int t = 0; t < 20000 && !(e && p && r && g_tex_dev && g_fill); t++) {
     if (!e) e = install_entries(); if (!p) p = install_pd(); if (!r) r = install_rhm();
     if (!g_tex_dev && objc_getClass("MTLIGAccelDevice")) install_nocomp();
     if (!g_nc3 && objc_getClass("MTLIOAccelDevice")) install_nocopyfix();
-    if (!(e && p && r && g_tex_dev)) usleep(500);
+    if (!g_fill && objc_getClass("MTLIGAccelBlitCommandEncoder")) install_fillfix();
+    if (!(e && p && r && g_tex_dev && g_fill)) usleep(500);
   }
   LOG("instalação tardia: entries=%d pd=%d rhm=%d", e, p, r);
   return NULL;
 }
-__attribute__((constructor)) static void xedrv15_init(void) {
+__attribute__((constructor)) static void xedrv16_init(void) {
 #ifdef SO_PIPELOG
   install_pipelog(); return;
 #endif
@@ -457,7 +564,8 @@ __attribute__((constructor)) static void xedrv15_init(void) {
   install_nocomp();
   install_pipelog();
   install_nocopyfix();
+  install_fillfix();
   int e = install_entries(), p = install_pd(), r = install_rhm();
   LOG("carregada em %s[%d]: entries=%d pd=%d rhm=%d layout=%d lab=%d", getprogname(), getpid(), e, p, r, g_layout_ok, access(LAB_FLAG, F_OK) == 0);
-  if (!(e && p && r && g_tex_dev)) { pthread_t th; pthread_create(&th, NULL, late, NULL); pthread_detach(th); }
+  if (!(e && p && r && g_tex_dev && g_fill)) { pthread_t th; pthread_create(&th, NULL, late, NULL); pthread_detach(th); }
 }
