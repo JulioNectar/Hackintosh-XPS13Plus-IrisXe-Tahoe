@@ -16,7 +16,7 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 |---|---|
 | Mesa, Dock, janelas, desfoque "Liquid Glass" | ✅ acelerado pela GPU (Metal) |
 | Resolução nativa (3840×2400) e escala HiDPI | ✅ (troque com `tools/xe-res`, não pelos Ajustes) |
-| Frequência da GPU | ✅ 1100 MHz sob carga, repouso em RC6 |
+| Frequência da GPU | ✅ ~1300 MHz sob carga (pede 1500 MHz; o limite de energia do processador, PL4/IccMax, segura em ~1300), repouso em RC6 |
 | Imagens HEIC/YUV (papéis de parede, fotos) | ✅ |
 | Ícones de apps, Finder, miniaturas | ✅ |
 | YouTube | ✅ no Chrome (com GPU, até 4K) · ✅ no Safari com uma saída de áudio (Bluetooth ou o BlackHole virtual, `tools/build-blackhole.sh`) |

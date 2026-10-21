@@ -21,7 +21,7 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 |---|---|
 | Desktop, Dock, windows, Liquid Glass blur | ✅ GPU-accelerated through Metal |
 | Native panel resolution (3840×2400) and HiDPI scaling (1280–1920 pt wide) | ✅ (switch with `tools/xe-res`, not System Settings) |
-| GPU clock | ✅ 1100 MHz floor while busy (`ngreengtfreq`), idles in RC6 |
+| GPU clock | ✅ ~1300 MHz under load (requests RP0 1500 MHz; the CPU package power limit PL4/IccMax caps it at ~1300), idles in RC6 |
 | HEIC / YUV images (wallpapers, photos) | ✅ |
 | App icons, Finder icons, image thumbnails | ✅ |
 | YouTube | ✅ in Chrome (GPU on, up to 4K) · ✅ Safari with an audio output (Bluetooth or the BlackHole virtual device, `tools/build-blackhole.sh`) |
