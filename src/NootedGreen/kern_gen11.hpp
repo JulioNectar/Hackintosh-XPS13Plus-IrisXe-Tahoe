@@ -1809,6 +1809,8 @@ private:
 	static void IGHardwareBlit3DContextinitialize(void *that);
 	mach_vm_address_t oIGHardwareBlit3DContextinitialize {};
 	static void IGAccelResourcefree(void *that);
+	static IOReturn wrapSetFramebufferPowerState(void *that, unsigned int state);
+	mach_vm_address_t oSetFramebufferPowerState {};
 	mach_vm_address_t oIGAccelResourcefree {};
 	static void wrapSetGTFrequencyMMIO(void *that, uint32_t val);
 	mach_vm_address_t oSetGTFrequencyMMIO {};

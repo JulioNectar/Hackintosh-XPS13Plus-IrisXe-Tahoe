@@ -19,7 +19,6 @@
 | Chrome with GPU on | blank windows (ANGLE/Metal) | `--disable-gpu --disable-gpu-compositing` |
 | System Settings › Displays | can panic; mode switches sometimes go black until reboot | `tools/xe-res` |
 | Colour profile changes | selecting another profile (e.g. ITU-709) in Displays caused three page-fault panics in GPU memory management (`newResourceWithClientBuffer`, `orphanIt`/`releaseDescriptors`, `IGHardwarePageTable::commitRange`) | keep the factory profile (`tools/xe-perfil padrao` restores it) |
-| Display sleep | the display does not wake after display sleep | avoid display sleep (Energy settings) |
 | Brightness keys | the TGL framebuffer never writes the PWM duty | `xe-brilho` |
 | Trackpad | intermittent: I2C bus stuck ("Timeout waiting for bus not to be busy") in some boots | reboot |
 | Hardware video decode/encode | off (XE-NOGVA) | software decode |

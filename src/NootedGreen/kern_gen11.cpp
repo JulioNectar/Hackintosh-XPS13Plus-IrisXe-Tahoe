@@ -14,6 +14,8 @@ static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
 // xe/blitscratch2: definidos em kern_green.cpp (wrapLockCpu)
 extern void *volatile gXeBlitMem, *volatile gXeBlitCpu;
 static volatile uint32_t gXeGtFreqApple = 0, gXeGtFreqN = 0;  // XE-GTFREQ: último pedido da Apple, nº de pedidos
+static volatile uint32_t gXeDpmsBlocked = 0;  // XE-NODPMS: escritas de desligamento do caminho de vídeo bloqueadas
+static volatile uint32_t gXeFbDpmsN = 0;  // XE-FBDPMS: transições de repouso interceptadas
 static volatile uint32_t gXeResFreeFix = 0;  // XE-RESFREE: entradas inválidas neutralizadas
 extern volatile uint32_t gXeOrphanMiss;  // XE-NOORPHAN (kern_green.cpp)
 extern bool gXeLockRouted;
@@ -409,8 +411,8 @@ static void xeCsStateWorker(thread_call_param_t, thread_call_param_t) {
 			  c[0x1c00], *reinterpret_cast<volatile uint32_t *>(c + 0x1c38), c[0x1c3c]);
 	}
 	if (gAccelObj && tick % 8 == 0)
-		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
-			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut);
+		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u dpms=%u fbdpms=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
+			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeDpmsBlocked, gXeFbDpmsN, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut);
 	if (tick < 2400 && gCsStateTc) {  // a cada 250 ms por ~10 min
 		uint64_t deadline;
 		clock_interval_to_deadline(250, kMillisecondScale, &deadline);
@@ -1160,6 +1162,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
+			// 20/10 (XE-FBDPMS): repouso da tela sem desmontar pipe/transcoder/DDI (ver wrapSetFramebufferPowerState).
+			{"__ZN21AppleIntelFramebuffer24setFramebufferPowerStateEj", wrapSetFramebufferPowerState, this->oSetFramebufferPowerState},
 			// V208/V209/V210 routes DISABLED at 3/3/3 baseline. They actively cause
 			// the IOFramebuffer::getAttributeExt+0x25 NULL deref when fb1/fb2 start()
 			// is refused but IGAccelDisplayPipe still tracks them. Re-enable only
@@ -3449,8 +3453,40 @@ static bool xeFixEnabled() {
 	if (v < 0) v = checkKernelArgument("-ngreenxefix") ? 1 : 0;
 	return v == 1;
 }
+// 20/10 (XE-NODPMS): a tela não acordava depois do repouso. Diagnóstico com XeShim (~/xe/tools/xe-sleep-diag.sh):
+// ao dormir o FB TGL desliga pipe A (TRANSCONF 0x70008), TRANS_DDI_FUNC_CTL_A (0x60400), DDI_BUF_CTL_A (0x64000),
+// o escalador (PS_CTRL_1A 0x68180), backlight e energia do painel; ao acordar religa painel e plano, mas NUNCA o
+// caminho pipe/transcoder/DDI (no boot ele herda a tela acesa pelo firmware, -ngreenkeepefi, e não sabe treinar o
+// link eDP no display 13). Aqui o caminho de vídeo do painel nunca é desmontado: escritas que limpam o bit de enable
+// desses registradores (e do clock da DDI-A em DPCLKA_CFGCR0, e da energia do painel em PP_CONTROL) são trocadas pelo
+// último valor ligado. A luz de fundo segue apagando (o painel fica escuro). -ngreendpms volta ao comportamento original.
+// v2 (20/10 20h): a v1 tinha IOLog aqui e também segurava o clock da DDI-A (DPCLKA_CFGCR0) -> spinlock timeout e
+// "lock recursively" no boot. v2: sem log, sem DPCLKA; só bloqueia depois de ver o registrador ligado.
+static uint32_t xeNoDpms(uint32_t r, uint32_t val) {
+	// 20/10 20h: DESLIGADO por padrão. Bloquear o desligamento do pipe também quebra as trocas de modo do FB (ele
+	// desliga o pipe e espera o hardware confirmar com uma trava segurada -> NMIPI/spinlock timeout no boot).
+	// Fica opt-in (-ngreennodpms) até o bloqueio ficar restrito ao caminho de repouso (hook de energia do FB).
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennodpms") ? 1 : 0;
+	if (!on) return val;
+	static uint32_t lastOn[6];
+	int idx; uint32_t bit;
+	switch (r) {
+		case 0x70008:  idx = 0; bit = 0x80000000u; break;   // TRANSCONF_A
+		case 0x60400:  idx = 1; bit = 0x80000000u; break;   // TRANS_DDI_FUNC_CTL_A
+		case 0x64000:  idx = 2; bit = 0x80000000u; break;   // DDI_BUF_CTL_A
+		case 0x68180:  idx = 3; bit = 0x80000000u; break;   // PS_CTRL_1A
+		case 0xC7204:  idx = 4; bit = 0x00000001u; break;   // PP_CONTROL: power on
+		default: return val;
+	}
+	if (val & bit) { lastOn[idx] = val; return val; }
+	if (!lastOn[idx]) return val;          // nunca vimos ligado: não inventa valor
+	gXeDpmsBlocked++;   // sem IOLog: este filtro roda dentro de seções travadas do FB (log aqui = deadlock/spinlock timeout)
+	return r == 0xC7204 ? (val | 1u) : lastOn[idx];   // painel: só força o power on, o resto (backlight) passa
+}
 static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 	if (!xeFixEnabled()) return val;
+	val = xeNoDpms((uint32_t)(reg & 0x1FFFFF), val);
 	// 20/10 (XE-BLR): o brilho ia só até ~50%. Como o BacklightRegistersFix do WhateverGreen: mantém o período do
 	// hardware (lido antes da 1ª escrita da Apple) e reescala o duty por período_hw / período_Apple. Se a Apple não
 	// gravar o período, ngreenblmax=N diz qual duty ela considera 100%. -ngreennoblr desliga.
@@ -6427,6 +6463,49 @@ void Gen11::wrapSetGTFrequencyMMIO(void *that, uint32_t val)
 		if (ratio < piso) val = piso << 23;
 	}
 	FunctionCast(wrapSetGTFrequencyMMIO, callback->oSetGTFrequencyMMIO)(that, val);
+}
+
+// 20/10 (XE-FBDPMS): a tela não acordava do repouso. AppleIntelFramebuffer::setFramebufferPowerState(state) (2=Wake,
+// 1=Doze, 0=Sleep; estado atual em fb+0x4284) chama prepareToExitWake ao sair de Wake, que desliga pipe A,
+// TRANS_DDI_FUNC_CTL_A, DDI_BUF_CTL_A, escalador e painel; ao voltar, prepareToEnterWake religa painel e plano mas não
+// o pipe/link eDP (o FB TGL não treina o link do display 13; no boot ele herda a tela do firmware). Medido com
+// ~/xe/tools/xe-sleep-diag.sh. Aqui, no FB0 (painel interno): Wake -> Doze/Sleep só apaga a luz de fundo (BLC_CTL bit 31)
+// e grava o novo estado; Doze/Sleep -> Wake só reacende. O caminho de vídeo nunca é desmontado, e as trocas de modo
+// (que não passam por aqui) continuam normais. A XE-NODPMS (filtro de escritas) quebrava as trocas de modo.
+// -ngreenfbdpms volta ao original.
+static uint32_t gXeFbBlcCtl = 0, gXeFbBlcDuty = 0;
+static bool gXeFbFake = false;
+IOReturn Gen11::wrapSetFramebufferPowerState(void *that, unsigned int state)
+{
+	static int on = -1;
+	if (on < 0) on = (xeFixEnabled() && !checkKernelArgument("-ngreenfbdpms")) ? 1 : 0;
+	auto *fb = static_cast<uint8_t *>(that);
+	if (on && fb && NGreen::callback && *reinterpret_cast<uint32_t *>(fb + 0x1dc) == 0) {
+		uint32_t cur = *reinterpret_cast<uint32_t *>(fb + 0x4284);
+		if (state > 2) state = 2;
+		if (cur == 2 && state < 2) {
+			gXeFbBlcCtl = NGreen::callback->readReg32(0xC8250);
+			gXeFbBlcDuty = NGreen::callback->readReg32(0xC8258);
+			NGreen::callback->writeReg32(0xC8250, gXeFbBlcCtl & ~0x80000000u);   // luz de fundo off
+			*reinterpret_cast<uint32_t *>(fb + 0x4284) = state;
+			gXeFbFake = true; gXeFbDpmsN++;
+			IOLog("XeNG FBDPMS: FB0 %u -> %u: só luz de fundo off (BLC_CTL 0x%x duty 0x%x)\n", cur, state, gXeFbBlcCtl, gXeFbBlcDuty);
+			return kIOReturnSuccess;
+		}
+		if (cur < 2 && state < 2 && gXeFbFake) {           // Doze <-> Sleep enquanto "dormindo": só registra
+			*reinterpret_cast<uint32_t *>(fb + 0x4284) = state;
+			return kIOReturnSuccess;
+		}
+		if (cur < 2 && state == 2 && gXeFbFake) {
+			if (gXeFbBlcDuty) NGreen::callback->writeReg32(0xC8258, gXeFbBlcDuty);
+			NGreen::callback->writeReg32(0xC8250, gXeFbBlcCtl | 0x80000000u);   // luz de fundo on
+			*reinterpret_cast<uint32_t *>(fb + 0x4284) = 2;
+			gXeFbFake = false; gXeFbDpmsN++;
+			IOLog("XeNG FBDPMS: FB0 %u -> 2: luz de fundo on\n", cur);
+			return kIOReturnSuccess;
+		}
+	}
+	return FunctionCast(wrapSetFramebufferPowerState, callback->oSetFramebufferPowerState)(that, state);
 }
 
 void Gen11::IGAccelResourcefree(void *that)

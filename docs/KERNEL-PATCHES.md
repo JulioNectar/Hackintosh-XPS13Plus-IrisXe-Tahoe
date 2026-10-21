@@ -70,6 +70,7 @@ Gen12 render compression needs the AUX translation table, which the TGL driver d
 
 | Patch | Problem | Fix | Disable |
 |---|---|---|---|
+| **XE-FBDPMS** | display sleep tore down pipe A, TRANS_DDI_FUNC_CTL_A, DDI_BUF_CTL_A and the scaler; wake re-enabled the panel and plane but never the eDP link → display stayed dark | `setFramebufferPowerState` on FB0: Wake→Doze/Sleep only clears `BLC_CTL` bit 31; back to Wake only sets it | `-ngreenfbdpms` |
 | **XE-GTFREQ** | without GuC the frequency policy object returns 0 → GPU stuck at 100 MHz (RPn) | `setGTFrequencyMMIO` never requests less than `ngreengtfreq` MHz (default 1100, RP0 is 1500). Idle GPU still enters RC6 | `ngreengtfreq=0` |
 | **XE-NOGVA** | the TGL personality advertises hardware video decode (`IOGVACodec`, HEVC caps). On RPL the decoder can't be created and decode sessions that request an output format fail with `-6680` → YouTube "an error occurred" | remove the `IOGVA*` properties → VideoToolbox uses software decode | `-ngreengva` |
 
