@@ -60,7 +60,7 @@ Documentation: [INSTALL](docs/INSTALL.md) · [STATUS](docs/STATUS.md) · [KERNEL
 **1. Make your EFI** (on any Mac, with git):
 
 ```sh
-git clone https://github.com/JulioNectar/XPS13Plus-Tahoe-IrisXe.git && cd XPS13Plus-Tahoe-IrisXe
+git clone https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe.git && cd Hackintosh-XPS13Plus-IrisXe-Tahoe
 zsh make-efi.sh        # -> dist/EFI with YOUR OWN serial numbers (never share them)
 ```
 
