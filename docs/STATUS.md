@@ -8,6 +8,7 @@
 - HEIC/YUV images, wallpapers (PLANES2). App icons, thumbnails and image layers (libxedrv v15).
 - Video: YouTube in **Chrome with GPU acceleration** (software decode on the CPU), including 4K. Screen recording works. Safari works once an audio output exists: the laptop has none on macOS, so install the BlackHole virtual device (`tools/build-blackhole.sh`) or use Bluetooth audio.
 - Brightness through `xe-brilho` (XeShim).
+- Fast shutdown/restart (XE-IDLEBOUND), trackpad and touchscreen on interrupts, multitouch gestures.
 
 ## Known problems
 
@@ -15,14 +16,15 @@
 |---|---|---|
 | WindowServer hang | occasionally before login and on some UI-scale changes: a context left pending by the CSB guard → stuck stamp → watchdog. Fix in testing (csbresync) | reboot |
 | Slow shutdown / watchdog panic | fixed 2026-10-21 (XE-IDLEBOUND): shutdown no longer waits on a GPU that never goes idle | — |
-| Panic at shutdown | "corrupt list" in `IOAccelOrphanedMemoryPool` (release path) | none yet |
-| Safari video | VideoToolbox decode with an explicit output format → `-6680` | use Chrome (no GPU) |
-| Chrome with GPU on | blank windows (ANGLE/Metal) | `--disable-gpu --disable-gpu-compositing` |
+| Panic at shutdown (rare) | "corrupt list" in `IOAccelOrphanedMemoryPool` (release path) | none yet |
 | System Settings › Displays | can panic; mode switches sometimes go black until reboot | `tools/xe-res` |
 | Colour profile changes | selecting another profile (e.g. ITU-709) in Displays caused three page-fault panics in GPU memory management (`newResourceWithClientBuffer`, `orphanIt`/`releaseDescriptors`, `IGHardwarePageTable::commitRange`) | keep the factory profile (`tools/xe-perfil padrao` restores it) |
-| Brightness keys | the TGL framebuffer never writes the PWM duty | `xe-brilho` |
+| Brightness keys | regression (2026-10-21): Fn+brightness on the touch row reaches neither the keyboard driver nor BrightnessKeys (no ACPI notify); they used to move the macOS slider. Under investigation | `tools/xe-brilho <percent>` |
+| Brightness range | with `ngreenblmax=48000` the macOS maximum is only 37 % of the panel PWM; the right value is `17777` (prepared, not yet shipped) | — |
 | Trackpad / touchscreen | fixed 2026-10-20: GPIO/APIC interrupts instead of forced polling (the I2C bus used to get stuck, "Timeout waiting for bus not to be busy") | — |
-| Hardware video decode/encode | off by default (XE-NOGVA); bring-up in progress with `-ngreengva` + patched VA plugin (`macos/vadriver/`): AppleGVA now loads and initialises the TGL plugin, contexts and bitstream buffers are created; it stops at the NV12 output surface | software decode |
+| Hardware video decode/encode | off by default (XE-NOGVA); bring-up in progress with `-ngreengva` + patched VA plugin (`macos/vadriver/`): AppleGVA now loads and initialises the TGL plugin, contexts and bitstream buffers are created; the NV12 crash is fixed (driver parameter 14 now answers with the capability list); AppleGVA now gives up cleanly right after reading that list (`-12900`), under investigation | software decode |
+| E-cores | only the 4 P-cores (8 threads) run; booting with E-cores on hangs. Test plan prepared (CpuTopologyRebuild + HT patch) | E-cores off in BIOS |
+| Internal audio / camera | SoundWire audio (RT714/RT1316) and the camera have no macOS driver | Bluetooth / USB audio, BlackHole for apps that need an output |
 | Extended range 10-bit (`w30r` / BGR10_XR) | not supported by the 16.0.32 Metal driver | — |
 | Small glitch on the lock-screen clock | cosmetic | — |
 

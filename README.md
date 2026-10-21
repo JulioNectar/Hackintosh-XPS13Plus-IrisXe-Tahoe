@@ -27,7 +27,7 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | YouTube | ✅ in Chrome (GPU on, up to 4K) · ✅ Safari with an audio output (Bluetooth or the BlackHole virtual device, `tools/build-blackhole.sh`) |
 | Screen recording | ✅ |
 | Hardware video decode (H.264/HEVC) | 🚧 in progress (off by default; video plays decoded on the CPU) — see [docs/STATUS.md](docs/STATUS.md) |
-| Brightness keys | ❌ use `tools/xe-brilho` |
+| Brightness keys | ⚠️ Fn+brightness stopped reaching macOS (regression, under investigation); use `tools/xe-brilho` |
 | System Settings › Displays | ⚠️ may panic, change resolution with `tools/xe-res` |
 | Shutdown / restart | ✅ fast (XE-IDLEBOUND; used to stall ~3 min and panic) |
 | WindowServer hang | ⚠️ occasionally before login, and sometimes when changing the UI scale (reboot recovers); fix in testing (csbresync) |
