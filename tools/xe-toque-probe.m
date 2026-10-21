@@ -35,7 +35,7 @@ static const char *nomeTipo(CGEventType t) {
         case 34: return "Pressure"; case 37: return "DirectTouch"; case 38: return "ChangeMode";
         case kCGEventTapDisabledByTimeout: return "TapDisabledByTimeout";
         case kCGEventTapDisabledByUserInput: return "TapDisabledByUserInput";
-        default: return "?";
+        default: { static char b[8][16]; static int k; k = (k + 1) % 8; snprintf(b[k], 16, "type%d", (int)t); return b[k]; }
     }
 }
 
@@ -149,7 +149,7 @@ static void relatorio(NSString *out) {
     [o appendString:@"\n== timeline (fields 3 click, 7 subtype, 41 pid?, 45 srcstate, 87+, 2 pressure) ==\n"];
     for (NSUInteger i = 0; i < n; i++) {
         NSString *g = R[i].phase == 2 ? @"P" : R[i].touch ? @"T" : @"O";
-        [o appendFormat:@"%7.3f %@ tips=%d %-14s (%5.0f,%5.0f) f1=%lld f3=%lld f7=%lld f41=%lld f45=%lld f87=%lld f88=%lld f2=%.2f f99=%lld f132=%lld\n",
+        [o appendFormat:@"%7.3f %@ tips=%d %-14s (%5.0f,%5.0f) f1=%lld f3=%lld f7=%lld f41=%lld f45=%lld f87=0x%llx f88=%lld f2=%.2f f99=%lld f132=%lld\n",
          R[i].t, g, R[i].contacts, nomeTipo(R[i].type), R[i].loc.x, R[i].loc.y, R[i].f[1], R[i].f[3], R[i].f[7], R[i].f[41],
          R[i].f[45], R[i].f[87], R[i].f[88], R[i].d[2], R[i].f[99], R[i].f[132]];
     }

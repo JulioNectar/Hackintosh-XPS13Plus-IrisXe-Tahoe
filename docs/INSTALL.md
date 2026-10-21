@@ -74,3 +74,23 @@ Approve the extension in **System Settings › Privacy & Security** if asked, an
 - Each patch can be turned off with its boot-arg ([KERNEL-PATCHES.md](KERNEL-PATCHES.md)).
 - Remove the user-space pieces: delete `/Library/GPUBundles/AppleIntelTGL*`, `/System/Library/Caches/xe.bundle`
   and the TGL kexts in `/Library/Extensions`, then run `sudo kmutil load -z` again.
+
+## Touchscreen extras (xe-toque)
+
+`zsh tools/build-xe-toque.sh`, copy `tools/xe-toque.app` wherever you keep it (e.g. `~/xe/toque/`), open it and add it
+to Login Items. Allow it in Privacy & Security › **Input Monitoring** and › **Accessibility** (Screen Recording only
+for the magnifier). The build signs it with a requirement on its bundle id, so later rebuilds keep the grants.
+A hand icon in the menu bar holds the toggles (saved in `defaults read local.xe.toque`):
+
+- **One-finger scroll**: drag scrolls with momentum, tap clicks (double-tap works), hold 0.5 s = right click,
+  hold then drag = left drag/selection. VoodooI2C's own pointer events for the touch are filtered out (CGEvent field 87 =
+  sender registry ID of the touchscreen driver); the trackpad and mouse are never filtered.
+- **Edge swipes**: in from the right edge = Notification Center (presses the menu-bar clock via Accessibility),
+  up from the bottom edge = Mission Control.
+- Two-, three- and four-finger gestures on the screen already reach macOS as trackpad gestures (VoodooI2C feeds them to an
+  emulated Magic Trackpad), so they follow System Settings › Trackpad. With **xe-toque handles 2–5 fingers** on,
+  xe-toque replaces them: 2 = scroll, 3 sideways = switch Space (ctrl+←/→), 5-finger pinch = Apps.
+- **Trail** / **Ripple** visual feedback, **Magnifier** (two-finger hold), **Pen mode** (draw on screen; Esc exits,
+  *Clear drawing* wipes it), **Touch mode** (switches to a 1152-pt-wide HiDPI mode with `~/xe/build/xe-res` and back
+  to the previous mode).
+- Log: `~/xe/build/toque/xe-toque.log`. Diagnostic: `xe-toque.app/Contents/MacOS/xe-toque --probe-events`.
