@@ -25,7 +25,7 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | CPU | ✅ **all 16 threads (4 P-cores with HT + 8 E-cores)** — the E-cores used to hang the boot; fixed with one byte in `Cpuid1Data` (see [STATUS](docs/STATUS.md)). Topology is still flat (16 equal cores); CpuTopologyRebuild tuning is next |
 | HEIC / YUV images (wallpapers, photos) | ✅ |
 | App icons, Finder icons, image thumbnails | ✅ (layers in the 10-bit extended-range format `w30r`/`BGR10_XR` still don't render) |
-| Hardware video decode | ✅ **H.264 on the GPU** (bit-exact vs. software) for apps that use VideoToolbox: QuickTime, Photos, video editors, conversions. Needs `-ngreengva` and the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed by hand for now) · 🚧 HEVC: plugin fixed, waiting for the NootedGreen `IOGVAHEVCDecode` property (testing) · ⚠️ Safari decodes on the CPU: its WebKit GPU process may not load drivers from `/Library/GPUBundles` |
+| Hardware video decode | ✅ **H.264 on the GPU** (bit-exact vs. software) for apps that use VideoToolbox: QuickTime, Photos, video editors, conversions. Needs `-ngreengva` and the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed by hand for now) · ✅ **HEVC** too (NootedGreen XE-GVAHEVC) · ⚠️ Safari decodes on the CPU: its WebKit GPU process may not load drivers from `/Library/GPUBundles` |
 | YouTube | ✅ Chrome with GPU compositing, up to 4K (VP9/AV1 decoded on the CPU) · ✅ Safari up to 1080p H.264 (needs an audio output: Bluetooth or the BlackHole virtual device, `tools/build-blackhole.sh`) |
 | Screen recording | ✅ |
 | Touchscreen | ✅ up to 10 fingers via VoodooI2C; `tools/xe-toque` adds one-finger scroll, hold-for-right-click, edge swipes, pen, magnifier and a touch mode |

@@ -5204,6 +5204,11 @@ unsigned long Gen11::start(void *that,void  *param_1)
 		auto *rid = OSNumber::withNumber(0x1080080ULL, 32);
 		if (rid) { service->setProperty("IOVARendererID", rid); rid->release(); }
 		SYSLOG("ngreen", "XE-GVAID: IOVARendererID = 0x1080080 (ID do AppleIntelTGLGraphicsVADriver)");
+		// xe/gvahevc (21/10): o AppleGVA só oferece HEVC por hardware se o acelerador tiver IOGVAHEVCDecode (o kext ICL
+		// do Tahoe traz "2" no Info.plist; a personality TGL só tem IOGVAHEVCDecodeCapabilities). Sem ela a sessão HEVC
+		// falha com -12906. Com o plugin VA corrigido (macos/vadriver), a decodificação HEVC sai idêntica à de software.
+		service->setProperty("IOGVAHEVCDecode", "2");
+		SYSLOG("ngreen", "XE-GVAHEVC: IOGVAHEVCDecode = \"2\"");
 	}
 	} else {
 		SYSLOG("ngreen", "V52: Real TGL — skipping MultiForceWakeSelect override");
