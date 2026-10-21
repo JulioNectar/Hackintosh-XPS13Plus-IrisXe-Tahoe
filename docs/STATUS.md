@@ -18,11 +18,16 @@
 | Safari video | VideoToolbox decode with an explicit output format → `-6680` | use Chrome (no GPU) |
 | Chrome with GPU on | blank windows (ANGLE/Metal) | `--disable-gpu --disable-gpu-compositing` |
 | System Settings › Displays | can panic; mode switches sometimes go black until reboot | `tools/xe-res` |
+| Colour profile changes | selecting another profile (e.g. ITU-709) in Displays caused three page-fault panics in GPU memory management (`newResourceWithClientBuffer`, `orphanIt`/`releaseDescriptors`, `IGHardwarePageTable::commitRange`) | keep the factory profile (`tools/xe-perfil padrao` restores it) |
+| Display sleep | the display does not wake after display sleep | avoid display sleep (Energy settings) |
 | Brightness keys | the TGL framebuffer never writes the PWM duty | `xe-brilho` |
 | Trackpad | intermittent: I2C bus stuck ("Timeout waiting for bus not to be busy") in some boots | reboot |
 | Hardware video decode/encode | off (XE-NOGVA) | software decode |
 | Extended range 10-bit (`w30r` / BGR10_XR) | not supported by the 16.0.32 Metal driver | — |
 | Small glitch on the lock-screen clock | cosmetic | — |
+
+How each of these was reached, and what was already tried, is in [HISTORY.md](HISTORY.md) and
+[EXPERIMENTS.md](EXPERIMENTS.md).
 
 ## Not possible on this laptop
 

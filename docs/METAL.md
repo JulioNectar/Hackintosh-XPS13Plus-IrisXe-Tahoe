@@ -3,6 +3,11 @@
 Everything here is built by `macos/build-all.sh` from Apple's 16.0.32 bundles plus the sources in `macos/src`, and
 installed by `macos/install-macos.sh`.
 
+**Version history.** The Metal driver went through builds v1–v12 and MTL13–MTL17 (18–19 Oct); **MTL18** (20 Oct, in
+test) is MTL17 with two bytes restored — see the L3 row below. libxedrv went through v7–v15 and the LLVM bridge through
+v1–v2. Every build, with its evidence and result, is in [HISTORY.md](HISTORY.md) and [CATALOG.md](CATALOG.md) §4;
+abandoned approaches are in [EXPERIMENTS.md](EXPERIMENTS.md).
+
 ```
 /Library/Extensions/AppleIntelTGLGraphics*.kext, *.bundle      Apple 16.0.32 (accelerator Info.plist edited)
 /Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle       Metal driver, patched ("MTL17") + libxedrv.dylib
@@ -29,11 +34,18 @@ differences outside the code signature).
 |---|---|---|
 | header | + `LC_LOAD_DYLIB` `.../libxedrv.dylib` | load the adapter in every Metal process |
 | `0x0a2e7b` | compiler plugin path → `xe.bundle` | see above |
-| `0x065f12`, `0x07ff77`, `0x080253` | L3 allocation `0x20000088` → `0x200000d0` | RPL L3 bank layout |
-| `0x01c7c0`, `0x01c7cf`, `0x049cfe`, `0x018c28` | `setne`/`mov` → NOP / `xor` | disable code paths for features RPL lacks |
-| `0x067c27` | `je` → NOP | no render-target fast clear (needs the AUX table) |
-| `0x067c5c` | `jne` → `jmp` | a clear always disables the VS stage (it inherited the VS state → hangs) |
+| `0x065f12` | L3 allocation immediate `0x88000020` → `0xd0000020` (v11) | RPL-P reset value; not the cause of the hang it targeted, kept |
+| `0x01c7c0`, `0x01c7cf` | `setne` → NOP in `generateClearRequirements:` (MTL13) | no render-target fast clear (needs the AUX table) |
+| `0x049cfe` | `setne` → NOP in the clear `writePSState` (MTL14) | no dual-SIMD8 clear PS |
+| `0x018c28` | `mov ecx,[rax+0x18]` → `xor ecx,ecx` (MTL15) | ignore the kernel's IOSurface compression flag |
+| `0x067c27` | `je` → NOP in `programClearPipeline` (MTL16) | a clear always emits a disabled VS (it inherited the previous VS → hangs) |
+| `0x067c5c` | `jne` → `jmp` (MTL17) | after a clear the VS is marked dirty, so the next draw re-emits its own |
 | Info.plist | `Development.PoshDisable = 1` | no POSH pipe on RPL |
+
+**MTL18.** v11 originally replaced the same byte at `0x07ff77` and `0x080253` too, but those are not L3 values: in
+`IntelState::IntelState()` the byte is the opcode of `movb %al,0x110(%rdi)` / `movb %cl,0x8e0(%rbx)`, which the patch
+turned into `rolb`/`rorb`. The repository's `mtl17-patches.json` now **excludes those two bytes**, so `patch-mtl17.py`
+builds MTL18 (MTL17 minus the corruption; being tested). Details: [CATALOG.md](CATALOG.md) §6.1.
 
 ## 3. libxedrv (macos/src/libxedrv.m)
 

@@ -46,6 +46,10 @@ tools/                   xe-res (resolution/DPI), xe-brilho (brightness), xe-per
 docs/                    install guide, patch catalogs, status, debugging notes
 ```
 
+Documentation: [INSTALL](docs/INSTALL.md) · [STATUS](docs/STATUS.md) · [KERNEL-PATCHES](docs/KERNEL-PATCHES.md) ·
+[METAL](docs/METAL.md) · [DEBUGGING](docs/DEBUGGING.md) · [HISTORY](docs/HISTORY.md) (how it was done, phase by phase) ·
+[EXPERIMENTS](docs/EXPERIMENTS.md) (what failed and why) · [CATALOG](docs/CATALOG.md) (full patch and tool reference)
+
 ## Installing
 
 The full guide is [docs/INSTALL.md](docs/INSTALL.md). In short:

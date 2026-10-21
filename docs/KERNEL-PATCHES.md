@@ -16,6 +16,12 @@ ngreenblmax=48000
 `-ngreenxefix` turns on the Raptor Lake / Tahoe fix set. Lilu truncates boot-args at about 228 characters, so keep the
 line short.
 
+**More detail.** This page lists the patches that matter for a working system. The full list — every `XE-*` patch
+including diagnostics and opt-in experiments, the upstream V-numbered patches, byte patterns and all boot-args — is in
+[CATALOG.md](CATALOG.md). **Version history:** the order in which these patches were found, with the evidence for each,
+is in [HISTORY.md](HISTORY.md) (phases 1–2 display, 9–16 scheduler/memory, 17–18 power and video), and the patches that
+were tried and dropped are in [EXPERIMENTS.md](EXPERIMENTS.md).
+
 ## Display (display engine 13)
 
 | Patch | Problem | Fix | Disable |
