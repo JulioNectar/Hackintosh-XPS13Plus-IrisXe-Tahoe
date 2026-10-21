@@ -20,19 +20,22 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | Area | Status |
 |---|---|
 | Desktop, Dock, windows, Liquid Glass blur | ✅ GPU-accelerated through Metal |
-| Native panel resolution (3840×2400) and HiDPI scaling (1280–1920 pt wide) | ✅ (switch with `tools/xe-res`, not System Settings) |
+| Native panel resolution (3840×2400) and HiDPI scaling (1280–1920 pt wide) | ✅ switch with `tools/xe-res`, not System Settings (a brief glitch during the switch is cosmetic) |
 | GPU clock | ✅ ~1300 MHz under load (requests RP0 1500 MHz; the CPU package power limit PL4/IccMax caps it at ~1300), idles in RC6 |
+| CPU | ✅ **all 16 threads (4 P-cores with HT + 8 E-cores)** — the E-cores used to hang the boot; fixed with one byte in `Cpuid1Data` (see [STATUS](docs/STATUS.md)). Topology is still flat (16 equal cores); CpuTopologyRebuild tuning is next |
 | HEIC / YUV images (wallpapers, photos) | ✅ |
-| App icons, Finder icons, image thumbnails | ✅ |
-| YouTube | ✅ in Chrome (GPU on, up to 4K) · ✅ Safari with an audio output (Bluetooth or the BlackHole virtual device, `tools/build-blackhole.sh`) |
+| App icons, Finder icons, image thumbnails | ✅ (layers in the 10-bit extended-range format `w30r`/`BGR10_XR` still don't render) |
+| Hardware video decode | ✅ **H.264 on the GPU** (bit-exact vs. software) for apps that use VideoToolbox: QuickTime, Photos, video editors, conversions. Needs `-ngreengva` and the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed by hand for now) · 🚧 HEVC: plugin fixed, waiting for the NootedGreen `IOGVAHEVCDecode` property (testing) · ⚠️ Safari decodes on the CPU: its WebKit GPU process may not load drivers from `/Library/GPUBundles` |
+| YouTube | ✅ Chrome with GPU compositing, up to 4K (VP9/AV1 decoded on the CPU) · ✅ Safari up to 1080p H.264 (needs an audio output: Bluetooth or the BlackHole virtual device, `tools/build-blackhole.sh`) |
 | Screen recording | ✅ |
-| Hardware video decode (H.264/HEVC) | ✅ H.264 on the GPU (VDBOX) for VideoToolbox apps, with `-ngreengva` and the patched VA plugin (`macos/vadriver/`) · ⚠️ Safari still decodes on the CPU (WebKit GPU-process sandbox) · 🚧 HEVC: plugin fixed, needs NootedGreen XE-GVAHEVC (testing) — see [docs/STATUS.md](docs/STATUS.md) |
-| Brightness keys | ⚠️ the Dell firmware stopped reporting the sun keys; F6/F7 work through `tools/xe-brilho daemon` |
-| System Settings › Displays | ⚠️ may panic, change resolution with `tools/xe-res` |
+| Touchscreen | ✅ up to 10 fingers via VoodooI2C; `tools/xe-toque` adds one-finger scroll, hold-for-right-click, edge swipes, pen, magnifier and a touch mode |
+| Trackpad, keyboard | ✅ trackpad and touchscreen on GPIO/APIC interrupts (no polling freezes) |
+| Brightness | ✅ `tools/xe-brilho` (slider works; macOS maximum is ~37 % of the panel until `ngreenblmax=17777` ships) · ⚠️ the sun keys depend on a Dell firmware state that changes from boot to boot; F6/F7 always work through `xe-brilho daemon` |
 | Shutdown / restart | ✅ fast (XE-IDLEBOUND; used to stall ~3 min and panic) |
-| WindowServer hang | ⚠️ occasionally before login, and sometimes when changing the UI scale (reboot recovers); fix in testing (csbresync) |
+| System Settings › Displays, colour profiles | ⚠️ may panic: change resolution with `tools/xe-res` and keep the factory colour profile |
+| WindowServer hang | ⚠️ rare, before login or on a UI-scale change (reboot recovers); fix in testing (csbresync) |
 
-Everything else about the laptop (Wi-Fi via itlwm/HeliPort, Bluetooth, keyboard/trackpad/touchscreen via VoodooI2C, NVMe, battery) is a regular OpenCore setup. Internal audio (SoundWire RT714/RT1316) and the camera do **not** work on macOS.
+Everything else about the laptop (Wi-Fi via itlwm/HeliPort, Bluetooth, NVMe, battery) is a regular OpenCore setup. Internal audio (SoundWire RT714/RT1316) and the camera do **not** work on macOS.
 
 ## How it works (one paragraph)
 
@@ -47,8 +50,8 @@ EFI/                     OpenCore EFI for the XPS 13 Plus 9320 (serials removed 
 src/NootedGreen/         the modified NootedGreen source (Lilu plugin)
 build-nootedgreen.sh     builds src/NootedGreen with only the Command Line Tools
 patches/                 diff of this fork against upstream NootedGreen 95f8189
-macos/                   user-space stack: Metal driver patcher, libxedrv, shader compiler, installer
-tools/                   xe-res (resolution/DPI), xe-brilho (brightness), xe-perfil (color profile), xe-toque (touch trail),
+macos/                   user-space stack: Metal driver patcher, libxedrv, shader compiler, VA (video) plugin patcher, installer
+tools/                   xe-res (resolution/DPI), xe-brilho (brightness), xe-perfil (color profile), xe-toque (touchscreen gestures),
                          XeShim + xectl (register access), diagnostics/ (the test programs used to find bugs)
 docs/                    install guide, patch catalogs, status, debugging notes
 ```
@@ -67,7 +70,7 @@ zsh make-efi.sh        # -> dist/EFI with YOUR OWN serial numbers (never share t
 ```
 
 **2. Install macOS Tahoe 26.7.1 (25G241)** booting with `EFI/OC/config-install.plist` renamed to `config.plist`
-(acceleration off). BIOS: usual hackintosh settings (storage in AHCI/NVMe mode, not RAID/VMD; Secure Boot off).
+(acceleration off). BIOS: usual hackintosh settings (storage in AHCI/NVMe mode, not RAID/VMD; Secure Boot off). The E-cores can stay enabled.
 
 **3. On the new macOS**, with the accelerated `config.plist` back in place:
 
@@ -85,7 +88,8 @@ EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTAL
 ## Credits
 
 - **NootedGreen** by StezzaPilot ([sgiammori/NootedGreen](https://github.com/sgiammori/NootedGreen)): the base of the kernel plugin and the source of the 16.0.32 driver bundles. Licensed under the *Thou Shalt Not Profit License 1.0*, which also covers the fork in `src/`.
-- **WhateverXe** and **OpenCore Legacy Patcher fork** by b00t0x: reference for Gen12 on macOS.
+- **WhateverXe** and **OpenCore Legacy Patcher fork** by b00t0x, and jkbuha's WhateverXe work: reference for Gen12 on macOS (including the Tahoe VA-plugin payload-header fix).
+- **BlackHole** by Existential Audio (virtual audio output, GPL-3.0), built by `tools/build-blackhole.sh`.
 - **IntelIGPU-Tahoe**: reference for running the TGL Metal driver on Tahoe.
 - **acidanthera** (OpenCore, Lilu, WhateverGreen, VirtualSMC, MacKernelSDK), **OpenIntelWireless** (itlwm, IntelBluetoothFirmware), **VoodooI2C**, **USBToolBox**.
 - Developed on one Dell XPS 13 Plus by its owner, pair-programming with Claude (Anthropic).

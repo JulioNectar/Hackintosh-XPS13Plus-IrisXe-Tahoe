@@ -1276,11 +1276,11 @@
 		<dict>
 			<key>Cpuid1Data</key>
 			<data>
-			VQYKAAAAAAAAAAAAAAAAAA==
+			VQYKAAAAgAAAAAAAAAAAAA==
 			</data>
 			<key>Cpuid1Mask</key>
 			<data>
-			/////wAAAAAAAAAAAAAAAA==
+			/////wAA/wAAAAAAAAAAAA==
 			</data>
 			<key>DummyPowerManagement</key>
 			<false/>

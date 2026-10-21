@@ -1064,6 +1064,21 @@ orphaned-memory code (`orphanIt`) as XE-NOORPHAN and the shutdown "corrupt list"
 
 ---
 
+## Phase 21 — Stability, touch and E-cores (21 Oct)
+
+- **XE-IDLEBOUND**: shutdown waited on `IGScheduler5::waitForGpuIdle` for a GPU that never idles (~3.5 min, then a
+  watchdog panic). Bounding the waits brought it to ~11 s.
+- **XE-RCPOLICY**: the renderCompression flag flipped on at the first mode set while AUX/resolves are off; forced to 0.
+- **Brightness keys**: not a graphics bug. The OpRegion/ASLE theory was ruled out; the Dell SMM simply stops reporting
+  the sun keys on some boots. A diagnostic that re-mapped GGTT entries to read physical memory hung the render ring
+  once; tools that touch GPU page tables are now off-limits during live sessions.
+- **Touchscreen**: `xe-toque` reads the digitizer with IOHIDManager and tells touchscreen events from trackpad events by
+  the CGEvent sender ID (field 87); it adds one-finger scroll, right click on hold, edge swipes, pen and magnifier.
+- **E-cores**: any enabled E-core froze the kernel right after EXITBS. Diffing the OpenCore logs showed the only change
+  was ProvideCurrentCpuInfo's hybrid path setting cores-per-package to 128; this 4P+8E chip reports
+  logical_per_package 64, so xnu divided by threads-per-core = 0. Spoofing EBX[23:16] = 0x80 in `Cpuid1Data` fixed
+  it: 16 threads.
+
 ## Version index
 
 ### Metal driver (`AppleIntelTGLGraphicsMTLDriver.bundle`)

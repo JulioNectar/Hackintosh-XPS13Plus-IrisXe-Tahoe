@@ -15,17 +15,20 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Área | Status |
 |---|---|
 | Mesa, Dock, janelas, desfoque "Liquid Glass" | ✅ acelerado pela GPU (Metal) |
-| Resolução nativa (3840×2400) e escala HiDPI | ✅ (troque com `tools/xe-res`, não pelos Ajustes) |
+| Resolução nativa (3840×2400) e escala HiDPI | ✅ troque com `tools/xe-res`, não pelos Ajustes (um glitch rápido na troca é só visual) |
 | Frequência da GPU | ✅ ~1300 MHz sob carga (pede 1500 MHz; o limite de energia do processador, PL4/IccMax, segura em ~1300), repouso em RC6 |
+| Processador | ✅ **os 16 threads (4 núcleos P com HT + 8 núcleos E)**: os núcleos E travavam o boot; corrigido com um byte no `Cpuid1Data`. A topologia ainda é "plana" (16 núcleos iguais); o ajuste com o CpuTopologyRebuild vem a seguir |
 | Imagens HEIC/YUV (papéis de parede, fotos) | ✅ |
-| Ícones de apps, Finder, miniaturas | ✅ |
-| YouTube | ✅ no Chrome (com GPU, até 4K) · ✅ no Safari com uma saída de áudio (Bluetooth ou o BlackHole virtual, `tools/build-blackhole.sh`) |
+| Ícones de apps, Finder, miniaturas | ✅ (camadas no formato de 10 bits com faixa estendida, `w30r`/`BGR10_XR`, ainda não aparecem) |
+| Decodificação de vídeo por hardware | ✅ **H.264 na GPU** (idêntico ao software) para apps que usam o VideoToolbox: QuickTime, Fotos, editores, conversões. Precisa de `-ngreengva` e do plugin VA corrigido (`macos/vadriver/build-vadriver.sh`, instalação manual por enquanto) · 🚧 HEVC: plugin corrigido, falta a propriedade `IOGVAHEVCDecode` no NootedGreen (em teste) · ⚠️ o Safari decodifica na CPU: o processo GPU do WebKit não pode carregar drivers de `/Library/GPUBundles` |
+| YouTube | ✅ Chrome com GPU, até 4K (VP9/AV1 decodificados na CPU) · ✅ Safari até 1080p H.264 (precisa de uma saída de áudio: Bluetooth ou o BlackHole virtual, `tools/build-blackhole.sh`) |
 | Gravação de tela | ✅ |
-| Decodificação de vídeo por hardware | ✅ H.264 na GPU (VDBOX) para apps que usam o VideoToolbox, com `-ngreengva` e o plugin VA corrigido (`macos/vadriver/`) · ⚠️ o Safari ainda decodifica na CPU (sandbox do processo GPU do WebKit) · 🚧 HEVC: plugin corrigido, falta o XE-GVAHEVC no NootedGreen (em teste) |
-| Teclas de brilho | ⚠️ o firmware da Dell parou de avisar as teclas de sol; F6/F7 funcionam pelo `tools/xe-brilho daemon` |
-| Ajustes › Telas | ⚠️ pode dar pânico |
+| Tela de toque | ✅ até 10 dedos pelo VoodooI2C; o `tools/xe-toque` acrescenta rolagem com um dedo, segurar = clique direito, gestos pela borda, caneta, lupa e modo toque |
+| Trackpad e teclado | ✅ trackpad e tela de toque por interrupção (sem os travamentos do polling) |
+| Brilho | ✅ `tools/xe-brilho` (o slider funciona; o máximo do macOS dá ~37% do painel até entrar o `ngreenblmax=17777`) · ⚠️ as teclas de sol dependem de um estado do firmware da Dell que muda de um boot para outro; F6/F7 sempre funcionam pelo `xe-brilho daemon` |
 | Desligar / reiniciar | ✅ rápido (XE-IDLEBOUND; antes travava ~3 min e dava panic) |
-| Travamento do WindowServer | ⚠️ às vezes antes do login e em algumas trocas de escala da tela (reiniciar resolve); correção em teste (csbresync) |
+| Ajustes › Telas, perfis de cor | ⚠️ pode dar panic: troque a resolução com `tools/xe-res` e mantenha o perfil de cor de fábrica |
+| Travamento do WindowServer | ⚠️ raro, antes do login ou numa troca de escala (reiniciar resolve); correção em teste (csbresync) |
 
 Som interno (SoundWire) e câmera **não funcionam** no macOS neste notebook.
 
@@ -41,6 +44,6 @@ A documentação técnica está em inglês. Os comentários do código estão, e
 
 ## Créditos e licença
 
-Base: **NootedGreen** de StezzaPilot (licença *Thou Shalt Not Profit 1.0*, que vale também para este fork). Referências: WhateverXe e o fork do OCLP de b00t0x, IntelIGPU-Tahoe, acidanthera, OpenIntelWireless, VoodooI2C. Desenvolvido num XPS 13 Plus pelo próprio dono, em parceria com o Claude (Anthropic).
+Base: **NootedGreen** de StezzaPilot (licença *Thou Shalt Not Profit 1.0*, que vale também para este fork). Referências: WhateverXe e o fork do OCLP de b00t0x, o trabalho do jkbuha no WhateverXe, IntelIGPU-Tahoe, acidanthera, OpenIntelWireless, VoodooI2C. Desenvolvido num XPS 13 Plus pelo próprio dono, em parceria com o Claude (Anthropic).
 
 **Nenhum binário da Apple está incluído.** Você precisa da sua própria cópia dos bundles 16.0.32.

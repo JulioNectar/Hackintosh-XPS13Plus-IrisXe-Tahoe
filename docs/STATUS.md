@@ -8,6 +8,7 @@
 - HEIC/YUV images, wallpapers (PLANES2). App icons, thumbnails and image layers (libxedrv v15).
 - Video: YouTube in **Chrome with GPU acceleration** (software decode on the CPU), including 4K. Screen recording works. Safari works once an audio output exists: the laptop has none on macOS, so install the BlackHole virtual device (`tools/build-blackhole.sh`) or use Bluetooth audio.
 - Brightness through `xe-brilho` (XeShim).
+- All 16 CPU threads (4 P-cores with HT + 8 E-cores).
 - Fast shutdown/restart (XE-IDLEBOUND), trackpad and touchscreen on interrupts, multitouch gestures.
 
 ## Known problems
@@ -19,15 +20,25 @@
 | Panic at shutdown (rare) | "corrupt list" in `IOAccelOrphanedMemoryPool` (release path) | none yet |
 | System Settings › Displays | can panic; mode switches sometimes go black until reboot | `tools/xe-res` |
 | Colour profile changes | selecting another profile (e.g. ITU-709) in Displays caused three page-fault panics in GPU memory management (`newResourceWithClientBuffer`, `orphanIt`/`releaseDescriptors`, `IGHardwarePageTable::commitRange`) | keep the factory profile (`tools/xe-perfil padrao` restores it) |
-| Brightness keys | since 2026-10-20 night the sun icons on the touch row stopped working: the EC raises events but the Dell SMM no longer reports brightness (no `Notify(LCD)`), so BrightnessKeys gets nothing. Not graphics-related (OpRegion/ASLE checked). Possibly firmware state; BIOS "Load defaults" untested | `xe-brilho daemon` with `~/.xe-brilho-teclas` binding F6/F7 (`down 97 800000` / `up 98 800000`) |
+| Brightness keys | the sun keys work on some boots and not on others: when they fail the EC still raises events but the Dell SMM does not report brightness (no `Notify(LCD)`), so BrightnessKeys gets nothing. Firmware state (e.g. not after entering the BIOS); not graphics-related (OpRegion/ASLE checked) | `xe-brilho daemon` with `~/.xe-brilho-teclas` binding F6/F7 (`down 97 800000` / `up 98 800000`) |
 | Brightness range | with `ngreenblmax=48000` the macOS maximum is only 37 % of the panel PWM; the right value is `17777` (prepared, not yet shipped) | — |
 | Trackpad / touchscreen | fixed 2026-10-20: GPIO/APIC interrupts instead of forced polling (the I2C bus used to get stuck, "Timeout waiting for bus not to be busy") | — |
 | Hardware video decode | **H.264 works** (2026-10-21) with `-ngreengva` + the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed in `/Library/GPUBundles`): frames are bit-exact against software decode, for VideoToolbox clients outside the WebKit GPU-process sandbox (verified with `xe-vtdec` and in-process decoder tests). **Safari still decodes on the CPU**: its `com.apple.WebKit.GPU` sandbox denies `file-map-executable` for `/Library/GPUBundles`, so the plugin cannot load there. **HEVC**: the plugin fixes are in the same build (bit-exact in tests, I/P/B frames); it also needs the accelerator property `IOGVAHEVCDecode` (NootedGreen XE-GVAHEVC, pending a boot test). Hardware encode is untested | software decode (Safari; HEVC until XE-GVAHEVC) |
-| E-cores | only the 4 P-cores (8 threads) run; booting with E-cores on hangs. Test plan prepared (CpuTopologyRebuild + HT patch) | E-cores off in BIOS |
+| E-cores | fixed 2026-10-21: all 16 threads run (see below). Topology is flat (16 equal cores, no P/E or HT grouping) until CpuTopologyRebuild is tuned | — |
 | Internal audio / camera | SoundWire audio (RT714/RT1316) and the camera have no macOS driver | Bluetooth / USB audio, BlackHole for apps that need an output |
 | Extended range 10-bit (`w30r` / BGR10_XR) | not supported by the 16.0.32 Metal driver | — |
 | Small glitch on the lock-screen clock | cosmetic | — |
 | Transition glitch | a brief wrong frame when going from the login screen to the desktop and during UI-scale changes (`xe-res`) | cosmetic |
+
+## E-cores
+
+The i7-1360P is a 4P+8E part. With any E-core enabled the kernel froze right after `EXITBS`, before any verbose text,
+even with a single E-core. Cause: on a hybrid CPU OpenCore's `ProvideCurrentCpuInfo` patches the kernel's
+cores-per-package value to 128, assuming CPUID leaf 1 reports `logical_per_package = 128` (true for 6P+8E and desktop
+parts). The 4P+8E Raptor Lake-P reports **64**, so xnu computes threads-per-core = 64/128 = 0 and divides by it in
+`cpu_thread_alloc` (`initTopoParms`). Fix: the existing `Cpuid1Data` spoof also sets EBX[23:16] = 0x80
+(`Cpuid1Data 55060A00 00008000 00000000 00000000`, `Cpuid1Mask FFFFFFFF 0000FF00 00000000 00000000`). Result:
+`hw.ncpu = 16`. Next step: CpuTopologyRebuild so macOS knows which cores are P, E and HT siblings.
 
 How each of these was reached, and what was already tried, is in [HISTORY.md](HISTORY.md) and
 [EXPERIMENTS.md](EXPERIMENTS.md).

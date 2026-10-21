@@ -15,8 +15,8 @@ Alder Lake laptops may work with their own EFI, but the patches were only tested
 
 ## 1. BIOS
 
-Use the usual hackintosh settings (storage in AHCI/NVMe mode, not RAID/VMD; Secure Boot off). This machine runs with
-the **E-cores disabled**. Change one setting at a time and keep a way to boot back.
+Use the usual hackintosh settings (storage in AHCI/NVMe mode, not RAID/VMD; Secure Boot off). The E-cores can stay
+**enabled**: the shipped `Cpuid1Data` includes the 4P+8E fix (see STATUS). Change one setting at a time and keep a way to boot back.
 
 ## 2. EFI
 
