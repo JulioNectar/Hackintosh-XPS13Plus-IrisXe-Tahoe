@@ -288,7 +288,7 @@ path, discovered one at a time:
 
 This path is unchanged in every later driver build, and the compiler has lived in `/System/Library/Caches/xe.bundle`
 ever since. The assistant's tooling refused to run the `..` patch even after the user authorised it, so the user ran
-the patch and install scripts in Terminal himself. Writing the plugin into the sealed system volume (`bless
+the patch and install scripts in Terminal on their own. Writing the plugin into the sealed system volume (`bless
 --create-snapshot`) was considered and rejected as riskier.
 
 **Next wall** (v5 + hybrid): `Assertion failed: (m_pReadBitcodeFn), function openIGCLibrary, file
@@ -317,7 +317,7 @@ only way to reach the assistant while the screen was black.
 | 6 | End to end | `MTLBuildFunctions` SUCCESS for VS and PS. **The wall moved into the Intel MTL driver**: `-[_MTLFunctionInternal layouts]: unrecognized selector` inside `generate3DStateVF` |
 
 (One installer was first run through the assistant's non-TTY shell and failed with "a terminal is required to read the
-password"; from then on the user ran every sudo command himself.)
+password"; from then on the user ran every sudo command in their own Terminal.)
 
 ---
 
@@ -403,8 +403,8 @@ is a boot-ordering artefact that V221 already papers over, not proof of a GPU ha
 (`GGTT[0x19]`) held a `00ffffff` fill with no LRI header despite V507's repair. Calling `xeLrcaRepair` again after
 engine start ended in a WindowServer watchdog panic with the logs lost.
 
-**Research.** The user rejected stopping or switching to VDBOX, asked for deep research, then "ok, siga, vamos
-conseguir". No public working desktop acceleration on TGL/RPL with NootedGreen was found (sgiammori issues, other forks,
+**Research.** The user rejected stopping or switching to VDBOX, asked for deep research, then asked to keep
+going. No public working desktop acceleration on TGL/RPL with NootedGreen was found (sgiammori issues, other forks,
 InsanelyMac/AMD-OSX threads, IntelIGPU-Tahoe with unresolved stalls, a Latitude 7320 Tahoe TGL report blocked by
 Gen11 vs Gen12 ISA). One fork's README described the same final symptom: WindowServer active, then frozen on the last
 frame about 220 ms later.

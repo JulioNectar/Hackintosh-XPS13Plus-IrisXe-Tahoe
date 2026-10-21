@@ -4,3 +4,5 @@ tools/build/
 .DS_Store
 *.dSYM/
 dist/
+.contentFlavour
+.contentVisibility
