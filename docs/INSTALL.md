@@ -58,6 +58,8 @@ Approve the extension in **System Settings › Privacy & Security** if asked, an
 - Resolution / UI scale: `tools/xe-res` (list) and `tools/xe-res w1680` (HiDPI 1680 pt wide). Avoid
   **System Settings › Displays**.
 - Brightness: build `tools/XeShim` (`zsh tools/build-kext.sh XeShim`), load it, then `xe-brilho 70`.
+- Touchscreen trail (optional): `zsh tools/build-xe-toque.sh`, then `open tools/xe-toque.app` and allow it in
+  Privacy & Security › Input Monitoring. Only touches on the screen draw; the trackpad is ignored.
 - Check: `system_profiler SPDisplaysDataType` shows **Metal Support** and the chipset model you set.
 
 ## 7. Moving OpenCore to the internal disk

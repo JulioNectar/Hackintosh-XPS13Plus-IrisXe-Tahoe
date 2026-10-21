@@ -6,3 +6,4 @@ tools/build/
 dist/
 .contentFlavour
 .contentVisibility
+tools/xe-toque.app/

@@ -48,7 +48,7 @@ src/NootedGreen/         the modified NootedGreen source (Lilu plugin)
 build-nootedgreen.sh     builds src/NootedGreen with only the Command Line Tools
 patches/                 diff of this fork against upstream NootedGreen 95f8189
 macos/                   user-space stack: Metal driver patcher, libxedrv, shader compiler, installer
-tools/                   xe-res (resolution/DPI), xe-brilho (brightness), xe-perfil (color profile),
+tools/                   xe-res (resolution/DPI), xe-brilho (brightness), xe-perfil (color profile), xe-toque (touch trail),
                          XeShim + xectl (register access), diagnostics/ (the test programs used to find bugs)
 docs/                    install guide, patch catalogs, status, debugging notes
 ```
