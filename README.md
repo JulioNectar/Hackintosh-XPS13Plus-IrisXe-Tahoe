@@ -24,7 +24,7 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | GPU clock | ✅ 1100 MHz floor while busy (`ngreengtfreq`), idles in RC6 |
 | HEIC / YUV images (wallpapers, photos) | ✅ |
 | App icons, Finder icons, image thumbnails | ✅ |
-| YouTube | ✅ in Chrome (GPU on, up to 4K) · ❌ Safari |
+| YouTube | ✅ in Chrome (GPU on, up to 4K) · ✅ Safari with an audio output (Bluetooth or the BlackHole virtual device, `tools/build-blackhole.sh`) |
 | Screen recording | ✅ |
 | Hardware video decode (H.264/HEVC) | ❌ disabled on purpose, decoded on the CPU |
 | Brightness keys | ❌ use `tools/xe-brilho` |

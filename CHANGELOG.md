@@ -8,6 +8,7 @@ The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
 
 | Date | Change | Status |
 |---|---|---|
+| 2026-10-20 | **Safari video works**: it needs an audio output device, and this laptop has none on macOS (SoundWire audio unsupported). `tools/build-blackhole.sh` builds the BlackHole virtual output (GPL-3.0) without Xcode; with it (or Bluetooth headphones) YouTube plays in Safari | confirmed |
 | 2026-10-20 | **XE-BLITALIGN + XE-PAGESYNC**: video surfaces from CoreVideo now work on the GPU. Screen recording is no longer green, all VTPixelTransfer conversions carry content (12/12, was 3/12), YouTube 4K in Chrome no longer flickers. Root causes: misaligned plane copies went to the broken 3D blit, and render work did not wait for the copy engine. Test tools: `tools/diagnostics/gpu-tests/` | confirmed |
 | 2026-10-20 | XE-GTFREQ floor raised to 1500 MHz (RP0); the PCU currently grants ~1300 MHz | testing |
 | 2026-10-20 | CpuTopologyRebuild 2.0.2 (with E-cores off) stops the boot before the progress bar; E-cores on without it boots the kernel but WindowServer hangs | reverted |
