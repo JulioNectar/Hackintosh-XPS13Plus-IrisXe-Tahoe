@@ -8,6 +8,7 @@ The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
 
 | Date | Change | Status |
 |---|---|---|
+| 2026-10-21 | CpuTopologyRebuild 2.0.2 enabled (default mode, no HT patch): 4 P-cores × 4 threads, System Information shows 12 cores | confirmed |
 | 2026-10-21 | `ngreenblmax=17777` in the shipped config: the macOS brightness maximum now drives the panel PWM to ~100 % (was 37 % with 48000) | confirmed |
 | 2026-10-21 | HEVC hardware decode on the GPU (NootedGreen XE-GVAHEVC sets `IOGVAHEVCDecode`=2 with `-ngreengva`; plugin HCP fixes); `tools/xe-chrome-limpa.sh` for the stale Chrome GPU-cache UI breakage | confirmed |
 | 2026-10-21 | **E-cores work: 16 threads.** Any E-core froze the kernel right after EXITBS: OpenCore ProvideCurrentCpuInfo sets cores-per-package to 128, but the 4P+8E i7-1360P reports logical_per_package 64 → threads-per-core 0 → divide by zero in `cpu_thread_alloc`. `Cpuid1Data`/`Cpuid1Mask` now also force EBX[23:16] = 0x80 | confirmed |

@@ -17,7 +17,7 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Mesa, Dock, janelas, desfoque "Liquid Glass" | ✅ acelerado pela GPU (Metal) |
 | Resolução nativa (3840×2400) e escala HiDPI | ✅ troque com `tools/xe-res`, não pelos Ajustes (um glitch rápido na troca é só visual) |
 | Frequência da GPU | ✅ ~1300 MHz sob carga (pede 1500 MHz; o limite de energia do processador, PL4/IccMax, segura em ~1300), repouso em RC6 |
-| Processador | ✅ **os 16 threads (4 núcleos P com HT + 8 núcleos E)**: os núcleos E travavam o boot; corrigido com um byte no `Cpuid1Data`. A topologia ainda é "plana" (16 núcleos iguais); o ajuste com o CpuTopologyRebuild vem a seguir |
+| Processador | ✅ **os 16 threads (4 núcleos P com HT + 8 núcleos E)**: os núcleos E travavam o boot; corrigido com um byte no `Cpuid1Data`. O CpuTopologyRebuild 2.0.2 (modo padrão) agrupa como 4 núcleos P com 4 threads cada, então o trabalho pesado vai para os núcleos P; Informações do Sistema mostra 12 núcleos |
 | Imagens HEIC/YUV (papéis de parede, fotos) | ✅ |
 | Ícones de apps, Finder, miniaturas | ✅ (camadas no formato de 10 bits com faixa estendida, `w30r`/`BGR10_XR`, ainda não aparecem) |
 | Decodificação de vídeo por hardware | ✅ **H.264 na GPU** (idêntico ao software) para apps que usam o VideoToolbox: QuickTime, Fotos, editores, conversões. Precisa de `-ngreengva` e do plugin VA corrigido (`macos/vadriver/build-vadriver.sh`, instalação manual por enquanto) · ✅ **HEVC** também (XE-GVAHEVC no NootedGreen) · ⚠️ o Safari decodifica na CPU: o processo GPU do WebKit não pode carregar drivers de `/Library/GPUBundles` |

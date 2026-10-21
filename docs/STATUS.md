@@ -23,7 +23,7 @@
 | Brightness keys | the sun keys work on some boots and not on others: when they fail the EC still raises events but the Dell SMM does not report brightness (no `Notify(LCD)`), so BrightnessKeys gets nothing. Firmware state (e.g. not after entering the BIOS); not graphics-related (OpRegion/ASLE checked) | `xe-brilho daemon` with `~/.xe-brilho-teclas` binding F6/F7 (`down 97 800000` / `up 98 800000`) |
 | Trackpad / touchscreen | fixed 2026-10-20: GPIO/APIC interrupts instead of forced polling (the I2C bus used to get stuck, "Timeout waiting for bus not to be busy") | — |
 | Hardware video decode | **H.264 works** (2026-10-21) with `-ngreengva` + the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed in `/Library/GPUBundles`): frames are bit-exact against software decode, for VideoToolbox clients outside the WebKit GPU-process sandbox (verified with `xe-vtdec` and in-process decoder tests). **Safari still decodes on the CPU**: its `com.apple.WebKit.GPU` sandbox denies `file-map-executable` for `/Library/GPUBundles`, so the plugin cannot load there. **HEVC**: the plugin fixes are in the same build (bit-exact in tests, I/P/B frames); the accelerator property `IOGVAHEVCDecode` comes from NootedGreen XE-GVAHEVC; **confirmed on the GPU 2026-10-21** (30/30 frames, no hang). Hardware encode is untested | software decode (Safari) |
-| E-cores | fixed 2026-10-21: all 16 threads run (see below). Topology is flat (16 equal cores, no P/E or HT grouping) until CpuTopologyRebuild is tuned | — |
+| E-cores | fixed 2026-10-21: all 16 threads run (see below), grouped by CpuTopologyRebuild | — |
 | Internal audio / camera | SoundWire audio (RT714/RT1316) and the camera have no macOS driver | Bluetooth / USB audio, BlackHole for apps that need an output |
 | Extended range 10-bit (`w30r` / BGR10_XR) | not supported by the 16.0.32 Metal driver | — |
 | Small glitch on the lock-screen clock | cosmetic | — |
@@ -38,7 +38,9 @@ cores-per-package value to 128, assuming CPUID leaf 1 reports `logical_per_packa
 parts). The 4P+8E Raptor Lake-P reports **64**, so xnu computes threads-per-core = 64/128 = 0 and divides by it in
 `cpu_thread_alloc` (`initTopoParms`). Fix: the existing `Cpuid1Data` spoof also sets EBX[23:16] = 0x80
 (`Cpuid1Data 55060A00 00008000 00000000 00000000`, `Cpuid1Mask FFFFFFFF 0000FF00 00000000 00000000`). Result:
-`hw.ncpu = 16`. Next step: CpuTopologyRebuild so macOS knows which cores are P, E and HT siblings.
+`hw.ncpu = 16`. CpuTopologyRebuild 2.0.2 is enabled in its default mode (no HT kernel patch needed): the E-cores
+become extra SMT threads of the P-cores (`hw.physicalcpu = 4`, `hw.logicalcpu = 16`), which the author recommends for
+performance; System Information shows the real 12 cores. `ctrsmt=off` would expose the real topology but is slower.
 
 How each of these was reached, and what was already tried, is in [HISTORY.md](HISTORY.md) and
 [EXPERIMENTS.md](EXPERIMENTS.md).
