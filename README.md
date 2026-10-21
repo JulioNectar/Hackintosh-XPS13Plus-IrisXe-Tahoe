@@ -30,7 +30,7 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | Screen recording | ✅ |
 | Touchscreen | ✅ up to 10 fingers via VoodooI2C; `tools/xe-toque` adds one-finger scroll, hold-for-right-click, edge swipes, pen, magnifier and a touch mode |
 | Trackpad, keyboard | ✅ trackpad and touchscreen on GPIO/APIC interrupts (no polling freezes) |
-| Brightness | ✅ `tools/xe-brilho` (slider works; macOS maximum is ~37 % of the panel until `ngreenblmax=17777` ships) · ⚠️ the sun keys depend on a Dell firmware state that changes from boot to boot; F6/F7 always work through `xe-brilho daemon` |
+| Brightness | ✅ `tools/xe-brilho` (the macOS slider now covers the full panel range with `ngreenblmax=17777`) · ⚠️ the sun keys depend on a Dell firmware state that changes from boot to boot; F6/F7 always work through `xe-brilho daemon` |
 | Shutdown / restart | ✅ fast (XE-IDLEBOUND; used to stall ~3 min and panic) |
 | System Settings › Displays, colour profiles | ⚠️ may panic: change resolution with `tools/xe-res` and keep the factory colour profile |
 | WindowServer hang | ⚠️ rare, before login or on a UI-scale change (reboot recovers); fix in testing (csbresync) |

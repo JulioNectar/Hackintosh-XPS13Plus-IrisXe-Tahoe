@@ -25,7 +25,7 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Gravação de tela | ✅ |
 | Tela de toque | ✅ até 10 dedos pelo VoodooI2C; o `tools/xe-toque` acrescenta rolagem com um dedo, segurar = clique direito, gestos pela borda, caneta, lupa e modo toque |
 | Trackpad e teclado | ✅ trackpad e tela de toque por interrupção (sem os travamentos do polling) |
-| Brilho | ✅ `tools/xe-brilho` (o slider funciona; o máximo do macOS dá ~37% do painel até entrar o `ngreenblmax=17777`) · ⚠️ as teclas de sol dependem de um estado do firmware da Dell que muda de um boot para outro; F6/F7 sempre funcionam pelo `xe-brilho daemon` |
+| Brilho | ✅ `tools/xe-brilho` (o slider do macOS agora cobre toda a faixa do painel com `ngreenblmax=17777`) · ⚠️ as teclas de sol dependem de um estado do firmware da Dell que muda de um boot para outro; F6/F7 sempre funcionam pelo `xe-brilho daemon` |
 | Desligar / reiniciar | ✅ rápido (XE-IDLEBOUND; antes travava ~3 min e dava panic) |
 | Ajustes › Telas, perfis de cor | ⚠️ pode dar panic: troque a resolução com `tools/xe-res` e mantenha o perfil de cor de fábrica |
 | Travamento do WindowServer | ⚠️ raro, antes do login ou numa troca de escala (reiniciar resolve); correção em teste (csbresync) |
