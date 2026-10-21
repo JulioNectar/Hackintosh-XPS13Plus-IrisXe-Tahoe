@@ -24,7 +24,8 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | GPU clock | ✅ 1100 MHz floor while busy (`ngreengtfreq`), idles in RC6 |
 | HEIC / YUV images (wallpapers, photos) | ✅ |
 | App icons, Finder icons, image thumbnails | ✅ |
-| YouTube | ✅ in Chrome with GPU compositing off (see [docs/STATUS.md](docs/STATUS.md)) · ❌ Safari |
+| YouTube | ✅ in Chrome (GPU on, up to 4K) · ❌ Safari |
+| Screen recording | ✅ |
 | Hardware video decode (H.264/HEVC) | ❌ disabled on purpose, decoded on the CPU |
 | Brightness keys | ❌ use `tools/xe-brilho` |
 | System Settings › Displays | ⚠️ may panic, change resolution with `tools/xe-res` |

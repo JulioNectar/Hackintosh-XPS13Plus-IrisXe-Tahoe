@@ -8,6 +8,9 @@ The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
 
 | Date | Change | Status |
 |---|---|---|
+| 2026-10-20 | **XE-BLITALIGN + XE-PAGESYNC**: video surfaces from CoreVideo now work on the GPU. Screen recording is no longer green, all VTPixelTransfer conversions carry content (12/12, was 3/12), YouTube 4K in Chrome no longer flickers. Root causes: misaligned plane copies went to the broken 3D blit, and render work did not wait for the copy engine. Test tools: `tools/diagnostics/gpu-tests/` | confirmed |
+| 2026-10-20 | XE-GTFREQ floor raised to 1500 MHz (RP0); the PCU currently grants ~1300 MHz | testing |
+| 2026-10-20 | CpuTopologyRebuild 2.0.2 (with E-cores off) stops the boot before the progress bar; E-cores on without it boots the kernel but WindowServer hangs | reverted |
 | 2026-10-20 | **Input without polling**: trackpad on a GPIO interrupt, touchscreen on an APIC interrupt; `-vi2c-force-polling` removed. Fixes the intermittent keyboard/trackpad/touchscreen freezes (I2C bus stuck while polling). Three pieces: VoodooGPIO built from current source with Tiger Lake-LP support (`build-voodoogpio.sh`) plus an upstream bug fix (`patches/voodoogpio-tigerlakelp-start.diff`); `SSDT-XPS-I2C` now returns the firmware's own resources (`acpi/SSDT-XPS-I2C.dsl`) | confirmed |
 | 2026-10-20 | **XE-FBDPMS**: display sleep only turns the backlight off; the pipe/transcoder/DDI path to the panel is never torn down, so the display wakes again (the TGL framebuffer cannot retrain the eDP link on display 13). Hooks `AppleIntelFramebuffer::setFramebufferPowerState`; `-ngreenfbdpms` disables | confirmed |
 | 2026-10-20 | XE-NODPMS (register-write filter for the same problem): broke the framebuffer's own mode sets (spinlock timeout at boot); kept as opt-in `-ngreennodpms` only | reverted |

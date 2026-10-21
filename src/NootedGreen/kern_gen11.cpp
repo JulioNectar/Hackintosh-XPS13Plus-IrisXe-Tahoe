@@ -618,9 +618,28 @@ static int xeNoPaging() {
 	if (v < 0) v = checkKernelArgument("-ngreennopaging") ? 1 : 0;
 	return v;
 }
+// xe/pagesync (20/10): pageon/pageoff copiam IOSurface <-> device cache no motor de cópia (BCS) e voltam sem esperar;
+// quem ordena o render/compute depois da cópia é o barrierSubmission da Apple (MI_SEMAPHORE_WAIT no stamp do BCS), que o
+// Gen11::barrierSubmission (V130) pula no RPL. Sem isso o shader lia a superfície pela metade e as escritas voltavam
+// misturadas (testes de 20/10: 3-53% certos com offset 32, 88-99% alinhado). Depois do original, espera o evento da
+// cópia na CPU com IOAccelEventMachineFast2::finishEvent (vtable +0x188, o mesmo fallback do barrierSubmission da
+// Apple). accel = resource+0x18, máquina de eventos = accel+0x380. -ngreennopagesync desliga.
+static uint32_t gPageSyncN = 0;
+static void xePageSync(void *that, void *ev) {
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennopagesync") ? 0 : 1;
+	if (on != 1 || !that || !ev) return;
+	auto *acc = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(that) + 0x18);
+	auto *em = acc ? *reinterpret_cast<void **>(acc + 0x380) : nullptr;
+	auto *vt = em ? *reinterpret_cast<void ***>(em) : nullptr;
+	if (!vt || !vt[0x188 / 8]) return;
+	reinterpret_cast<void (*)(void *, void *)>(vt[0x188 / 8])(em, ev);
+	gPageSyncN++;
+}
 static void xePageoff(void *that, void *ev, bool b, bool *out, uint64_t x) {
 	if (xeNoPaging()) { gPageoffN++; return; }
 	FunctionCast(xePageoff, gOrgPageoff)(that, ev, b, out, x);
+	xePageSync(that, ev);
 }
 // xe/pageonguard (19/10): o no-op estragou as janelas. Guard cirúrgico: antes do original, para cada entrada de nível
 // (resource+0x250, (faces=+0xac) x (níveis=+0xad), 40 B; contagem u16 em +0x18, array de pares u32 em +0x20) confere pelo
@@ -655,6 +674,7 @@ static void xePageon(void *that, void *ev, bool b, uint64_t x) {
 		}
 	}
 	FunctionCast(xePageon, gOrgPageon)(that, ev, b, x);
+	xePageSync(that, ev);
 }
 // 19/10: o mesmo pânico veio também de csbProcessPreempted (troca para "itens grandes"); os 3 tratadores que chamam
 // ContextStatusBufferValidate passam pelo mesmo teste. elSwitch: também exige o EL[1] (+0x38), que ele lê em seguida.
@@ -2243,6 +2263,27 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 					LookupPatchPlus const patchPlanes[] = {{activeKext, f_planes, r_planes, arrsize(f_planes), 1}};
 					bool okp2 = LookupPatchPlus::applyAll(patcher, patchPlanes, address, size);
 					IOLog("XeNG PLANES2: calculateIOSurfaceDeviceCacheVRAMBytes planos de IOSurface+%s: %s\n", r_planes == r_planes_98 ? "0x98" : "nenhum (xor)", okp2 ? "aplicado" : "NAO encontrado");
+				}
+				// xe/blitalign (20/10): plano de IOSurface com offset não múltiplo de 64 (o CoreVideo usa 32 e 2073632 no 420v)
+				// = textura zerada e escrita perdida -> gravação de tela verde, conversões VTPixelTransfer vazias, Safari -6680.
+				// A GPU usa uma cópia da superfície (device cache, +0x04 da tabela de planos); pageon/pageoff copiam com
+				// IntelAccelerator::submitBlit. blit2d_common_supported exige (endereço & 0x3f) == 0 também para o
+				// XY_SRC_COPY_BLT comum (só o fast copy precisa de 64 B), e cópias lineares grandes não-fast vão para o
+				// blit 3D, que não funciona aqui. Máscara 0x3f -> 0x0f (origem e destino) e o "je" que manda cópia grande
+				// para o 3D vira nop: vão para blt2d_source_copy (motor de cópia). -ngreennoblitalign desliga.
+				static const uint8_t f_ba_src[] = {0x8b, 0x0f, 0x03, 0x4f, 0x2c, 0x83, 0xe1, 0x3f, 0x48, 0x85, 0xc9};
+				static const uint8_t r_ba_src[] = {0x8b, 0x0f, 0x03, 0x4f, 0x2c, 0x83, 0xe1, 0x0f, 0x48, 0x85, 0xc9};
+				static const uint8_t f_ba_dst[] = {0x8b, 0x4f, 0x48, 0x03, 0x4f, 0x74, 0x83, 0xe1, 0x3f, 0x48, 0x85, 0xc9};
+				static const uint8_t r_ba_dst[] = {0x8b, 0x4f, 0x48, 0x03, 0x4f, 0x74, 0x83, 0xe1, 0x0f, 0x48, 0x85, 0xc9};
+				static const uint8_t f_ba_rota[] = {0x0f, 0x82, 0xb5, 0xfc, 0xff, 0xff, 0x20, 0xc8, 0x0f, 0x84, 0xc9, 0xfa, 0xff, 0xff, 0xe9, 0xa8, 0xfc, 0xff, 0xff};
+				static const uint8_t r_ba_rota[] = {0x0f, 0x82, 0xb5, 0xfc, 0xff, 0xff, 0x20, 0xc8, 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0xe9, 0xa8, 0xfc, 0xff, 0xff};
+				if (!checkKernelArgument("-ngreennoblitalign")) {
+					LookupPatchPlus const patchBa[] = {
+						{activeKext, f_ba_src, r_ba_src, arrsize(f_ba_src), 1},
+						{activeKext, f_ba_dst, r_ba_dst, arrsize(f_ba_dst), 1},
+						{activeKext, f_ba_rota, r_ba_rota, arrsize(f_ba_rota), 1}};
+					bool okba = LookupPatchPlus::applyAll(patcher, patchBa, address, size);
+					IOLog("XeNG BLITALIGN: cópias lineares de IOSurface desalinhadas (offset %% 64) pelo motor de cópia: %s\n", okba ? "aplicado" : "NAO encontrado");
 				}
 				// xe/rpcs (20/10, do WhateverXe 1163642): o construtor do contexto RCS grava R_PWR_CLK_STATE (0x20c8) = 0x80000000
 				// (só ENABLE). O Linux pede ENABLE | S_CNT_ENABLE | 1 fatia (0x80041000); o RPL também tem 1 fatia (SLICE_EN=1).
@@ -6446,12 +6487,12 @@ void Gen11::blit3d_initialize_scratch_space(void *that)
 // energia em accel+0xde8 (depende do GuC/SLPC, desligado com -disablegfxfirmware) e recebe 0 -> grava RPNSWREQ
 // (0xA008) = 0 e a GPU fica no RPn (100 MHz; RP0 do i7-1360P = 1500 MHz). Provado ao vivo: pedir 900 MHz com
 // forcewake sobe o CAGF na hora e a Apple zera em ~20 ms. Aqui o pedido nunca fica abaixo de ngreengtfreq (MHz,
-// padrão 1100; 0 desliga). Ocioso a GPU entra em RC6 de qualquer jeito, então o piso só vale com trabalho.
+// padrão 1500 = RP0 desde 20/10 noite, antes 1100; 0 desliga). Ocioso a GPU entra em RC6 de qualquer jeito, então o piso só vale com trabalho.
 void Gen11::wrapSetGTFrequencyMMIO(void *that, uint32_t val)
 {
 	static int pisoMhz = -1;
 	if (pisoMhz < 0) {
-		pisoMhz = 1100;
+		pisoMhz = 1500;
 		PE_parse_boot_argn("ngreengtfreq", &pisoMhz, sizeof(pisoMhz));
 		if (pisoMhz > 1500) pisoMhz = 1500;
 	}

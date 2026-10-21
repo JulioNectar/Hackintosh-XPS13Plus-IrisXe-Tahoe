@@ -6,7 +6,7 @@
 - 3840×2400 panel, HiDPI 1280–1920 pt (via `tools/xe-res`).
 - GPU at 1100 MHz under load (XE-GTFREQ), RC6 when idle.
 - HEIC/YUV images, wallpapers (PLANES2). App icons, thumbnails and image layers (libxedrv v15).
-- Video: YouTube in **Chrome launched with `--disable-gpu --disable-gpu-compositing`** (software decode).
+- Video: YouTube in **Chrome with GPU acceleration** (software decode on the CPU), including 4K. Screen recording works. Safari still fails (see below).
 - Brightness through `xe-brilho` (XeShim).
 
 ## Known problems

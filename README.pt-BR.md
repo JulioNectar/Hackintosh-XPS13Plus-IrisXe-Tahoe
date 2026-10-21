@@ -19,7 +19,8 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Frequência da GPU | ✅ 1100 MHz sob carga, repouso em RC6 |
 | Imagens HEIC/YUV (papéis de parede, fotos) | ✅ |
 | Ícones de apps, Finder, miniaturas | ✅ |
-| YouTube | ✅ no Chrome sem GPU · ❌ no Safari |
+| YouTube | ✅ no Chrome (com GPU, até 4K) · ❌ no Safari |
+| Gravação de tela | ✅ |
 | Decodificação de vídeo por hardware | ❌ desligada de propósito (decodifica na CPU) |
 | Teclas de brilho | ❌ use `tools/xe-brilho` |
 | Ajustes › Telas | ⚠️ pode dar pânico |
