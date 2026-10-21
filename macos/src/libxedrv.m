@@ -1,4 +1,4 @@
-// libxedrv v16 — injetado no driver Metal TGL 16.0.32 (LC_LOAD_DYLIB). Adapta o driver (era Big Sur) ao Metal do Tahoe 25G241. v16: escritas em buffer pelo caminho 3D (ver "v16").
+// libxedrv v17 — injetado no driver Metal TGL 16.0.32 (LC_LOAD_DYLIB). Adapta o driver (era Big Sur) ao Metal do Tahoe 25G241. v16: escritas em buffer pelo caminho 3D (ver "v16"). v17: stencil fora do bloco de 64 KB de outro render target (ver "v17").
 // Mudanças em relação à v7 (xe/build/llvm-bridge/xedrv.m), comparando com o adaptador do IntelIGPU-Tahoe (25G83) e com o layout medido:
 //  1. _descriptorPrivate: o deslocamento de 0x10 começa em 0xa8 (o driver antigo também tem shaderValidation em 0xa0; a v7 punha
 //     textureWriteRoundingMode ali). Layout antigo lido da codificação de tipo do próprio driver:
@@ -33,7 +33,7 @@ static FILE* g_logf;
 static void xe_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void xe_log(const char* fmt, ...) {
   char b[1024]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
-  syslog(LOG_ERR, "xedrv16: %s", b);
+  syslog(LOG_ERR, "xedrv17: %s", b);
   if (!g_logf) { char p[256]; snprintf(p, sizeof p, "/tmp/xedrv-%s.log", getprogname()); g_logf = fopen(p, "a"); if (g_logf) setvbuf(g_logf, NULL, _IOLBF, 0); }
   if (g_logf) fprintf(g_logf, "%ld %s\n", (long)time(NULL), b);
 }
@@ -329,7 +329,49 @@ static void tex_stat(int via, MTLTextureDescriptor* d, void* io, NSUInteger pl, 
         iosf,
         (unsigned long)pl, ok ? "ok" : "NIL", n);
 }
-static id w_tex_dev(id s, SEL c, MTLTextureDescriptor* d) { id r = ((id(*)(id, SEL, id))g_tex_dev)(s, c, sem_compressao(d)); tex_stat(0, d, NULL, 0, r); return r; }
+// v17 (21/10): RELÓGIO DA TELA DE BLOQUEIO. O driver 16.0.32 aloca texturas Stencil8 pelo device com alinhamento de 4 KB
+// (todas as outras texturas tiled ficam em 64 KB; o próprio heapTextureSizeAndAlign do driver diz 64 KB para Stencil8).
+// O stencil então começa no último bloco de 64 KB de um render target de 32/64 bpp alocado logo antes. Se esse render
+// target e o stencil são usados no MESMO render pass, a parte do stencil dentro desse bloco perde escritas (linhas de
+// cache ímpares lidas como 0). O RenderBox (vidro do relógio, textos com Liquid Glass) aloca em sequência c0 R16F, c1
+// RG16F e o stencil, e desenha os três no mesmo pass: o teste de stencil falha no topo das letras -> faixas.
+// Prova: ~/xe/build/glitch (stenciltest: 5/5 falhas -> 0 com stencil alinhado; glasstext + passdump).
+// Correção: textura privada de render target cujo endereço GPU não é múltiplo de 64 KB é recriada num MTLHeap próprio
+// (tamanho arredondado para 64 KB, hazard tracking ligado), que começa em 64 KB e ocupa blocos inteiros. XE_STENCIL_NATIVO=1 desliga.
+static int g_s64_off = -1; static long g_s64_n;
+static uint64_t xe_gpuaddr(id t) {
+  static SEL sg; if (!sg) sg = sel_registerName("gpuAddress");
+  return [t respondsToSelector:sg] ? ((uint64_t(*)(id, SEL))objc_msgSend)(t, sg) : 0;
+}
+static id xe_realinha64k(id dev, id r, MTLTextureDescriptor* d) {
+  if (g_s64_off < 0) g_s64_off = getenv("XE_STENCIL_NATIVO") != NULL;
+  if (g_s64_off || !r || !d || d.storageMode != MTLStorageModePrivate || !(d.usage & MTLTextureUsageRenderTarget)) return r;
+  MTLPixelFormat f = d.pixelFormat;
+  if (f != MTLPixelFormatStencil8 && f != MTLPixelFormatX32_Stencil8) return r;
+  uint64_t ga = xe_gpuaddr(r);
+  if (!ga || !(ga & 0xffff)) return r;
+  MTLSizeAndAlign sa = ((MTLSizeAndAlign(*)(id, SEL, id))objc_msgSend)(dev, sel_registerName("heapTextureSizeAndAlignWithDescriptor:"), d);
+  if (!sa.size) return r;
+  MTLHeapDescriptor* hd = [[MTLHeapDescriptor new] autorelease];
+  hd.storageMode = MTLStorageModePrivate; hd.cpuCacheMode = d.cpuCacheMode; hd.size = (sa.size + 0xffff) & ~(NSUInteger)0xffff;
+  if ([hd respondsToSelector:@selector(setHazardTrackingMode:)]) hd.hazardTrackingMode = MTLHazardTrackingModeTracked;
+  id<MTLHeap> h = [dev newHeapWithDescriptor:hd];
+  id t = h ? [h newTextureWithDescriptor:d] : nil;
+  uint64_t gb = t ? xe_gpuaddr(t) : 0;
+  long n = __sync_add_and_fetch(&g_s64_n, 1);
+  if (!t || (gb & 0xffff)) {
+    if (n <= 8) LOG("STENCIL64K %lux%lu fmt=%lu em 0x%llx: heap falhou (heap=%p tex=%p 0x%llx), mantida a original", (unsigned long)d.width,
+        (unsigned long)d.height, (unsigned long)f, ga, h, t, gb);
+    [t release]; [h release]; return r;
+  }
+  if (r && [r label]) [t setLabel:[r label]];
+  [r release]; [h release];   // a textura mantém o heap vivo
+  if (n <= 4 || (n & (n - 1)) == 0) LOG("STENCIL64K %lux%lu fmt=%lu estava em 0x%llx (não alinhado a 64 KB) -> heap próprio em 0x%llx (n=%ld)",
+      (unsigned long)d.width, (unsigned long)d.height, (unsigned long)f, ga, gb, n);
+  return t;
+}
+static id w_tex_dev(id s, SEL c, MTLTextureDescriptor* d) { MTLTextureDescriptor* dd = sem_compressao(d); id r = ((id(*)(id, SEL, id))g_tex_dev)(s, c, dd);
+  r = xe_realinha64k(s, r, dd); tex_stat(0, d, NULL, 0, r); return r; }
 static id w_tex_dev_ios(id s, SEL c, MTLTextureDescriptor* d, void* io, NSUInteger pl) { id r = ((id(*)(id, SEL, id, void*, NSUInteger))g_tex_dev_ios)(s, c, sem_compressao(d), io, pl); tex_stat(1, d, io, pl, r); return r; }
 static id w_tex_heap(id s, SEL c, MTLTextureDescriptor* d) { id r = ((id(*)(id, SEL, id))g_tex_heap)(s, c, sem_compressao(d)); tex_stat(2, d, NULL, 0, r); return r; }
 static id w_tex_heap_off(id s, SEL c, MTLTextureDescriptor* d, NSUInteger off) { id r = ((id(*)(id, SEL, id, NSUInteger))g_tex_heap_off)(s, c, sem_compressao(d), off); tex_stat(3, d, NULL, 0, r); return r; }
@@ -556,7 +598,7 @@ static void* late(void* a) {
   LOG("instalação tardia: entries=%d pd=%d rhm=%d", e, p, r);
   return NULL;
 }
-__attribute__((constructor)) static void xedrv16_init(void) {
+__attribute__((constructor)) static void xedrv17_init(void) {
 #ifdef SO_PIPELOG
   install_pipelog(); return;
 #endif
