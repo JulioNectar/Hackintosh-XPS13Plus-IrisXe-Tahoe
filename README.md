@@ -90,7 +90,5 @@ EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTAL
 
 ## License
 
-- `src/NootedGreen` and `patches/`: Thou Shalt Not Profit License 1.0 (see `src/LICENSE-NootedGreen`).
-- Everything else written for this project (`macos/`, `tools/`, `docs/`, scripts): same license, for consistency.
-- Third-party kexts in `EFI/` keep their own licenses.
-- **No Apple binaries are included.** You need your own copy of the 16.0.32 driver bundles.
+[Thou Shalt Not Profit License 1.0](LICENSE), the license of NootedGreen, which this project derives from. Third-party
+kexts in `EFI/` keep their own licenses, and no Apple binaries are included: see [NOTICE.md](NOTICE.md).
