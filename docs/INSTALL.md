@@ -1,5 +1,8 @@
 # Installation guide
 
+> **Same laptop (XPS 13 Plus 9320)?** The short path is `zsh make-efi.sh` (EFI with your own serials) and, after
+> installing macOS, `zsh install.sh`. See the README. This guide is the manual procedure behind those scripts.
+
 Target: Dell XPS 13 Plus 9320, i7-1360P, Iris Xe 8086:A7A0, **macOS Tahoe 26.7.1 (25G241)**. Other Raptor Lake /
 Alder Lake laptops may work with their own EFI, but the patches were only tested here.
 

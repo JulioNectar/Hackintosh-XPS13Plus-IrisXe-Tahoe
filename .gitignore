@@ -3,3 +3,4 @@ macos/out/
 tools/build/
 .DS_Store
 *.dSYM/
+dist/

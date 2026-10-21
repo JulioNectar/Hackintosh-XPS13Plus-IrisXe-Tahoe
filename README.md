@@ -50,17 +50,30 @@ Documentation: [INSTALL](docs/INSTALL.md) · [STATUS](docs/STATUS.md) · [KERNEL
 [METAL](docs/METAL.md) · [DEBUGGING](docs/DEBUGGING.md) · [HISTORY](docs/HISTORY.md) (how it was done, phase by phase) ·
 [EXPERIMENTS](docs/EXPERIMENTS.md) (what failed and why) · [CATALOG](docs/CATALOG.md) (full patch and tool reference)
 
-## Installing
+## Quick start (Dell XPS 13 Plus 9320)
 
-The full guide is [docs/INSTALL.md](docs/INSTALL.md). In short:
+**1. Make your EFI** (on any Mac, with git):
 
-1. **BIOS:** the usual hackintosh settings (storage in AHCI/NVMe mode rather than RAID/VMD, Secure Boot off). On this machine the E-cores are also disabled, so macOS sees 4 cores / 8 threads.
-2. **EFI:** copy `EFI/` to a USB stick or the internal ESP. Generate SMBIOS (MacBookPro16,2) serials with GenSMBIOS. **Boot the macOS installer with `config-install.plist`** (rename it to `config.plist`).
-3. **Install macOS Tahoe 26.7.1** (build 25G241 — the user-space patches are build-specific).
-4. Install the **Command Line Tools** (`xcode-select --install`).
-5. Get Apple's 16.0.32 driver bundles: the `sle_Internal/le` and `sle_Internal/sle` folders of the [NootedGreen](https://github.com/sgiammori/NootedGreen) project.
-6. `zsh build-nootedgreen.sh` and put `build/NootedGreen.kext` in `EFI/OC/Kexts`.
-7. `zsh macos/build-all.sh <sle>` then `sudo zsh macos/install-macos.sh <sle> <le>`, approve the extension, and reboot with the accelerated `config.plist`.
+```sh
+git clone https://github.com/<user>/XPS13Plus-Tahoe-IrisXe.git && cd XPS13Plus-Tahoe-IrisXe
+zsh make-efi.sh        # -> dist/EFI with YOUR OWN serial numbers (never share them)
+```
+
+**2. Install macOS Tahoe 26.7.1 (25G241)** booting with `EFI/OC/config-install.plist` renamed to `config.plist`
+(acceleration off). BIOS: usual hackintosh settings (storage in AHCI/NVMe mode, not RAID/VMD; Secure Boot off).
+
+**3. On the new macOS**, with the accelerated `config.plist` back in place:
+
+```sh
+xcode-select --install          # Command Line Tools, once
+zsh install.sh                  # checks, downloads Apple's driver bundles via NootedGreen, builds, installs
+```
+
+Copy the freshly built `build/NootedGreen.kext` to `EFI/OC/Kexts/`, approve the extension if asked, reboot.
+`zsh install.sh --check` only runs the checks; `zsh install.sh --uninstall` removes everything.
+
+Other hardware (other Raptor Lake / Alder Lake laptops): the user-space part is the same, but you need your own
+EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Credits
 
