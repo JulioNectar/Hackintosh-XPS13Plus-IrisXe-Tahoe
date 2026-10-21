@@ -21,7 +21,7 @@
 | Colour profile changes | selecting another profile (e.g. ITU-709) in Displays caused three page-fault panics in GPU memory management (`newResourceWithClientBuffer`, `orphanIt`/`releaseDescriptors`, `IGHardwarePageTable::commitRange`) | keep the factory profile (`tools/xe-perfil padrao` restores it) |
 | Brightness keys | the TGL framebuffer never writes the PWM duty | `xe-brilho` |
 | Trackpad / touchscreen | fixed 2026-10-20: GPIO/APIC interrupts instead of forced polling (the I2C bus used to get stuck, "Timeout waiting for bus not to be busy") | — |
-| Hardware video decode/encode | off (XE-NOGVA) | software decode |
+| Hardware video decode/encode | off by default (XE-NOGVA); bring-up in progress with `-ngreengva` + patched VA plugin (`macos/vadriver/`): AppleGVA now loads and initialises the TGL plugin, contexts and bitstream buffers are created; it stops at the NV12 output surface | software decode |
 | Extended range 10-bit (`w30r` / BGR10_XR) | not supported by the 16.0.32 Metal driver | — |
 | Small glitch on the lock-screen clock | cosmetic | — |
 

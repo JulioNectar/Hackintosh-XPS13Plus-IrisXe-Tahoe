@@ -26,10 +26,10 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | App icons, Finder icons, image thumbnails | ✅ |
 | YouTube | ✅ in Chrome (GPU on, up to 4K) · ✅ Safari with an audio output (Bluetooth or the BlackHole virtual device, `tools/build-blackhole.sh`) |
 | Screen recording | ✅ |
-| Hardware video decode (H.264/HEVC) | ❌ disabled on purpose, decoded on the CPU |
+| Hardware video decode (H.264/HEVC) | 🚧 in progress (off by default; video plays decoded on the CPU) — see [docs/STATUS.md](docs/STATUS.md) |
 | Brightness keys | ❌ use `tools/xe-brilho` |
 | System Settings › Displays | ⚠️ may panic, change resolution with `tools/xe-res` |
-| Long sessions | ⚠️ occasional GPU hang → WindowServer watchdog reboot |
+| WindowServer hang | ⚠️ occasionally before login, and sometimes when changing the UI scale (reboot recovers) |
 
 Everything else about the laptop (Wi-Fi via itlwm/HeliPort, Bluetooth, keyboard/trackpad/touchscreen via VoodooI2C, NVMe, battery) is a regular OpenCore setup. Internal audio (SoundWire RT714/RT1316) and the camera do **not** work on macOS.
 

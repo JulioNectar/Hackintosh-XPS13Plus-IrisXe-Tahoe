@@ -21,10 +21,10 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Ícones de apps, Finder, miniaturas | ✅ |
 | YouTube | ✅ no Chrome (com GPU, até 4K) · ✅ no Safari com uma saída de áudio (Bluetooth ou o BlackHole virtual, `tools/build-blackhole.sh`) |
 | Gravação de tela | ✅ |
-| Decodificação de vídeo por hardware | ❌ desligada de propósito (decodifica na CPU) |
+| Decodificação de vídeo por hardware | 🚧 em andamento (desligada por padrão; o vídeo é decodificado na CPU) |
 | Teclas de brilho | ❌ use `tools/xe-brilho` |
 | Ajustes › Telas | ⚠️ pode dar pânico |
-| Uso longo | ⚠️ travamento ocasional da GPU → reinício pelo watchdog |
+| Travamento do WindowServer | ⚠️ às vezes antes do login e em algumas trocas de escala da tela (reiniciar resolve) |
 
 Som interno (SoundWire) e câmera **não funcionam** no macOS neste notebook.
 

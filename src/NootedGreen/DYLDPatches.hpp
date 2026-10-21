@@ -72,7 +72,10 @@ class DYLDPatches {
 //! VideoToolbox DRM model check
 static const char kVideoToolboxDRMModelOriginal[] = "MacPro5,1\0MacPro6,1\0IOService";
 
-static const char kHwGvaId[] = "Mac-7BA5B2D9E42DDD94";
+// xe/gvaboard (20/10): era "Mac-7BA5B2D9E42DDD94" (iMacPro1,1, herança do NootedRed/AMD). Nesse board-id o AppleGVA
+// (AVDGetGPUAccelerators) só aceita plugins AMD e descarta o Intel -> "Error loading GPU renderer". Usa o board-id real
+// do SMBIOS (MacBookPro16,2), que tem entrada própria no Info.plist do AppleGVA. Mesmo tamanho: os patches de dyld valem.
+static const char kHwGvaId[] = "Mac-5F9802EFE386AA28";
 
 //! AppleGVA model check
 static const char kAGVABoardIdOriginal[] = "board-id\0hw.model";

@@ -8,6 +8,9 @@ The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
 
 | Date | Change | Status |
 |---|---|---|
+| 2026-10-21 | **XE-BLITALIGN v2**: only misaligned large copies go to the copy engine; aligned ones use the 3D blit again. Fixes the missing Chrome toolbar/page icons caused by v1 (confirmed by a boot with the patch off); screen recording and video conversions still pass | confirmed |
+| 2026-10-21 | AppleGVA `hwgva-id` is now the real board-id (was iMacPro1,1 from NootedRed, which makes AppleGVA accept only AMD plugins) and XE-GVAID (IOVARendererID 0x1080080 with `-ngreengva`) | testing |
+| 2026-10-21 | Hardware decode bring-up (WIP, off by default): `macos/vadriver/` patches the TGL VA plugin (device-id 9A49, VAME name, Tahoe bitstream request, unknown driver parameter, capability-node layout 0x430→0x438); install in `/Library/GPUBundles`. AppleGVA now creates the decoder up to the NV12 output surface. Tracer: `tools/diagnostics/xe-vatrace.c` | in progress |
 | 2026-10-20 | **Safari video works**: it needs an audio output device, and this laptop has none on macOS (SoundWire audio unsupported). `tools/build-blackhole.sh` builds the BlackHole virtual output (GPL-3.0) without Xcode; with it (or Bluetooth headphones) YouTube plays in Safari | confirmed |
 | 2026-10-20 | **XE-BLITALIGN + XE-PAGESYNC**: video surfaces from CoreVideo now work on the GPU. Screen recording is no longer green, all VTPixelTransfer conversions carry content (12/12, was 3/12), YouTube 4K in Chrome no longer flickers. Root causes: misaligned plane copies went to the broken 3D blit, and render work did not wait for the copy engine. Test tools: `tools/diagnostics/gpu-tests/` | confirmed |
 | 2026-10-20 | XE-GTFREQ floor raised to 1500 MHz (RP0); the PCU currently grants ~1300 MHz | testing |
