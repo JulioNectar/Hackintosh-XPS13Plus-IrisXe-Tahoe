@@ -1,0 +1,26 @@
+# Changelog
+
+Every change is tested on the real XPS 13 Plus 9320 before it is marked **confirmed**. Status values:
+**confirmed** (works on hardware), **testing** (built and installed, being evaluated), **reverted**.
+The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
+
+## Unreleased
+
+| Date | Change | Status |
+|---|---|---|
+| 2026-10-20 | **MTL18**: `mtl17-patches.json` no longer rewrites `0x7ff77`/`0x80253`. The v11 L3 patch had turned two `movb` instructions in `IntelState::IntelState()` into `rolb`/`rorb` | testing |
+| 2026-10-20 | `make-efi.sh` (EFI with your own SMBIOS) and `install.sh` (check, fetch, build, install, uninstall) | confirmed (build path) |
+| 2026-10-20 | Deep documentation: HISTORY, EXPERIMENTS, CATALOG | — |
+
+## v0.1 — 2026-10-20 (first public snapshot)
+
+| Area | Change | Status |
+|---|---|---|
+| Kernel | XE-GTFREQ: GPU frequency floor (1100 MHz) — the GPU was stuck at 100 MHz | confirmed |
+| Kernel | PLANES2: IOSurface plane count read at `+0x98` (Tahoe) → HEIC/YUV no longer green | confirmed |
+| Kernel | XE-NOGVA: hide hardware video decode → VideoToolbox uses software decode | confirmed (Chrome) |
+| Kernel | XE-NOORPHAN, XE-RESFREE, XE-NODEPTH: memory/resolve panics | confirmed |
+| Metal | libxedrv v15: copy zero-copy textures at unaligned offsets → app icons and image layers visible | confirmed |
+| Repo | reproducible MTL17 patcher and shader-compiler build; EFI without serials | confirmed |
+
+See [docs/STATUS.md](docs/STATUS.md) for what works and the known problems.

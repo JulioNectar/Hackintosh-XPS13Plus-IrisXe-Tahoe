@@ -4,6 +4,11 @@ Hardware-accelerated graphics (**Metal, Core Animation, Liquid Glass**) for the 
 
 There is no Apple driver for Raptor Lake. This project runs **Apple's own driver for Tiger Lake Iris Xe** (GPUDriversIntel 16.0.32, written for Macs that never shipped) on the newer GPU. Both GPUs share the Xe-LP (Gen12) architecture. A modified **NootedGreen** Lilu plugin bridges the generation gap in the kernel, and a set of user-space patches bridges the gap between that 2020-era driver and Tahoe's Metal stack.
 
+> 🚧 **Work in progress — this repository is a living snapshot.** Development happens day by day on the author's own
+> XPS 13 Plus, and every fix is committed here after it is confirmed on real hardware. Expect frequent updates;
+> see [CHANGELOG.md](CHANGELOG.md) for what changed and what is still being tested, and the
+> [releases](../../releases) for the stable points.
+
 > 🇧🇷 Leia em português: [README.pt-BR.md](README.pt-BR.md)
 
 > ⚠️ **Experimental.** Expect occasional GPU hangs and kernel panics. Keep a second bootable disk (or the USB installer) around. Read [docs/STATUS.md](docs/STATUS.md) before you start.

@@ -4,6 +4,10 @@ Aceleração gráfica de verdade (**Metal, Core Animation, Liquid Glass**) para 
 
 A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a própria Apple fez para a Iris Xe do Tiger Lake** (GPUDriversIntel 16.0.32, de Macs que nunca foram lançados) na GPU mais nova, porque as duas têm a mesma arquitetura (Xe-LP, Gen12). Um **NootedGreen modificado** (plugin do Lilu) corrige as diferenças no kernel, e um conjunto de patches de user space adapta esse driver de 2020 ao Metal do Tahoe.
 
+> 🚧 **Projeto em andamento: este repositório é um retrato vivo do trabalho.** O desenvolvimento acontece dia a dia
+> no próprio XPS 13 Plus do autor, e cada correção entra aqui depois de confirmada no hardware real. Atualizações
+> frequentes; veja o [CHANGELOG.md](CHANGELOG.md) (o que mudou e o que ainda está em teste).
+
 > ⚠️ **Experimental.** Ainda acontecem travamentos da GPU e kernel panics de vez em quando. Tenha sempre um segundo disco de boot (ou o instalador no USB). Leia [docs/STATUS.md](docs/STATUS.md) antes de começar.
 
 ## O que funciona
