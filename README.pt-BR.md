@@ -21,7 +21,7 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Ícones de apps, Finder, miniaturas | ✅ |
 | YouTube | ✅ no Chrome (com GPU, até 4K) · ✅ no Safari com uma saída de áudio (Bluetooth ou o BlackHole virtual, `tools/build-blackhole.sh`) |
 | Gravação de tela | ✅ |
-| Decodificação de vídeo por hardware | 🚧 em andamento (desligada por padrão; o vídeo é decodificado na CPU) |
+| Decodificação de vídeo por hardware | ✅ H.264 na GPU (VDBOX) para apps que usam o VideoToolbox, com `-ngreengva` e o plugin VA corrigido (`macos/vadriver/`) · ⚠️ o Safari ainda decodifica na CPU (sandbox do processo GPU do WebKit) · 🚧 HEVC: plugin corrigido, falta o XE-GVAHEVC no NootedGreen (em teste) |
 | Teclas de brilho | ⚠️ o firmware da Dell parou de avisar as teclas de sol; F6/F7 funcionam pelo `tools/xe-brilho daemon` |
 | Ajustes › Telas | ⚠️ pode dar pânico |
 | Desligar / reiniciar | ✅ rápido (XE-IDLEBOUND; antes travava ~3 min e dava panic) |

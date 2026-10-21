@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# patch-vadriver.py: patches the Tiger Lake VA (video) plugin so AppleGVA on Tahoe can load it on a Raptor Lake iGPU
-# spoofed as 9A49. Hardware decode is WORK IN PROGRESS (stops at NV12 output surface creation); see docs/STATUS.md.
-#   python3 -I patch-vadriver.py AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/AppleIntelTGLGraphicsVADriver
-# Then: python3 -I patch_nodes.py <bin> <bin>  (capability-node layout 0x430 -> 0x438) and codesign -f -s - <bundle>.
+# patch-vadriver.py <plugin binary>  (step 1 of build-vadriver.sh, in place)
+# Lets AppleGVA on Tahoe load the Tiger Lake VA (video) plugin on a Raptor Lake iGPU spoofed as 9A49:
+# device-id whitelist, service lookup, Tahoe bitstream-buffer request, unknown driver parameters, VAME name.
+# Run the whole chain with build-vadriver.sh (it starts from the stock 16.0.32 bundle and signs the result).
 # Install in /Library/GPUBundles (AppleGVA only looks in /System/Library/Extensions and /Library/GPUBundles).
 import sys
 p = sys.argv[1]; d = bytearray(open(p, 'rb').read())

@@ -22,11 +22,12 @@
 | Brightness keys | since 2026-10-20 night the sun icons on the touch row stopped working: the EC raises events but the Dell SMM no longer reports brightness (no `Notify(LCD)`), so BrightnessKeys gets nothing. Not graphics-related (OpRegion/ASLE checked). Possibly firmware state; BIOS "Load defaults" untested | `xe-brilho daemon` with `~/.xe-brilho-teclas` binding F6/F7 (`down 97 800000` / `up 98 800000`) |
 | Brightness range | with `ngreenblmax=48000` the macOS maximum is only 37 % of the panel PWM; the right value is `17777` (prepared, not yet shipped) | — |
 | Trackpad / touchscreen | fixed 2026-10-20: GPIO/APIC interrupts instead of forced polling (the I2C bus used to get stuck, "Timeout waiting for bus not to be busy") | — |
-| Hardware video decode/encode | off by default (XE-NOGVA); bring-up in progress with `-ngreengva` + patched VA plugin (`macos/vadriver/`): AppleGVA now loads and initialises the TGL plugin, contexts and bitstream buffers are created; the NV12 crash is fixed (driver parameter 14 now answers with the capability list); AppleGVA now gives up cleanly right after reading that list (`-12900`), under investigation | software decode |
+| Hardware video decode | **H.264 works** (2026-10-21) with `-ngreengva` + the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed in `/Library/GPUBundles`): frames are bit-exact against software decode, for VideoToolbox clients outside the WebKit GPU-process sandbox (verified with `xe-vtdec` and in-process decoder tests). **Safari still decodes on the CPU**: its `com.apple.WebKit.GPU` sandbox denies `file-map-executable` for `/Library/GPUBundles`, so the plugin cannot load there. **HEVC**: the plugin fixes are in the same build (bit-exact in tests, I/P/B frames); it also needs the accelerator property `IOGVAHEVCDecode` (NootedGreen XE-GVAHEVC, pending a boot test). Hardware encode is untested | software decode (Safari; HEVC until XE-GVAHEVC) |
 | E-cores | only the 4 P-cores (8 threads) run; booting with E-cores on hangs. Test plan prepared (CpuTopologyRebuild + HT patch) | E-cores off in BIOS |
 | Internal audio / camera | SoundWire audio (RT714/RT1316) and the camera have no macOS driver | Bluetooth / USB audio, BlackHole for apps that need an output |
 | Extended range 10-bit (`w30r` / BGR10_XR) | not supported by the 16.0.32 Metal driver | — |
 | Small glitch on the lock-screen clock | cosmetic | — |
+| Transition glitch | a brief wrong frame when going from the login screen to the desktop and during UI-scale changes (`xe-res`) | cosmetic |
 
 How each of these was reached, and what was already tried, is in [HISTORY.md](HISTORY.md) and
 [EXPERIMENTS.md](EXPERIMENTS.md).

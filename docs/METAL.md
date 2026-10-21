@@ -13,6 +13,7 @@ abandoned approaches are in [EXPERIMENTS.md](EXPERIMENTS.md).
 /Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle       Metal driver, patched ("MTL17") + libxedrv.dylib
 /Library/GPUBundles/AppleIntelGraphicsShared.bundle             Apple 16.0.32 (profiler and runtime files)
 /System/Library/Caches/xe.bundle                                 shader compiler stack
+/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle        video decode plugin, patched (macos/vadriver/, optional)
 ```
 
 ## 1. Why /Library/GPUBundles and /System/Library/Caches
@@ -83,10 +84,33 @@ links LLVM 3902.
 
 `build-shader-compiler.sh` regenerates the libLLVM stub from the running system (`dyld_info -exports`).
 
-## 5. Known gaps in this layer
+## 5. Video decode plugin (macos/vadriver/)
+
+`macos/vadriver/build-vadriver.sh <stock VADriver bundle or sle/>` copies Apple's 16.0.32
+`AppleIntelTGLGraphicsVADriver.bundle`, applies the patch scripts in order (each one checks the original bytes first)
+and ad-hoc signs the result. AppleGVA only loads it from `/Library/GPUBundles`, and only when the accelerator keeps the
+`IOGVA*` keys (`-ngreengva`). Code caves sit in the zero padding after the load commands (r-x `__TEXT`, 0xb00–0x1100).
+
+| Step | Script | Problem on Tahoe / RPL | Fix |
+|---|---|---|---|
+| 1 | `patch-vadriver.py` | device-id whitelist, accelerator lookup, Tahoe no longer fills the bitstream request (`bwar`), unknown driver parameters, the plugin dlopens the *ICL* VAME | 9A49 accepted, lookup by name, checks skipped, unknown parameters skipped, VAME name ICL→TGL |
+| 2 | `patch_nodes.py` | AppleGVA walks capability nodes with the next link at +0x430 (plugin: +0x428) | nodes 0x438 bytes, link at both offsets |
+| 3 | `patch_nodelayout.py` | Tahoe nodes have a new u64 at +0x20, so every list moved by 8 → H.264 node had no input format (`-12913`); Tahoe asks driver parameter 14 (capability list), the plugin knows 2–12 | AppleGVA gets a converted deep copy of the list (at accelerator create and for parameter 14); the plugin keeps its own layout |
+| 4 | `patch_payloadhdr.py` | CodecHAL sideband payload header never committed for decode (`je` at 0x64a15) → the kernel reads relocation 0 as an indirect-batch handle, the lookup fails and IOAcceleratorFamily2 drops every decode batch ("commands on floor") → empty frames | always commit it |
+| 5 | `patch_pitchdelta.py` | SURFACE_STATE pitch relocation delta already holds pitch-1 = -1 → pitch one too small | clear the field before the kernel adds pitch-1 |
+| 6 | `patch_spsshift.py` | Tahoe's H.264 SPS structure has 8 extra bytes before `level_idc` → MFX_AVC_IMG_STATE with chroma 4:4:4, MBAFF, wrong frame_num/POC widths → garbage and a VCS0 hang | the three SPS readers use SPS+8 |
+| 7 | `patch_hcpsurface.py` | HEVC: the HCP surface-state builder fills the command but never adds it to the batch; its relocations land on HCP_PIPE_BUF_ADDR_STATE | emit it (5 dwords) |
+| 8 | `patch_hevclastslice.py` | HEVC: Tahoe AppleGVA never sets LastSliceOfPic in the slice parameters | set it on the last slice, clear it elsewhere |
+
+`--trace` adds an `LC_LOAD_DYLIB` for `tools/diagnostics/xe-vatrace.c` (logs every IOAccelerator/IOKit call of the
+plugin, subsystem `xe.vatrace`); off by default. With all steps, H.264 and HEVC (8-bit 4:2:0) decode bit-exact against
+the software decoder in tests. HEVC sessions also need the accelerator property `IOGVAHEVCDecode` = "2" (the ICL kext
+has it, the TGL one doesn't; without it HEVC fails with `-12906`). Safari can't use the plugin: the
+`com.apple.WebKit.GPU` sandbox denies `file-map-executable` for `/Library/GPUBundles`, so Safari decodes on the CPU.
+
+## 6. Known gaps in this layer
 
 - `BGR10_XR` / `w30r` (extended-range 10-bit) isn't supported by the 16.0.32 driver.
-- Hardware video decode/encode is off (see XE-NOGVA). Decoding with an explicit output pixel format fails in
-  VideoToolbox (`-6680`), which is why Safari can't play YouTube. Chrome with `--disable-gpu
-  --disable-gpu-compositing` plays it with software decode.
+- Hardware video decode needs `-ngreengva` and the plugin above (section 5); Safari still decodes on the CPU, and
+  hardware encode is untested. Without `-ngreengva` (XE-NOGVA) VideoToolbox decodes and converts in software.
 - Chrome's own GPU path (ANGLE/Metal) draws blank windows.

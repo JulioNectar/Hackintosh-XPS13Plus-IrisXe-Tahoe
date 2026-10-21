@@ -412,8 +412,9 @@ static void xeCsStateWorker(thread_call_param_t, thread_call_param_t) {
 			  c[0x1c00], *reinterpret_cast<volatile uint32_t *>(c + 0x1c38), c[0x1c3c]);
 	}
 	if (gAccelObj && tick % 8 == 0)
-		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u csbr=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u dpms=%u fbdpms=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
-			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gCsbResyncN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeDpmsBlocked, gXeFbDpmsN, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut);
+		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u csbr=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u dpms=%u fbdpms=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u rc1474=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
+			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gCsbResyncN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeDpmsBlocked, gXeFbDpmsN, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut,
+			  (unsigned)*reinterpret_cast<volatile uint8_t *>(gAccelObj + 0x1474));
 	if (tick < 2400 && gCsStateTc) {  // a cada 250 ms por ~10 min
 		uint64_t deadline;
 		clock_interval_to_deadline(250, kMillisecondScale, &deadline);
@@ -651,6 +652,34 @@ static bool xeMapeado(uint64_t va) {
 	if (!gPmapFindPhys || !gKernelPmap) return true;
 	void *kp = *reinterpret_cast<void **>(gKernelPmap);
 	return reinterpret_cast<uint32_t (*)(void *, uint64_t)>(gPmapFindPhys)(kp, va) != 0;
+}
+// xe/vadiag (21/10, default on, -ngreennovadiag disables): hardware video decode returned empty frames. Every decode submission is
+// "dropped on floor" by IOAccelFIFOChannel2::submitCommands because IGAccelVideoContext::bind_resource clears
+// info.valid (+0x3c) for the FIRST relocation it binds (any handle; user-space bisect). This hook only classifies the
+// failure, no behaviour change: *addr/*pitch get sentinels before the original call:
+//   res==0                    -> IOAccelContext2::lookupResource failed (handle not in the IOAccelShared2 namespace)
+//   res!=0, addr==sentinel    -> IOAccelContext2::bindResource failed (Tahoe: write check on accel+0xc90 bit 30 /
+//                                res+0xd bit 1, or IOAccelResource2::prepare() -> map()/memory map list)
+//   addr set, pitch==0        -> IGAccelResource::get_tex_data found no plane/size (resource layout/type)
+// Logs the first 48 failures and counts all of them (gVaBindFail/gVaBindOk).
+static mach_vm_address_t gOrgVaBind = 0;
+static uint32_t gVaBindFail = 0, gVaBindOk = 0;
+static bool xeVaBind(void *that, void *info, uint32_t handle, void **res, uint64_t *addr, uint32_t *pitch, bool write) {
+	auto *inf = static_cast<uint8_t *>(info);
+	uint8_t validBefore = inf ? inf[0x3c] : 0xff;
+	if (addr) *addr = 0xdeadbeefdeadbeefULL;
+	if (pitch) *pitch = 0xdeadbeef;
+	bool r = FunctionCast(xeVaBind, gOrgVaBind)(that, info, handle, res, addr, pitch, write);
+	if (r) { gVaBindOk++; return r; }
+	if (gVaBindFail++ < 48) {
+		auto *rs = (res && *res) ? static_cast<uint8_t *>(*res) : nullptr;
+		const char *why = !rs ? "lookup" : (addr && *addr == 0xdeadbeefdeadbeefULL) ? "bindResource/prepare" : (pitch && *pitch == 0) ? "get_tex_data pitch=0" : "other";
+		IOLog("XeNG VADIAG bind fail #%u: h=%#x w=%d valid %u->%u why=%s res=%p type=%#x f0d=%#x f0e=%#x prep=%u map=%p addr=%#llx pitch=%#x (ok=%u)\n",
+		      gVaBindFail, handle, write, validBefore, inf ? inf[0x3c] : 0xff, why, rs, rs ? rs[0x14] : 0, rs ? rs[0xd] : 0, rs ? rs[0xe] : 0,
+		      rs ? *reinterpret_cast<uint32_t *>(rs + 0x28) : 0, rs ? *reinterpret_cast<void **>(rs + 0x40) : nullptr,
+		      addr ? (unsigned long long)*addr : 0ULL, pitch ? *pitch : 0, gVaBindOk);
+	}
+	return r;
 }
 static void xePageon(void *that, void *ev, bool b, uint64_t x) {
 	if (xeNoPaging()) { gPageonN++; return; }
@@ -1927,6 +1956,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			bool okr = RouteRequestPlus::routeAll(patcher, index, ringDiag, address, size);
 			if (!okr) patcher.clearError();
 			IOLog("XeNG RING diag hooks: %s\n", okr ? "OK" : "FALHOU");
+			if (!checkKernelArgument("-ngreennovadiag")) {  // log-only, default on (boot-args are near the 228-char limit)
+				RouteRequestPlus vaDiag[] = {{"__ZN19IGAccelVideoContext13bind_resourceER24IOAccelCommandStreamInfojPP15IGAccelResourcePyPjb", xeVaBind, gOrgVaBind}};
+				bool okv = RouteRequestPlus::routeAll(patcher, index, vaDiag, address, size);
+				if (!okv) patcher.clearError();
+				IOLog("XeNG VADIAG: bind_resource hook %s\n", okv ? "OK" : "FALHOU");
+			}
 			bool ok = RouteRequestPlus::routeAll(patcher, index, flipDiag, address, size);
 			if (!ok) patcher.clearError();
 			IOLog("XeNG FLIP diag hooks: %s\n", ok ? "OK" : "FALHOU");
@@ -2347,6 +2382,56 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 					LookupPatchPlus const patchNoAux[] = {{activeKext, f_noaux, r_noaux, arrsize(f_noaux), 1}};
 					bool oka = LookupPatchPlus::applyAll(patcher, patchNoAux, address, size);
 					IOLog("XeNG NOAUX: fillSurfaceStateAuxInfo sempre AUX_NONE: %s\n", oka ? "aplicado" : "NAO encontrado");
+				}
+				// xe/rcpolicy (21/10, from WhateverXe jkbuha 1a9b960/76a9459): IntelAccelerator+0x1474 is the display/IOSurface
+				// "renderCompression" policy. start() leaves it 0 on real hardware (it is 1 only in the simulator), but the TGL
+				// FB's setDisplayMode calls callPlatformFunction("renderCompression", !hasExternalDisplay()) when the YTiling
+				// feature is on (FeatureControl YTiling=1 here) -> 1 with the internal panel only. XE-NOCCS's properties do not
+				// touch it. With 1: calculateIOSurfaceDeviceCacheVRAMBytes reserves CCS space for IOSurfaces, flips may keep a
+				// compressed scanout and generateFlip may set PLANE_CTL bit 15 (render decompression) although AUX is forced
+				// NONE (XE-NOAUX) and the resolves are stubbed (NOCCS3/NODEPTH). With 0 the accelerator runs Apple's
+				// "external display connected" path: every flip goes through disableRenderCompression first.
+				// Startup immediate (0x246e0) 1->0 and the setter (0x2b872) "mov al,[r15]" -> "mov al,0; nop".
+				// -ngreennorc disables.
+				if (xeFixEnabled() && !checkKernelArgument("-ngreennorc")) {
+					static const uint8_t f_rcstart[] = {0x41, 0xf6, 0x06, 0x20, 0x74, 0x08, 0x41, 0xc6, 0x85, 0x74, 0x14, 0x00, 0x00, 0x01};
+					static const uint8_t r_rcstart[] = {0x41, 0xf6, 0x06, 0x20, 0x74, 0x08, 0x41, 0xc6, 0x85, 0x74, 0x14, 0x00, 0x00, 0x00};
+					static const uint8_t f_rcset[] = {0x41, 0x8a, 0x07, 0x41, 0x88, 0x86, 0x74, 0x14, 0x00, 0x00, 0xeb, 0x16};
+					static const uint8_t r_rcset[] = {0xb0, 0x00, 0x90, 0x41, 0x88, 0x86, 0x74, 0x14, 0x00, 0x00, 0xeb, 0x16};
+					LookupPatchPlus const patchRcStart[] = {{activeKext, f_rcstart, r_rcstart, arrsize(f_rcstart), 1}};
+					LookupPatchPlus const patchRcSet[] = {{activeKext, f_rcset, r_rcset, arrsize(f_rcset), 1}};
+					bool oks = LookupPatchPlus::applyAll(patcher, patchRcStart, address, size);
+					if (!oks) patcher.clearError();
+					bool okr = LookupPatchPlus::applyAll(patcher, patchRcSet, address, size);
+					if (!okr) patcher.clearError();
+					IOLog("XeNG RCPOLICY: renderCompression (accel+0x1474) sempre 0: start %s, setter %s\n",
+						  oks ? "aplicado" : "NAO encontrado", okr ? "aplicado" : "NAO encontrado");
+				}
+				// xe/ffdop + xe/objpreempt (21/10, opt-in; WhateverXe r145/r135): IntelAccelerator::startGraphicsEngine writes
+				// CS_DEBUG_MODE1 (0x20ec) = 0x10001 and feeds the same EDX into CS_CHICKEN1 (0x2580). Our V163/V164 already
+				// clear FF_SLICE_CS_CHICKEN1 bit 14, so 3D object-level preemption is selected by 0x20ec bit 0 (=1 today).
+				//   -ngreenffdop        : also set 0x20ec bit 1 FF_DOP_CLOCK_GATE_DISABLE (Linux Wa_1606700617 tgl/dg1/adl-p).
+				//   -ngreenobjpoff: clear bit 0 in 0x20ec and 0x2580 (object-level preemption off; WEX TGL-B0 erratum).
+				// Window at 0x25166 (16.0.32): "mov edx,[rax+0x20ec]; mov edx,0x10001; mov [rax+0x20ec],edx" becomes
+				// "mov edx,<20ec>; mov [rax+0x20ec],edx; mov edx,<2580 bits>; nop" (the discarded MMIO read goes away).
+				{
+					bool ffdop = checkKernelArgument("-ngreenffdop");
+					bool objoff = checkKernelArgument("-ngreenobjpoff");
+					if (ffdop || objoff) {
+						uint8_t v20ec = (ffdop ? 0x02 : 0x00) | (objoff ? 0x00 : 0x01);
+						uint8_t m20ec = 0x01 | (ffdop ? 0x02 : 0x00);
+						uint8_t v2580 = objoff ? 0x00 : 0x01;
+						static const uint8_t f_preempt[] = {0x8b, 0x90, 0xec, 0x20, 0x00, 0x00, 0xba, 0x01, 0x00, 0x01, 0x00,
+						                                    0x89, 0x90, 0xec, 0x20, 0x00, 0x00};
+						uint8_t r_preempt[] = {0xba, v20ec, 0x00, m20ec, 0x00, 0x89, 0x90, 0xec, 0x20, 0x00, 0x00,
+						                       0xba, v2580, 0x00, 0x01, 0x00, 0x90};
+						static_assert(sizeof(r_preempt) == sizeof(f_preempt), "preempt patch size");
+						LookupPatchPlus const patchPreempt[] = {{activeKext, f_preempt, r_preempt, arrsize(f_preempt), 1}};
+						bool okp = LookupPatchPlus::applyAll(patcher, patchPreempt, address, size);
+						if (!okp) patcher.clearError();
+						IOLog("XeNG PREEMPT: 0x20ec=0x%02x%04x 0x2580|=0x1%04x (ffdop=%d objoff=%d): %s\n", m20ec, v20ec, v2580,
+							  ffdop, objoff, okp ? "aplicado" : "NAO encontrado");
+					}
 				}
 
 				// Optional secondary signature for Sonoma variants with long JE encoding.

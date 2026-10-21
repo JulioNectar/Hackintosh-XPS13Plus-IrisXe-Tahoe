@@ -63,6 +63,7 @@ over about six days in October 2026.
 | 17 | 19 Oct 23:20 → 20 Oct 14:30 | Living on Tahoe; clean reinstall | GPU frequency fixed; Tahoe on the internal SSD |
 | 18 | 20 Oct 14:30 → 17:30 | Clean-install regressions; repository | PLANES2, NOGVA, libxedrv v15 icons fix, reproducible build |
 | 19 | 20 Oct, after the repository | Audit and new problems | MTL v11 byte bug → MTL18 (in test); display sleep; colour-profile panics |
+| 20 | 20 Oct evening → 21 Oct | Hardware video decode | H.264 decodes on VDBOX, bit-exact; HEVC plugin fixed |
 
 ---
 
@@ -1032,6 +1033,37 @@ orphaned-memory code (`orphanIt`) as XE-NOORPHAN and the shutdown "corrupt list"
 
 ---
 
+## Phase 20 — Hardware video decode (20 Oct evening → 21 Oct)
+
+**Goal.** Let VideoToolbox use the GPU's video engine (VDBOX) through Apple's TGL VA plugin, run in place by AppleGVA.
+
+- **Loading and creating the decoder.** With `-ngreengva` the accelerator keeps its `IOGVA*` keys; XE-GVAID gives it the
+  renderer id the plugin reports, and `hwgva-id` became the real board-id (AppleGVA only accepts AMD plugins on
+  iMacPro1,1). `patch-vadriver.py` made the plugin load (device id, VAME name, bitstream request, driver parameters).
+  Decoder creation then crashed on an NV12 output pool (driver parameter 14 unanswered) and failed with `-12913`: Tahoe
+  reads capability nodes in the ICL layout, with a new field at +0x20 (`patch_nodes.py`, `patch_nodelayout.py`). Found
+  with an in-process harness (`VTApplyRestrictions(1)` + a `DYLD_INSERT_LIBRARIES` library that redirects AppleGVA to a
+  local plugin build and guards every GPU submission).
+- **Empty frames.** Every decode batch was dropped by IOAcceleratorFamily2 ("commands on floor"). A log-only kernel
+  hook (VADIAG) on `bind_resource` showed the kernel looking up handle 0x88: the plugin never committed the CodecHAL
+  payload-header dword for decode (`je` at 0x64a15), so the first relocation entry was read as an indirect-batch handle
+  (`patch_payloadhdr.py`; WhateverXe makes the same change). The pitch relocation was off by one (`patch_pitchdelta.py`).
+- **Garbage and VCS0 hangs.** The batch now ran but produced garbage and hung VCS0 in the closing MI_FLUSH_DW.
+  MI-only test batches, TLB/row-store experiments and a register survey ruled out coherency and the VDBOX setup;
+  patching three dwords of MFX_AVC_IMG_STATE in-process gave a bit-exact frame. Tahoe's H.264 SPS structure has 8 extra
+  bytes before `level_idc`, so the plugin read chroma 4:4:4, MBAFF and wrong frame_num/POC widths (`patch_spsshift.py`).
+  H.264 then decoded bit-exact with no hang, also with BGRA output, and system-wide after installing the plugin.
+- **HEVC.** AppleGVA only offers HEVC when the accelerator has `IOGVAHEVCDecode` (the ICL kext sets "2"; faked
+  in-process). The HCP picture state was already right, but the plugin never added HCP_SURFACE_STATE to the batch
+  (`patch_hcpsurface.py`) and Tahoe never sets LastSliceOfPic (`patch_hevclastslice.py`); both match WhateverXe's runtime
+  shims. With both, 10 HEVC frames (I and B) decode bit-exact (Y and UV), no hang. The property needs a kernel change.
+- **Safari** still decodes on the CPU: the `com.apple.WebKit.GPU` sandbox denies `file-map-executable` for
+  `/Library/GPUBundles`, so the plugin cannot load in Safari's GPU process.
+- **Reproducible.** `macos/vadriver/build-vadriver.sh` rebuilds the plugin from the stock bundle and reproduces the tested
+  binaries byte for byte; the call tracer used during bring-up is now opt-in (`--trace`).
+
+---
+
 ## Version index
 
 ### Metal driver (`AppleIntelTGLGraphicsMTLDriver.bundle`)
@@ -1128,8 +1160,8 @@ NOGVA. Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2.
 - "corrupt list" panic at shutdown (`IOAccelSysMemory::free → IOAccelOrphanedMemoryPool::addMemory`).
 - Occasional GPU hang in long sessions (gpuRestart → WindowServer watchdog); the c01dbead Blit3D hang was never
   root-caused.
-- Video: Safari/VideoToolbox software decode with an output format (−6680); no hardware decode; Chrome's GPU path draws
-  blank windows.
+- Video: Safari cannot load the VA plugin (WebKit GPU-process sandbox) and decodes on the CPU; HEVC hardware decode needs
+  the `IOGVAHEVCDecode` property in NootedGreen; hardware encode untested; Chrome's GPU path draws blank windows.
 - Brightness keys; `w30r`/BGR10_XR; lock-screen clock glitch; Blit3D sampler-state tail beyond
   `0xd000`; a fixed 1100 MHz floor instead of a real governor; E-cores off.
 - MTL18 verification.
