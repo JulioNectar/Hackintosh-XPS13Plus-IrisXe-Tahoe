@@ -39,7 +39,11 @@ Use the usual hackintosh settings (storage in AHCI/NVMe mode, not RAID/VMD; Secu
 
 ```sh
 zsh build-nootedgreen.sh                 # -> build/NootedGreen.kext
+zsh build-hookcase.sh                    # -> build/HookCase.kext (installed by step 5)
 ```
+
+`HookCase.kext` is required: Apple's TGL kexts link against `org.smichaud.HookCase`, and without it kmutil refuses
+to register them. It goes to `/Library/Extensions` (step 5), not to the EFI.
 
 Put `build/NootedGreen.kext` in `EFI/OC/Kexts/` and switch back to the accelerated `config.plist` (keep the boot-args
 from the repository).

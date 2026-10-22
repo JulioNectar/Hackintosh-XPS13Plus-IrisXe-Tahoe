@@ -56,6 +56,8 @@ EFI/                     OpenCore EFI for the XPS 13 Plus 9320 (serials removed 
   OC/config-install.plist  safe config for installing macOS (NootedGreen off, verbose)
 src/NootedGreen/         the modified NootedGreen source (Lilu plugin)
 build-nootedgreen.sh     builds src/NootedGreen with only the Command Line Tools
+src/HookCase/            NootedGreen's modified HookCase (MIT) — the TGL kexts depend on it
+build-hookcase.sh        builds src/HookCase (required; installed to /Library/Extensions by macos/install-macos.sh)
 patches/                 diff of this fork against upstream NootedGreen 95f8189
 macos/                   user-space stack: Metal driver patcher, libxedrv, shader compiler, VA (video) plugin patcher, installer
 tools/                   xe-res (resolution/DPI), xe-brilho (brightness), xe-perfil (color profile), xe-toque (touchscreen gestures),

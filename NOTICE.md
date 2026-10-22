@@ -4,6 +4,9 @@
   distributed under the **Thou Shalt Not Profit License 1.0** (see [LICENSE](LICENSE)), the license of the project it
   derives from, [NootedGreen](https://github.com/sgiammori/NootedGreen) by StezzaPilot. Free to use, study, modify and
   share; not for profit.
+- **`src/HookCase/`** is HookCase by Steven Michaud, as modified in the NootedGreen project, with two fixes from this
+  repository (probePortMode NULL `callback`, strnstr signature). It is under the **MIT License**; see
+  [src/LICENSE-HookCase](src/LICENSE-HookCase).
 - **Third-party components in `EFI/`** keep their own licenses: OpenCore, Lilu, WhateverGreen, VirtualSMC, NVMeFix,
   RestrictEvents, BrightnessKeys, CpuTopologyRebuild (acidanthera and contributors); itlwm, IntelBluetoothFirmware,
   IntelBTPatcher (OpenIntelWireless); VoodooI2C and VoodooPS2 (their authors); USBToolBox (dhinakg). See each

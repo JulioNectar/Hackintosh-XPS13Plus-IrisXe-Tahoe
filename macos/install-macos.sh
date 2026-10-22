@@ -5,7 +5,8 @@
 #   <le/>  : AppleIntelTGLGraphics.kext + AppleIntelTGLGraphicsFramebuffer.kext with com.xxxxx bundle IDs
 #   <sle/> : the 16.0.32 GL / VA / VAME / Shared / MTL bundles
 # Both folders come from the NootedGreen project (sle_Internal/le and sle_Internal/sle); they are Apple binaries
-# and are not redistributed here. Build macos/out first with macos/build-all.sh (as your user, no sudo).
+# and are not redistributed here. Build macos/out first with macos/build-all.sh and build/HookCase.kext with
+# build-hookcase.sh (both as your user, no sudo).
 set -e
 [[ $EUID -eq 0 ]] || { echo "run with sudo"; exit 1; }
 SLE=${1:?sle/}; LE=${2:?le/}
@@ -23,7 +24,10 @@ plutil -replace CFBundleVersion -string 16.0.2 $K
 for b in AppleIntelTGLGraphicsMTLDriver AppleIntelTGLGraphicsGLDriver AppleIntelTGLGraphicsVADriver AppleIntelTGLGraphicsVAME AppleIntelGraphicsShared; do
   put $SLE/$b.bundle /Library/Extensions/$b.bundle
 done
-[[ -d $LE/HookCase.kext ]] && put $LE/HookCase.kext /Library/Extensions/HookCase.kext
+# the TGL kexts link against org.smichaud.HookCase: build it with build-hookcase.sh (or take it from <le/>)
+HC=$HERE/../build/HookCase.kext; [[ -d $LE/HookCase.kext ]] && HC=$LE/HookCase.kext
+[[ -d $HC ]] || { echo "HookCase.kext missing: run 'zsh build-hookcase.sh' (as your user) first"; exit 1; }
+put $HC /Library/Extensions/HookCase.kext
 
 echo "== Metal driver (MTL17) and shared bundle in /Library/GPUBundles"
 put $OUT/AppleIntelTGLGraphicsMTLDriver.bundle /Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle
@@ -34,6 +38,6 @@ put $OUT/xe.bundle /System/Library/Caches/xe.bundle
 
 echo "== registering kexts in the Auxiliary Kernel Collection"
 kexts=(-p /Library/Extensions/AppleIntelTGLGraphics.kext -p /Library/Extensions/AppleIntelTGLGraphicsFramebuffer.kext)
-[[ -d /Library/Extensions/HookCase.kext ]] && kexts+=(-p /Library/Extensions/HookCase.kext)
+kexts+=(-p /Library/Extensions/HookCase.kext)
 /usr/bin/kmutil load -z --load-style match-only $kexts 2>&1 || true
 echo "done: approve the extension if asked, then reboot"
