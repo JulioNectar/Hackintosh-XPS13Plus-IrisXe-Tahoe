@@ -21,10 +21,10 @@
 
 | Problem | Details | Workaround |
 |---|---|---|
-| WindowServer hang | occasionally before login and on some UI-scale changes: a context left pending by the CSB guard → stuck stamp → watchdog. Fix in testing (csbresync) | reboot |
+| WindowServer hang | fixed 2026-10-21 (csbresync): not seen again in daily use since | — |
 | Slow shutdown / watchdog panic | fixed 2026-10-21 (XE-IDLEBOUND): shutdown no longer waits on a GPU that never goes idle | — |
 | Panic at shutdown (rare) | "corrupt list" in `IOAccelOrphanedMemoryPool` (release path) | none yet |
-| System Settings › Displays | can panic; mode switches sometimes go black until reboot | `tools/xe-res` |
+| System Settings › Displays | not seen to panic since 21 Oct (XE-RCPOLICY, csbresync, libxedrv v16/v17); keep an eye on it. Changing the colour profile (row below) is still a known unresolved memory bug | `tools/xe-res` still recommended for scale changes |
 | Colour profile changes | selecting another profile (e.g. ITU-709) in Displays caused three page-fault panics in GPU memory management (`newResourceWithClientBuffer`, `orphanIt`/`releaseDescriptors`, `IGHardwarePageTable::commitRange`) | keep the factory profile (`tools/xe-perfil padrao` restores it) |
 | Brightness keys | the sun keys work on some boots and not on others: when they fail the EC still raises events but the Dell SMM does not report brightness (no `Notify(LCD)`), so BrightnessKeys gets nothing. Firmware state (e.g. not after entering the BIOS); not graphics-related (OpRegion/ASLE checked) | `xe-brilho daemon` with `~/.xe-brilho-teclas` binding F6/F7 (`down 97 800000` / `up 98 800000`) |
 | Trackpad / touchscreen | fixed 2026-10-20: GPIO/APIC interrupts instead of forced polling (the I2C bus used to get stuck, "Timeout waiting for bus not to be busy") | — |

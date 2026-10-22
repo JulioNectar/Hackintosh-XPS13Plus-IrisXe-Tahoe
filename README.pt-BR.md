@@ -32,8 +32,6 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Wi-Fi, Bluetooth | ✅ Wi-Fi nativo (menu do macOS) com o AirportItlwm-Tahoe, sem HeliPort · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
 | Vibração do trackpad | ✅ intensidade do clique com `tools/xe-haptic` / o controle `xe-hapticbar` na barra de menus · ❌ sem pulso sob demanda (resposta do Force Touch) |
 | Repouso | ❌ sem repouso do sistema (firmware só tem Modern Standby); ✅ repouso da tela, e fechar a tampa apaga a tela (`tools/sleep`) |
-| Ajustes › Telas, perfis de cor | ⚠️ pode dar panic: troque a resolução com `tools/xe-res` e mantenha o perfil de cor de fábrica |
-| Travamento do WindowServer | ⚠️ raro, antes do login ou numa troca de escala (reiniciar resolve); correção em teste (csbresync) |
 
 A câmera (OV01A10 atrás do IPU6 da Intel) e o leitor de digitais **não funcionam** no macOS. **Os alto-falantes internos
 funcionam** desde 22/10/2026, sem nenhum driver de áudio da Apple: o `AudShim` liga o DSP de áudio da Intel (cAVS 2.5)

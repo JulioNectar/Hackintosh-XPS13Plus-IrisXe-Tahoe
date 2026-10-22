@@ -37,8 +37,6 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | Wi-Fi, Bluetooth | ✅ native Wi-Fi menu via AirportItlwm-Tahoe (no HeliPort) · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
 | Touchpad haptics | ✅ click-vibration strength with `tools/xe-haptic` / the `xe-hapticbar` menu-bar slider · ❌ no on-demand pulse (Force Touch feedback) |
 | Sleep | ❌ no system sleep (Modern Standby only firmware); ✅ display sleep, and lid close turns the display off (`tools/sleep`) |
-| System Settings › Displays, colour profiles | ⚠️ may panic: change resolution with `tools/xe-res` and keep the factory colour profile |
-| WindowServer hang | ⚠️ rare, before login or on a UI-scale change (reboot recovers); fix in testing (csbresync) |
 
 Everything else about the laptop (NVMe, battery, USB) is a regular OpenCore setup. The camera (OV01A10 behind Intel's
 IPU6) and the fingerprint reader do **not** work on macOS. **Internal speakers** work since 2026-10-22 without any Apple
