@@ -68,6 +68,22 @@ How each of these was reached, and what was already tried, is in [HISTORY.md](HI
 - Safari hardware video decode: needs the VA plugin in `/System/Library/Extensions` (a sealed-volume root patch,
   prepared but not applied; [EXPERIMENTS.md](EXPERIMENTS.md) #81).
 
+## Reports from other machines
+
+Not verified here: I only have the XPS 13 Plus 9320.
+
+- **Dell Latitude 7430** (i7-1265U, Iris Xe 46A8, 1080p panel, macOS 26.7.1), reported by a user (22 Oct):
+  - Works: Metal, hardware decode (`-ngreengva` + the VA plugin), AirportItlwm, touchpad and touchscreen. The XOSI/I2C
+    ACPI gave the Synaptics touchpad its GPIO interrupt.
+  - The missing `HookCase.kext` was found on this install: now in `src/HookCase` + `build-hookcase.sh`.
+  - Known issues there:
+    - GPU hangs (context 5, `WAIT_ON_SCANLINE` in the gpuRestart report) when opening System Settings › Displays,
+      System Settings › Trackpad or Photo Booth. That machine has a plain UVC webcam, so the camera path runs. The
+      reporter ruled out the 48 Hz mode and mode switching.
+    - Occasional screen corruption when viewing screenshots.
+
+  Issues and PRs from other machines are welcome.
+
 ## iServices
 
 iMessage/FaceTime/iCloud readiness was checked read-only (22 Oct): SMBIOS fields set and consistent, en0 is the
