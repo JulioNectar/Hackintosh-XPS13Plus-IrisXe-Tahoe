@@ -2,7 +2,7 @@
 //   xe-brilho            print current brightness (%)
 //   xe-brilho <1-100>    set brightness
 //   xe-brilho + | -      one step up / down
-//   xe-brilho daemon     restore the saved level, then follow the keyboard brightness keys
+//   xe-brilho daemon     follow the keyboard brightness keys (XE_BRILHO_RESTORE=1 also restores the saved level)
 //                        plus extra bindings from ~/.xe-brilho-teclas ("up|down <keycode> <mods-hex>")
 // Levels are perceptual: duty = period * (pct/100)^2.2. The last level is kept in ~/.xe-brilho.
 #import <AppKit/AppKit.h>
@@ -101,9 +101,13 @@ static CGEventRef onEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef ev
 }
 
 static int daemon_mode(void) {
-    FILE *f = fopen(statePath, "r");
-    double saved;
-    if (f) { if (fscanf(f, "%lf", &saved) == 1) set_pct(saved); fclose(f); }
+    // Restoring the saved level here fought macOS: after login the system restores its own brightness
+    // (slider at max) and this then lowered the PWM behind its back. Only XE_BRILHO_RESTORE=1 restores now.
+    if (getenv("XE_BRILHO_RESTORE")) {
+        FILE *f = fopen(statePath, "r");
+        double saved;
+        if (f) { if (fscanf(f, "%lf", &saved) == 1) set_pct(saved); fclose(f); }
+    }
     static CFMachPortRef tap;
     tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
                            CGEventMaskBit(NX_SYSDEFINED) | CGEventMaskBit(kCGEventKeyDown), onEvent, &tap);

@@ -3649,7 +3649,134 @@ static uint32_t xeNoDpms(uint32_t r, uint32_t val) {
 	gXeDpmsBlocked++;   // sem IOLog: este filtro roda dentro de seções travadas do FB (log aqui = deadlock/spinlock timeout)
 	return r == 0xC7204 ? (val | 1u) : lastOn[idx];   // painel: só força o power on, o resto (backlight) passa
 }
+// xe/bootbar (21/10). XE-BOOTDIAG (só log, limitado): anel com as escritas da Apple no plano A, FBC, PSR, PIPE_SRCSZ
+// e DC_STATE_EN (sem log no caminho de escrita: pode ser contexto de interrupção), impresso com um retrato dos
+// registradores e do console do kernel antes/depois do FBController::start, em cada setDisplayMode e em +10/+40 s.
+// XE-BOOTHOLD: no boot o plano A varre o buffer linear 1024x768 da GOP em GGTT 0 (SURF=0). No 1º modo (~t=20.7 s) a
+// Apple grava PLANE_CTL X-tiled, STRIDE 0x1e, SIZE/PIPESRC 3840x2400 mas mantém SURF=0 por ~1 s até ter o buffer
+// próprio (SURF=0x45beb000 em t=21.69) -> a tela mostra o buffer de boot lido como X-tiled 3840x2400 (flash de lixo
+// em colunas). Enquanto SURF ainda é 0 e a Apple pede CTL tiled, o plano fica DESLIGADO (tela preta); na 1ª SURF != 0
+// v3 (bootbar4): espera a SURF voltar a um buffer já visto (anel do WindowServer deu a volta); timeout de 500 ms após a 1ª.
+// Grava-se o CTL real antes da SURF (que arma os dois). -xenobb desliga.
+static volatile SInt32 gXeBhDone = 0, gXeBhHolding = 0, gXeBhOn = -1;
+static volatile UInt32 gXeBhCtl = 0, gXeBhFirst = 0;
+static volatile UInt32 gXeBhBlc = 0; static uint64_t gXeBhFirstNs = 0; static int gXeBhMinMs = 600, gXeBhMaxMs = 1500;
+struct XeBdEnt { uint64_t ns; uint32_t reg, val, old; };
+static XeBdEnt gXeBd[256];
+static volatile SInt32 gXeBdN = 0, gXeBdPrinted = 0;
+static bool xeBdWatched(uint32_t r) {
+	switch (r) {
+		case 0x43200: case 0x43208: case 0x43224: case 0x45000: case 0x4208c:         // FBC: CFB base, DPFC_CTL, chicken, chicken par
+		case 0x70180: case 0x70188: case 0x7018C: case 0x70190: case 0x7019C: case 0x701A4:  // plane A CTL/STRIDE/POS/SIZE/SURF/OFFSET
+		case 0x6001C: case 0x60800: case 0x60900:                                     // PIPE_SRCSZ, PSR1/PSR2 CTL
+		case 0x45504:                                                                 // DC_STATE_EN
+			return true;
+	}
+	return false;
+}
+static void xeBootDiagRecord(unsigned long reg, uint32_t val) {
+	uint32_t r = (uint32_t)(reg & 0xFFFFF);
+	if (!xeBdWatched(r)) return;
+	SInt32 i = OSIncrementAtomic((volatile SInt32 *)&gXeBdN);
+	if (i >= (SInt32)arrsize(gXeBd)) return;
+	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	gXeBd[i].ns = ns; gXeBd[i].reg = r; gXeBd[i].val = val;
+	gXeBd[i].old = NGreen::callback ? NGreen::callback->readReg32(r) : 0xFFFFFFFF;
+}
+static void xeBootDiagDump(const char *tag) {
+	if (!NGreen::callback) return;
+	static int dumps = 0;
+	if (dumps++ >= 12) return;
+	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	PE_Video v {};
+	IOPlatformExpert *pe = OSDynamicCast(IOPlatformExpert, IOService::getPlatform());
+	bool hv = pe && pe->getConsoleInfo(&v) == kIOReturnSuccess;
+	#define R(a) NGreen::callback->readReg32(a)
+	IOLog("XeNG BOOTDIAG %s t=%llu.%03llu console=%d base=0x%lx rowBytes=%lu %lux%lu depth=%lu disp=%lu\n", tag,
+		  ns / 1000000000ULL, (ns / 1000000ULL) % 1000ULL, (int)hv, (unsigned long)v.v_baseAddr, (unsigned long)v.v_rowBytes,
+		  (unsigned long)v.v_width, (unsigned long)v.v_height, (unsigned long)v.v_depth, (unsigned long)v.v_display);
+	IOLog("XeNG BOOTDIAG %s PLANE_A CTL=%08x STRIDE=%08x POS=%08x SIZE=%08x SURF=%08x SURFLIVE=%08x OFF=%08x SRCSZ=%08x CUR=%08x/%08x\n", tag,
+		  R(0x70180), R(0x70188), R(0x7018C), R(0x70190), R(0x7019C), R(0x701AC), R(0x701A4), R(0x6001C), R(0x70080), R(0x70084));
+	IOLog("XeNG BOOTDIAG %s FBC CTL=%08x CFB=%08x CHICKEN=%08x STATUS=%08x/%08x PAR1=%08x 4208c=%08x PSR=%08x PSR2=%08x DC=%08x CDCLK_CTL=%08x DE_PLL=%08x\n", tag,
+		  R(0x43208), R(0x43200), R(0x43224), R(0x43210), R(0x43214), R(0x45000), R(0x4208c), R(0x60800), R(0x60900), R(0x45504), R(0x46000), R(0x46070));
+	for (int f = 0; f < 32; f++) {   // fences (aperture detiling used by CPU writes to tiled surfaces)
+		uint32_t lo = R(0x100000 + 8 * f), hi = R(0x100004 + 8 * f);
+		if (lo & 1) IOLog("XeNG BOOTDIAG %s FENCE%d lo=%08x hi=%08x\n", tag, f, lo, hi);
+	}
+	#undef R
+	SInt32 n = gXeBdN; if (n > (SInt32)arrsize(gXeBd)) n = arrsize(gXeBd);
+	for (SInt32 i = gXeBdPrinted; i < n; i++)
+		IOLog("XeNG BOOTDIAG w#%d t=%llu.%03llu reg=%05x val=%08x (was %08x)\n", (int)i, gXeBd[i].ns / 1000000000ULL,
+			  (gXeBd[i].ns / 1000000ULL) % 1000ULL, gXeBd[i].reg, gXeBd[i].val, gXeBd[i].old);
+	gXeBdPrinted = n;
+	IOLog("XeNG BOOTDIAG %s boothold blc0=%08x min=%d max=%d on=%d holding=%d done=%d ctl=%08x first=%08x\n", tag, (unsigned)gXeBhBlc, gXeBhMinMs, gXeBhMaxMs, (int)gXeBhOn, (int)gXeBhHolding, (int)gXeBhDone, (unsigned)gXeBhCtl, (unsigned)gXeBhFirst);
+	if (gXeBdN > (SInt32)arrsize(gXeBd)) IOLog("XeNG BOOTDIAG %s ring full (%d writes)\n", tag, (int)gXeBdN);
+}
+
+static thread_call_t gXeBhTimer = nullptr;
+static void xeBootHoldRelease(const char *why) {   // write Apple's last CTL, re-arm with the current SURF, backlight back on
+	if (gXeBhDone) return;
+	gXeBhDone = 1;
+	if (gXeBhHolding && NGreen::callback) {
+		NGreen::callback->writeReg32(0x70180, gXeBhCtl);
+		if (why) NGreen::callback->writeReg32(0x7019C, NGreen::callback->readReg32(0x7019C));
+		if (gXeBhBlc & 0x80000000u) NGreen::callback->writeReg32(0xC8250, NGreen::callback->readReg32(0xC8250) | 0x80000000u);
+	}
+	gXeBhHolding = 0;
+}
+static void xeBootHoldInit() {   // thread context (FBController::start): timer for the safety release
+	if (!gXeBhTimer) gXeBhTimer = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
+		if (!gXeBhDone) { xeBootHoldRelease("timeout"); IOLog("XeNG BOOTHOLD: released by timeout %d ms (first SURF 0x%x)\n", gXeBhMaxMs, (unsigned)gXeBhFirst); }
+	}, nullptr);
+}
+// XE-BOOTHOLD v4 (bootbar5): as v3, plus backlight (BLC_PWM_PCH_CTL1 0xC8250 bit 31) off during the hold and release
+// only after the ring wrapped AND >= xebbms (default 600) ms since the first surface; timeout xebbms+900 ms.
+// v3: the first show of EACH buffer of WindowServer's ring is unrendered (garbage), so the plane stays off
+// until a SURF returns to a buffer already shown (ring wrapped); 500 ms after the first non-zero SURF it is released anyway.
+static uint32_t xeBootHold(unsigned long reg, uint32_t val) {
+	if (gXeBhDone) return val;
+	uint32_t r = (uint32_t)(reg & 0xFFFFF);
+	if (r == 0xC8250) {   // Apple re-enabling the backlight during the hold: remember it, keep it off until release
+		if (gXeBhHolding) { gXeBhBlc = val; return val & ~0x80000000u; }
+		return val;
+	}
+	if (r != 0x70180 && r != 0x7019C) return val;
+	if (gXeBhOn < 0) gXeBhOn = checkKernelArgument("-xenobb") ? 0 : 1;
+	if (!gXeBhOn || !NGreen::callback) { gXeBhDone = 1; return val; }
+	if (r == 0x70180) {
+		if (!(val & 0x80000000u)) return val;
+		bool start = !gXeBhHolding && NGreen::callback->readReg32(0x7019C) == 0 && (val & (0x7u << 10));  // tiled CTL on the boot buffer
+		if (start) {   // v4: also switch the backlight off for the whole hold (hides anything not coming from plane A)
+			PE_parse_boot_argn("xebbms", &gXeBhMinMs, sizeof(gXeBhMinMs));
+			if (gXeBhMinMs < 0 || gXeBhMinMs > 5000) gXeBhMinMs = 600;
+			gXeBhMaxMs = gXeBhMinMs + 900;
+			gXeBhBlc = NGreen::callback->readReg32(0xC8250);
+			if (gXeBhBlc & 0x80000000u) NGreen::callback->writeReg32(0xC8250, gXeBhBlc & ~0x80000000u);
+		}
+		if (start || gXeBhHolding) { gXeBhCtl = val; gXeBhHolding = 1; return val & ~0x80000000u; }
+		return val;
+	}
+	if (val == 0) return val;
+	if (!gXeBhHolding) { gXeBhDone = 1; return val; }               // never held: nothing to do
+	static uint32_t seen[8], nseen = 0, last = 0;
+	if (!gXeBhFirst) {                                              // first real surface: keep off, start the safety timer
+		gXeBhFirst = val; absolutetime_to_nanoseconds(mach_absolute_time(), &gXeBhFirstNs);
+		if (gXeBhTimer) { uint64_t d; clock_interval_to_deadline(gXeBhMaxMs, kMillisecondScale, &d); thread_call_enter_delayed(gXeBhTimer, d); }
+	}
+	if (val == last) return val;                                    // same buffer re-armed in the same flip
+	last = val;
+	for (uint32_t k = 0; k < nseen; k++)
+		if (seen[k] == val) {   // ring wrapped (every buffer rendered once) AND >= xebbms since the first surface
+			uint64_t now = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+			if (now - gXeBhFirstNs >= (uint64_t)gXeBhMinMs * 1000000ULL) xeBootHoldRelease(nullptr);   // CTL first, this SURF arms both
+			return val;
+		}
+	if (nseen < 8) seen[nseen++] = val;
+	return val;
+}
 static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
+	xeBootDiagRecord(reg, val);
+	val = xeBootHold(reg, val);
 	if (!xeFixEnabled()) return val;
 	val = xeNoDpms((uint32_t)(reg & 0x1FFFFF), val);
 	// 20/10 (XE-BLR): o brilho ia só até ~50%. Como o BacklightRegistersFix do WhateverGreen: mantém o período do
@@ -4834,8 +4961,21 @@ bool Gen11::AppleIntelBaseControllerstart(AppleIntel::AppleIntelBaseController *
 	SYSLOG("ngreen", "AppleIntelBaseControllerstart: display workarounds applied");
 
 	SYSLOG("ngreen", "FBController::start() entering...");
+	xeBootHoldInit();
+	xeBootDiagDump("pre-FBstart");
 	auto ret=FunctionCast(AppleIntelBaseControllerstart, callback->oAppleIntelBaseControllerstart)(that,param_1 );
 	SYSLOG("ngreen", "FBController::start() returned %d", ret);
+	xeBootDiagDump("post-FBstart");
+	{   // again 10 s and 40 s later (thread context): writes made while the boot screen/progress bar were up and at the WindowServer handoff
+		static thread_call_t tc10 = nullptr, tc40 = nullptr;
+		if (!tc10) {
+			tc10 = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { xeBootDiagDump("t+10s"); }, nullptr);
+			tc40 = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { xeBootDiagDump("t+40s"); }, nullptr);
+			uint64_t d10, d40; clock_interval_to_deadline(10, kSecondScale, &d10); clock_interval_to_deadline(40, kSecondScale, &d40);
+			if (tc10) thread_call_enter_delayed(tc10, d10);
+			if (tc40) thread_call_enter_delayed(tc40, d40);
+		}
+	}
 	
 	if (ret) {
 		// The personality dict itself was registered in IOCatalogue from the HW-kext
@@ -11069,7 +11209,10 @@ uint8_t Gen11::enableController(AppleIntel::AppleIntelFramebuffer *that)
 uint8_t Gen11::setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2)
 {
 	if (getMember<uint32_t>(that, 0x1dc)==0) getMember<uint8_t>(that, 0x1e0)=1;
-	return FunctionCast(setDisplayMode, callback->osetDisplayMode)(that,param_1,param_2 );
+	xeBootDiagDump("pre-setDisplayMode");
+	auto r = FunctionCast(setDisplayMode, callback->osetDisplayMode)(that,param_1,param_2 );
+	xeBootDiagDump("post-setDisplayMode");
+	return r;
 
 }
 

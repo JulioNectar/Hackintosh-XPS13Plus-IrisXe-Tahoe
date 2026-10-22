@@ -8,6 +8,8 @@ The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
 
 | Date | Change | Status |
 |---|---|---|
+| 2026-10-21 | **Clean, fast boot screen**: OpenCore `Resolution=Max`; WhateverGreen `gfxrst=1` (its framebuffer-copy mode read the whole boot screen through a slow mapping: ~18 s at 3840x2400, the "Max is slow" effect); NootedGreen **XE-BOOTHOLD** keeps the backlight and plane A off from Apple's first tiled plane write until WindowServer's buffer ring wraps (no garbage flash; `-xenobb` disables, `xebbms=` tunes); OpenCore file logging off and picker timeout 1 s | confirmed |
+| 2026-10-21 | `xe-brilho daemon` no longer restores its saved level at login (it lowered the panel behind the macOS slider); signed with a stable identity so Accessibility survives rebuilds | confirmed |
 | 2026-10-21 | **libxedrv v17**: private render-target Stencil8/X32_Stencil8 textures that are not 64 KB-aligned are re-created in their own 64 KB-aligned heap (the driver used 4 KB alignment). Fixes the streaks in the lock-screen clock (SwiftUI RenderBox stencil pass). `XE_STENCIL_NATIVO=1` turns it off | confirmed |
 | 2026-10-21 | **libxedrv v16**: buffer fills and aligned buffer copies no longer use the driver's 2D blitter path, which is not ordered against later 3D work in the same command buffer on this stack. Fixes Chrome (Graphite/Dawn) drawing with a zeroed index buffer (missing icons, logo as a bar), which looked cache-related only because a warm start loses the race; also affects any Metal app (stress test 9/227 → 0 errors). `XE_FILL_NATIVO=1` / `XE_COPIA_NATIVA=1` turn it off | confirmed |
 | 2026-10-21 | CpuTopologyRebuild 2.0.2 enabled (default mode, no HT patch): 4 P-cores × 4 threads, System Information shows 12 cores | confirmed |
