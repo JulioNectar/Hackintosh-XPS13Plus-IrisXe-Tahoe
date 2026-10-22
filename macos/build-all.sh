@@ -9,6 +9,11 @@
 set -e
 SLE=${1:?pasta sle/ (bundles 16.0.32)}
 HERE=${0:A:h}; OUT=$HERE/out
+# FAT/exFAT (USB sticks) keep macOS metadata in "._" files: bundles copied there break codesign and the build
+for d in $HERE $SLE; do
+  fs=$(diskutil info "$(df -P "$d" | awk 'NR==2{print $1}')" 2>/dev/null | awk -F': *' '/Type \(Bundle\)/{print $2}')
+  [[ $fs == (apfs|hfs) ]] || { echo "$d is on a '$fs' volume: put the repository and NootedGreen on an APFS disk (e.g. your home folder)"; exit 1; }
+done
 mkdir -p $OUT
 clang -arch x86_64 -mmacosx-version-min=15.0 -dynamiclib -fno-objc-arc -O2 \
   -framework Foundation -framework Metal -framework IOSurface -lobjc \

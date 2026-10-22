@@ -50,6 +50,9 @@ from the repository).
 
 ## 5. User-space side
 
+Keep the repository and the NootedGreen download on an APFS disk (your home folder), not on a FAT/exFAT USB
+stick: macOS stores metadata there in `._` files, which break the bundle copies and code signing.
+
 ```sh
 zsh macos/build-all.sh /path/to/sle_Internal/sle
 sudo zsh macos/install-macos.sh /path/to/sle_Internal/sle /path/to/sle_Internal/le

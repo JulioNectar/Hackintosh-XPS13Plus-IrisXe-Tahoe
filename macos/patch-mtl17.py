@@ -35,7 +35,7 @@ def main():
     patches = json.load(open(os.path.join(here, 'mtl17-patches.json')))
     out = os.path.join(outdir, 'AppleIntelTGLGraphicsMTLDriver.bundle')
     if os.path.exists(out):
-        shutil.rmtree(out)
+        subprocess.run(['/bin/rm', '-rf', out], check=True)   # shutil.rmtree trips over vanishing "._" files
     shutil.copytree(stock, out, symlinks=True)
     binp = os.path.join(out, 'Contents/MacOS/AppleIntelTGLGraphicsMTLDriver')
     b = bytearray(open(binp, 'rb').read())
