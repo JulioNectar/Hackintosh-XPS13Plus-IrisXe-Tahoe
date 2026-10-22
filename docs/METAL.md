@@ -84,8 +84,19 @@ An ObjC dylib loaded into every Metal client (WindowServer included) by the driv
    The underlying 2D↔3D segment fence is a kernel-side gap (BCS/RCS sync) and still applies to 2D texture blits,
    which have not been seen to fail.
 
+7. **Stencil8 render targets aligned to 64 KB (v17, the lock-screen clock fix)**: the 16.0.32 driver places private
+   `Stencil8` textures with 4 KB alignment, although every other tiled render target (and the driver's own
+   `heapTextureSizeAndAlignWithDescriptor:`) uses 64 KB. A stencil that starts inside the last 64 KB block of a
+   ≥32 bpp colour target used in the same render pass loses its writes on every odd 64-byte line up to the next 64 KB
+   boundary (standalone repro: 5/5 failures; a 16 bpp colour target or a stencil in its own block is fine). SwiftUI's
+   RenderBox draws the Liquid Glass clock digits exactly that way (R16F + RG16F + Stencil8), so the stencil test failed
+   in 4-row bands: streaks above the digits. v17 re-creates a private render-target `Stencil8`/`X32_Stencil8` texture
+   that is not 64 KB aligned in its own `MTLHeap` (size rounded up to 64 KB), so it owns whole blocks (log line
+   `STENCIL64K`). The likely hardware reason (64 KB units for ≥32 bpp colour targets) is inferred, not documented.
+
 Environment switches: `XE_COMPRESSAO=1` keeps compression, `XE_NOCOPY_ZERO=1` disables fix 4, `XE_FILL_NATIVO=1`
-disables fix 6, `XE_COPIA_NATIVA=1` keeps aligned buffer copies on the 2D path (fills stay fixed).
+disables fix 6, `XE_COPIA_NATIVA=1` keeps aligned buffer copies on the 2D path (fills stay fixed),
+`XE_STENCIL_NATIVO=1` disables fix 7.
 
 ## 4. Shader compiler (xe.bundle)
 

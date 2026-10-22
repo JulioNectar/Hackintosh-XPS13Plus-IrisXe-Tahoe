@@ -1,4 +1,4 @@
-// audctl: user-space tool for the AudShim kext (milestones M1/M1b/M2/M2b/M3/M4/M5, audctl 0.7.0).
+// audctl: user-space tool for the AudShim kext (milestones M1/M1b/M2/M2b/M3/M4/M5/M6, audctl 0.8.0).
 // Intel cAVS 2.5 audio DSP, PCI 8086:51CA (RPL-P), Dell XPS 13 Plus 9320.
 //
 //   audctl info               PCI IDs, command/status, BAR addresses and sizes, PM state
@@ -40,6 +40,11 @@
 //                             the full reverse teardown; opts --seconds N --level dB --channel=both|left|right
 //                             --no-play (= audctl m5a: everything except the channel enable / DMA / TRIG_START)
 //   audctl m5 --undo | --state  rollback (amps muted + PS3 first) / state incl. the M5 kext state
+//   audctl gen-header [OUT.h] M6 (offline): writes tools/AudShim/AudShimData.h = firmware payload + the IPC3 plan +
+//                             SoundWire/RT1316 tables, compiled into the kext for its autonomous driver mode
+//   audctl drv state|open|start|stop|close   M6: the kext driver mode (interface v8) through a driver connection
+//   audctl drv test [--seconds=N] [--level=dB]  M6: OPEN, map the shared ring, sine, START/STOP twice, CLOSE
+//                             (only when no other driver connection, i.e. the XeSpeakers HAL plug-in, owns it)
 //
 // Everything except `m2` (without --dry/--state) is read-only. (Since M1b the kext itself sets
 // PCI COMMAND.MSE once at start, unless booted with -audshimnomse; `info` reports it.) The M2
@@ -70,6 +75,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include <time.h>
+#include <mach/mach_time.h>
 
 static io_connect_t conn;
 
@@ -469,7 +475,7 @@ static void flush_to_disk(void) {
 
 static void cmd_m1(int hda_only) {
     struct caps c = {0};
-    printf("AudShim M1 dump (read-only; audctl 0.7.0)\n");
+    printf("AudShim M1 dump (read-only; audctl 0.8.0)\n");
     cmd_info();
     m1_cfg();
     m1_bar0(&c);
@@ -782,7 +788,7 @@ static int cmd_m2(int argc, char **argv) {
     if (dry + undo + state > 1) { fprintf(stderr, "m2: --dry, --undo and --state are exclusive\n"); return 2; }
 
     if (dry) {
-        printf("audctl 0.7.0  m2 --dry: NOTHING is armed or written.\n");
+        printf("audctl 0.8.0  m2 --dry: NOTHING is armed or written.\n");
         uint32_t c44 = 0x00, c48 = 0xFF, cs = 0x00000F0F; int live = 0;
         if (offline) printf("(--offline: kext not opened, using the M1 dump values)\n");
         else if (aud_open() == 0) {
@@ -818,7 +824,7 @@ static int cmd_m2(int argc, char **argv) {
     }
 
     if (undo) {
-        printf("audctl 0.7.0  m2 --undo: return DSP core 0 and cfg 0x44/0x48 to the M1 state\n");
+        printf("audctl 0.8.0  m2 --undo: return DSP core 0 and cfg 0x44/0x48 to the M1 state\n");
         if (m2call(M2_ARM, MAGIC_UNDO, 0, o)) return 1;
         if (o[0] != M2R_OK) { printf("  ARM(undo) %s (fail mask 0x%llx)\n", m2rc(o[0]), o[11]); m2_precheck(p, 1); return 1; }
         { uint64_t q[16]; if (m2call(M2B_INFO, 2, 0, q) == 0 && q[11])
@@ -833,7 +839,7 @@ static int cmd_m2(int argc, char **argv) {
     }
 
     // ---------------- the real M2 run
-    printf("audctl 0.7.0  m2 (ipc=%s, ROM poll %u ms%s)\n", ipc, romms, teardown ? ", teardown at end" : "");
+    printf("audctl 0.8.0  m2 (ipc=%s, ROM poll %u ms%s)\n", ipc, romms, teardown ? ", teardown at end" : "");
     uint32_t f = m2_precheck(p, 1);
     if (f == 0xFFFFFFFFu) return 1;
     if (f) {
@@ -2978,7 +2984,7 @@ static int cmd_boot(int argc, char **argv, int mode) {   // mode 0 m2b, 1 m3, 2 
     memset(&fw, 0, sizeof fw);
     uint64_t o[16], p[16];
     if (dry) {
-        printf("audctl 0.7.0  %s --dry: NOTHING is armed or written.\n", cmd);
+        printf("audctl 0.8.0  %s --dry: NOTHING is armed or written.\n", cmd);
         if (m3) { printf("\n"); if (fw_parse(&fw, op.fw, 1)) printf("  (firmware file problem: a real run would abort here)\n"); }
         if (m5) {
             printf("\n");
@@ -3048,7 +3054,7 @@ static int cmd_boot(int argc, char **argv, int mode) {   // mode 0 m2b, 1 m3, 2 
     }
 
     // ---------------- the real run
-    printf("audctl 0.7.0  %s (attempts %d, ROM poll %u ms, ctrl-reset %s, iccmax %s, L1SEN %s, SSP %s, PIE %s%s%s, %s)\n",
+    printf("audctl 0.8.0  %s (attempts %d, ROM poll %u ms, ctrl-reset %s, iccmax %s, L1SEN %s, SSP %s, PIE %s%s%s, %s)\n",
            cmd, op.attempts, op.romms, op.ctrl ? "on" : "OFF", op.icc ? "on" : "OFF", op.l1 ? "on" : "OFF",
            op.ssp ? "WRITE" : "record-only", op.pie ? "on" : "OFF", m3 ? ", FW_READY wait " : "",
            m3 ? (op.post ? "+ post_fw_run" : "") : "", op.leave ? "leave-up" : "teardown");
@@ -3386,6 +3392,219 @@ fail_nodump:
 #undef CALL
 }
 
+// ------------------------------------------------------------------ M6: gen-header (static data for the kext's driver mode)
+// Writes a C header with everything the kext needs to run the M3 -> M5 sequence by itself (AudShim 0.8.0
+// "driver mode"): the firmware payload (the .ri file minus its SOF extended manifest), the IPC3 messages that
+// pl_build() generates from the topology (set-up, PCM params/free, trigger, free, volume template), the speaker
+// DAI facts, the SoundWire transport parameters (m5_compute) and the RT1316 init table. Both paths stay: audctl
+// m5 keeps driving the kext op by op; the kext driver mode replays exactly these bytes.
+static void gh_escape(FILE *f, const char *s) {
+    fputc('"', f);
+    for (; *s; s++) { if (*s == '"' || *s == '\\') fputc('\\', f); fputc((unsigned char)*s >= 32 && (unsigned char)*s < 127 ? *s : '?', f); }
+    fputc('"', f);
+}
+static void gh_msg(FILE *f, const char *name, const struct ipcmsg *m) {
+    fprintf(f, "static const uint32_t %s[%u] = {", name, (m->len + 3) / 4);
+    for (uint32_t i = 0; i < m->len; i += 4) fprintf(f, "%s0x%08x", i ? (i % 32 ? ", " : ",\n    ") : "\n    ", le32(m->b + i));
+    fprintf(f, "\n};\n");
+}
+static int cmd_genheader(int argc, char **argv) {
+    char defpath[1024], tdef[1024];
+    const char *home = getenv("HOME");
+    snprintf(defpath, sizeof defpath, "%s/xe/build/audio/fw/use/sof-rpl.ri", home ? home : "");
+    snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/sof-rpl-rt1316-l12-rt714-l0.tplg", home ? home : "");
+    const char *out = "AudShimData.h", *fwp = defpath, *tpp = tdef;
+    for (int i = 0; i < argc; i++) {
+        if (!strncmp(argv[i], "--fw=", 5)) fwp = argv[i] + 5;
+        else if (!strncmp(argv[i], "--tplg=", 7)) tpp = argv[i] + 7;
+        else out = argv[i];
+    }
+    static struct fwfile fw; static struct tplg tp; static struct m5plan pl;
+    if (fw_parse(&fw, fwp, 0)) { fprintf(stderr, "gen-header: firmware %s unusable\n", fwp); return 1; }
+    if (tplg_load(&tp, tpp, 0) || pl_build(&tp, &pl, 0)) { fprintf(stderr, "gen-header: topology %s unusable\n", tpp); return 1; }
+    if (!pl.vol_0db.len || pl.vol_ch < 1 || pl.vol_ch > 8) { fprintf(stderr, "gen-header: no PGA volume control\n"); return 1; }
+    struct sdwxp x; m5_compute(&x, 0);
+    FILE *f = fopen(out, "w");
+    if (!f) { perror(out); return 1; }
+    uint32_t tfnv = 0;
+    { FILE *t = fopen(tpp, "rb"); if (t) { static uint8_t b[1 << 20]; size_t n = fread(b, 1, sizeof b, t); fclose(t); tfnv = fnv1a(b, n); } }
+    fprintf(f, "// AudShimData.h: GENERATED by `audctl gen-header` (audctl 0.8.0). Do not edit.\n"
+               "// firmware: %s (%zu bytes, payload %u bytes at offset %u, payload FNV-1a 0x%08x)\n"
+               "//   Intel SOF firmware, redistributable under LICENCE.Intel (~/xe/build/audio/fw/use/LICENCE.Intel)\n"
+               "// topology: %s (FNV-1a 0x%08x), speaker PCM '%s' (pcm %u)\n"
+               "// Consumed by AudShim.cpp (driver mode, M6). Regenerate after changing either file:\n"
+               "//   audctl gen-header tools/AudShim/AudShimData.h\n"
+               "#ifndef AUDSHIM_DATA_H\n#define AUDSHIM_DATA_H\n\n"
+               "struct AudDrvMsg { uint32_t len; const uint32_t *w; const char *what; };\n"
+               "struct AudDrvDai { uint32_t link, pdi, alh_id, ch, dai_index; };\n"
+               "struct AudDrvReg { uint32_t reg; uint8_t val; };\n\n",
+            fwp, fw.size, fw.psize, fw.off, fw.hash, tpp, tfnv, pl.pcm_name, pl.pcm_id);
+    // IPC messages
+    char nm[64];
+    for (int i = 0; i < pl.n; i++) { snprintf(nm, sizeof nm, "kDrvSetup%d", i); gh_msg(f, nm, &pl.m[i]); }
+    for (int i = 0; i < pl.nf; i++) { snprintf(nm, sizeof nm, "kDrvFree%d", i); gh_msg(f, nm, &pl.f[i]); }
+    gh_msg(f, "kDrvPcmParamsW", &pl.pcm_params); gh_msg(f, "kDrvPcmFreeW", &pl.pcm_free);
+    gh_msg(f, "kDrvTrigStartW", &pl.trig_start); gh_msg(f, "kDrvTrigStopW", &pl.trig_stop);
+    gh_msg(f, "kDrvVolumeW", &pl.vol_0db);
+    fprintf(f, "\n// widget set-up + routes + pipeline complete (FE prepare minus PCM_PARAMS), in the Linux order\n");
+    fprintf(f, "static const AudDrvMsg kDrvSetup[%d] = {\n", pl.n);
+    for (int i = 0; i < pl.n; i++) { fprintf(f, "    {%u, kDrvSetup%d, ", pl.m[i].len, i); gh_escape(f, pl.m[i].what); fprintf(f, "},\n"); }
+    fprintf(f, "};\n// widget free (FE hw_free)\nstatic const AudDrvMsg kDrvFree[%d] = {\n", pl.nf);
+    for (int i = 0; i < pl.nf; i++) { fprintf(f, "    {%u, kDrvFree%d, ", pl.f[i].len, i); gh_escape(f, pl.f[i].what); fprintf(f, "},\n"); }
+    fprintf(f, "};\n");
+    fprintf(f, "static const AudDrvMsg kDrvPcmParams = {%u, kDrvPcmParamsW, \"STREAM_PCM_PARAMS\"};\n", pl.pcm_params.len);
+    fprintf(f, "static const AudDrvMsg kDrvPcmFree = {%u, kDrvPcmFreeW, \"STREAM_PCM_FREE\"};\n", pl.pcm_free.len);
+    fprintf(f, "static const AudDrvMsg kDrvTrigStart = {%u, kDrvTrigStartW, \"STREAM_TRIG_START\"};\n", pl.trig_start.len);
+    fprintf(f, "static const AudDrvMsg kDrvTrigStop = {%u, kDrvTrigStopW, \"STREAM_TRIG_STOP\"};\n", pl.trig_stop.len);
+    fprintf(f, "// COMP_SET_VALUE template for the PGA: channel c value at byte 96 + 8 * c\n");
+    fprintf(f, "static const AudDrvMsg kDrvVolume = {%u, kDrvVolumeW, \"COMP_SET_VALUE PGA\"};\n", pl.vol_0db.len);
+    fprintf(f, "static const uint32_t kDrvPgaComp = %u, kDrvVolCh = %u, kDrvVolMin = 0x%x, kDrvVolMax = 0x%x, kDrvHostComp = %u;\n",
+            pl.pga_comp, pl.vol_ch, pl.vol_min, pl.vol_max, pl.host_comp);
+    // DAIs in BE cpu-DAI order: link 1 first
+    fprintf(f, "\n// speaker DAIs (BE hw_params order: SDW1 Pin2, SDW2 Pin2)\nstatic const AudDrvDai kDrvDai[2] = {\n");
+    for (int k = 0; k < 2; k++) {
+        const struct m5dai *dd = &pl.dai[pl.dai[0].link == (uint32_t)(k + 1) ? 0 : 1];
+        fprintf(f, "    {%u, %u, %u, %u, 0x%x},   // %s\n", dd->link, dd->pdi, dd->alh_id, dd->ch, dd->dai_index, dd->wname);
+    }
+    fprintf(f, "};\n\n// SoundWire transport/port parameters (m5_compute, generic_bandwidth_allocation.c)\n");
+    fprintf(f, "static const uint32_t kDrvXpSi = %u, kDrvXpHstart = %u, kDrvXpHstop = %u, kDrvXpOff1 = %u, kDrvXpOff2 = %u,\n"
+               "                      kDrvXpBps = %u, kDrvXpChMask = 0x%x;\n", x.si, x.hstart, x.hstop, x.offset1, x.offset2, x.bps, x.chmask);
+    fprintf(f, "\n// rt1316_io_init blind writes (rt1316-sdw.c:71-129), after 0xc000 = 0x02\nstatic const AudDrvReg kDrvRtBlind[%zu] = {\n",
+            sizeof rt1316_blind / sizeof rt1316_blind[0]);
+    for (size_t k = 0; k < sizeof rt1316_blind / sizeof rt1316_blind[0]; k++)
+        fprintf(f, "%s{0x%x, 0x%02x},%s", k % 6 ? " " : "    ", rt1316_blind[k].reg, rt1316_blind[k].val, (k % 6 == 5) ? "\n" : "");
+    fprintf(f, "\n};\n");
+    fprintf(f, "\n// firmware payload (DMA image, starts with $CPD)\nstatic const uint32_t kDrvFwLen = %u, kDrvFwHash = 0x%08x;\n", fw.psize, fw.hash);
+    fprintf(f, "static const uint8_t kDrvFw[%u] __attribute__((aligned(16))) = {\n", fw.psize);
+    const uint8_t *p = fw.data + fw.off;
+    for (uint32_t i = 0; i < fw.psize; i++) fprintf(f, "%s0x%02x,%s", i % 16 ? "" : "    ", p[i], i % 16 == 15 ? "\n" : "");
+    fprintf(f, "};\n\n#endif\n");
+    fclose(f);
+    printf("wrote %s: %d set-up + %d free IPC messages, PGA comp %u (%u ch), DAIs ALH %u/%u, %zu RT1316 writes,\n"
+           "  firmware payload %u bytes FNV-1a 0x%08x\n", out, pl.n, pl.nf, pl.pga_comp, pl.vol_ch, pl.dai[0].alh_id, pl.dai[1].alh_id,
+           sizeof rt1316_blind / sizeof rt1316_blind[0], fw.psize, fw.hash);
+    free(fw.data);
+    return 0;
+}
+
+// ------------------------------------------------------------------ M6: drv (kext driver mode, test from the terminal)
+#include "AudShim/AudShimDrv.h"
+static io_connect_t dconn;
+static int drv_open_conn(void) {
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AudShim"));
+    if (!svc) { fprintf(stderr, "AudShim not loaded\n"); return -1; }
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), AUDSHIM_DRV_CONN_TYPE, &dconn);
+    IOObjectRelease(svc);
+    if (kr) { fprintf(stderr, "IOServiceOpen(driver connection): 0x%x (needs AudShim 0.8.0)\n", kr); return -1; }
+    return 0;
+}
+static int drv_call(uint64_t op, uint64_t a0, uint64_t o[16]) {
+    uint64_t in[2] = {op, a0}; uint32_t n = 16;
+    memset(o, 0, 16 * sizeof o[0]);
+    kern_return_t kr = IOConnectCallScalarMethod(dconn, AUDSHIM_METHOD_DRV, in, 2, o, &n);
+    if (kr) { fprintf(stderr, "driver method: 0x%x\n", kr); return -1; }
+    return 0;
+}
+static const char *drv_st(uint64_t s) { static const char *n[] = {"IDLE", "BUSY", "READY", "RUNNING", "FAILED"}; return s < 5 ? n[s] : "?"; }
+static const char *drv_rc(uint64_t r) {
+    static const char *n[] = {"ok", "busy (another driver connection owns the hardware, e.g. coreaudiod)", "suspended (sleep/shutdown)",
+                              "FAILED (see kernel log: AudShim DRV)", "bad op", "not ready", "retry later (recent failure)"};
+    return r < 7 ? n[r] : "?";
+}
+static void drv_print_state(void) {
+    uint64_t o[16];
+    if (drv_call(kDrvOpState, 0, o)) return;
+    printf("state %s, last failure step %llu code %llu; gain applied 0x%llx (cap 0x%llx = -%llu dB), requested 0x%llx%s\n"
+           "starts %llu, bring-ups %llu (last %llu ms), DSP notifications %llu (xruns %llu), host DMA errors %llu, suspended %llu,%s iface v%llu\n",
+           drv_st(o[1]), o[2], o[3], o[4], o[5], o[6], o[13] & 0xFFFFFFFF, (o[13] >> 32) ? " (muted)" : "", o[7], o[11], o[12], o[9], o[8],
+           o[10], o[14] & 1, (o[14] & 2) ? " LINGERING (deferred stop pending)," : "", o[15]);
+}
+static int cmd_drv(int argc, char **argv) {
+    const char *c = argc > 0 ? argv[0] : "state";
+    if (drv_open_conn()) return 1;
+    uint64_t o[16];
+    int rc = 0;
+    if (!strcmp(c, "state")) drv_print_state();
+    else if (!strcmp(c, "open") || !strcmp(c, "start") || !strcmp(c, "stop") || !strcmp(c, "close")) {
+        // NOTE: this connection owns the hardware only while this process lives; when audctl exits the kext tears
+        // everything down again (client death). "open"/"start" here are therefore only useful as quick checks.
+        uint64_t op = !strcmp(c, "open") ? kDrvOpOpen : !strcmp(c, "start") ? kDrvOpStart : !strcmp(c, "stop") ? kDrvOpStop : kDrvOpClose;
+        struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+        if (drv_call(op, 0, o)) return 1;
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        printf("%s: %s (%.0f ms)\n", c, drv_rc(o[0]), (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6);
+        drv_print_state();
+        rc = o[0] ? 1 : 0;
+    } else if (!strcmp(c, "test")) {
+        // end-to-end check of the driver mode without coreaudiod: OPEN, map the ring, write a ~1 kHz sine (looping, like
+        // M5), START, watch the position for N seconds, STOP, START/STOP a second time, CLOSE.
+        double secs = 2.0, level = -30.0;
+        for (int i = 1; i < argc; i++) {
+            if (!strncmp(argv[i], "--seconds=", 10)) secs = strtod(argv[i] + 10, NULL);
+            else if (!strncmp(argv[i], "--level=", 8)) level = strtod(argv[i] + 8, NULL);
+        }
+        if (!(secs >= 0.5 && secs <= 5)) { fprintf(stderr, "--seconds 0.5..5\n"); return 2; }
+        if (!(level >= -60 && level <= -12)) { fprintf(stderr, "--level -60..-12 dBFS\n"); return 2; }
+        printf("audctl 0.8.0 drv test: %.1f s of a ~1 kHz sine at %.1f dBFS through the kext driver mode, 3 times:\n"
+               "  round 1 = first START, round 2 = resume 0.3 s after STOP (deferred stop pending), round 3 = START 6 s later\n"
+               "  (after the deferred stop really stopped the stream: amps PS3, DMA off, widgets kept)\n", secs, level);
+        struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+        if (drv_call(kDrvOpOpen, 0, o)) return 1;
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        printf("OPEN: %s (%.0f ms)\n", drv_rc(o[0]), (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6);
+        drv_print_state();
+        if (o[0]) return 1;
+        // PGA to 0 dB (the kext clamps to its cap); the sine level sets the loudness
+        if (drv_call(kDrvOpVolume, 0x10000, o)) return 1;
+        for (int round = 1; round <= 3; round++) {
+            mach_vm_address_t addr = 0; mach_vm_size_t size = 0;
+            kern_return_t kr = IOConnectMapMemory64(dconn, AUDSHIM_MEM_RING, mach_task_self(), &addr, &size, kIOMapAnywhere);
+            if (kr || size < AUDSHIM_RING_BYTES) { fprintf(stderr, "map ring: 0x%x size %llu\n", kr, (unsigned long long)size); rc = 1; break; }
+            if (drv_call(kDrvOpStart, 0, o)) { rc = 1; break; }
+            printf("START %d: %s\n", round, drv_rc(o[0]));
+            if (o[0]) { drv_print_state(); rc = 1; break; }
+            // the kext zeroes the ring at START; fill it now (the DMA plays ~6 ms of silence first)
+            double fr; int32_t pk;
+            m5_sine((int32_t *)(uintptr_t)addr, level, 0, &fr, &pk);
+            uint64_t p[8]; uint32_t n = 8, prev = 0; uint64_t moved = 0;
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            uint64_t t0 = 0, tl = 0;
+            double el = 0;
+            while (el < secs) {
+                usleep(20000);
+                n = 8;
+                if (IOConnectCallScalarMethod(dconn, AUDSHIM_METHOD_POS, NULL, 0, p, &n)) { fprintf(stderr, "pos failed\n"); rc = 1; break; }
+                if (!t0) { t0 = p[2]; prev = (uint32_t)p[1]; tl = p[2]; continue; }   // measure from the first sample
+                moved += (uint32_t)((p[1] - prev) & 0xFFFF); prev = (uint32_t)p[1];
+                el = (double)(p[2] - t0) * tb.numer / tb.denom / 1e9;
+                if (p[2] - tl > 250000000ull * tb.denom / tb.numer) {
+                    printf("  t=%5.2f s state %s DPIB 0x%05llx LPIB 0x%05llx moved %llu B (%.0f B/s) SD 0x%08llx xruns %llu gen %llu\n", el,
+                           drv_st(p[0]), p[1], p[5], (unsigned long long)moved, el > 0 ? moved / el : 0, p[4], p[6], p[3]);
+                    tl = p[2];
+                }
+                if (p[0] != kDrvStRunning) { printf("  !! state %s\n", drv_st(p[0])); rc = 1; break; }
+            }
+            if (!rc && (el <= 0 || moved < 0.8 * 384000.0 * el || moved > 1.2 * 384000.0 * el)) {
+                printf("  !! the host DMA did not move at the 48 kHz rate (%.2f s of audio in %.2f s)\n", moved / 384000.0, el);
+                rc = 1;
+            }
+            if (drv_call(kDrvOpStop, 0, o)) { rc = 1; break; }
+            printf("STOP %d: %s; moved %llu B = %.2f s of audio in %.2f s\n", round, drv_rc(o[0]), (unsigned long long)moved, moved / 384000.0, el);
+            IOConnectUnmapMemory64(dconn, AUDSHIM_MEM_RING, mach_task_self(), addr);
+            if (o[0] || rc) { rc = 1; break; }
+            if (round == 1) usleep(300000);
+            else if (round == 2) { printf("  waiting 6 s for the deferred stop...\n"); sleep(6); drv_print_state(); }
+        }
+        drv_call(kDrvOpClose, 0, o);
+        printf("CLOSE: %s\n", drv_rc(o[0]));
+        drv_print_state();
+        printf("\nDRV TEST RESULT: %s\n", rc ? "FAILURE (see `log show --last 5m --predicate 'eventMessage CONTAINS \"AudShim\"'`)" :
+                                             "SUCCESS -> did you hear the ~1 kHz tone three times from both speakers?");
+    } else { fprintf(stderr, "drv: state | open | start | stop | close | test [--seconds=N] [--level=dB]\n"); rc = 2; }
+    IOServiceClose(dconn);
+    return rc;
+}
+
 // ------------------------------------------------------------------ main
 
 static uint32_t num(const char *s) { return (uint32_t)strtoul(s, NULL, 0); }
@@ -3404,7 +3623,9 @@ int main(int argc, char **argv) {
                         "       audctl m5 --dry [--offline] [--hex] | m5 [m4 options] [--seconds N (0.5..3, default 2)] [--level dB\n"
                         "                  (-60..-12, default -30)] [--channel=both|left|right] [--no-play] [--tplg=PATH] | m5 --undo | m5 --state\n"
                         "       audctl m5a [...]    = m5 --no-play (M5a: topology/pipeline/amp set-up and teardown, no audio)\n"
-                        "       audctl tplg [PATH] [--hex] [--plan]   topology dump + generated IPC3 messages (offline)\n");
+                        "       audctl tplg [PATH] [--hex] [--plan]   topology dump + generated IPC3 messages (offline)\n"
+                        "       audctl gen-header [OUT.h] [--fw=PATH] [--tplg=PATH]   M6: static data header for the kext driver mode\n"
+                        "       audctl drv state | open | start | stop | close | test [--seconds=N] [--level=dB]   M6: kext driver mode\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -3414,12 +3635,14 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "m4")) return cmd_boot(argc - 2, argv + 2, 2);
     if (!strcmp(argv[1], "m5")) return cmd_boot(argc - 2, argv + 2, 3);
     if (!strcmp(argv[1], "m5a")) return cmd_boot(argc - 2, argv + 2, 4);
+    if (!strcmp(argv[1], "gen-header")) return cmd_genheader(argc - 2, argv + 2);   // offline (M6)
+    if (!strcmp(argv[1], "drv")) return cmd_drv(argc - 2, argv + 2);                 // M6 driver mode
     if (!strcmp(argv[1], "tplg")) {   // offline: topology dump + the generated IPC3 plan (no kext needed)
         static struct tplg tp; static struct m5plan pl;
         char tdef[1024]; const char *home = getenv("HOME"), *path = NULL; int hex = 0, quiet = 0;
         snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/sof-rpl-rt1316-l12-rt714-l0.tplg", home ? home : "");
         for (int i = 2; i < argc; i++) { if (!strcmp(argv[i], "--hex")) hex = 1; else if (!strcmp(argv[i], "--plan")) quiet = 1; else path = argv[i]; }
-        printf("audctl 0.7.0  tplg: ALSA/SOF topology parser + IPC3 plan for the speaker PCM (read-only, no kext access)\n\n");
+        printf("audctl 0.8.0  tplg: ALSA/SOF topology parser + IPC3 plan for the speaker PCM (read-only, no kext access)\n\n");
         if (tplg_load(&tp, path ? path : tdef, 1)) return 1;
         if (!quiet) tplg_dump(&tp);
         printf("\n-- speaker playback plan (what Linux sends for 'Speaker', pcm 2) --\n");

@@ -8,10 +8,13 @@ log) on a different driver build.
 The fixes below are active with the boot-args shipped in `EFI/OC/config.plist`:
 
 ```
-IGLogLevel=3 msgbuf=400000 -ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp
+IGLogLevel=3 -ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp
 -ngreenv189 -ngreenkeepefi -ngreenxefix -ngreenfixbootmode amfi_get_out_of_my_way=1 ngreenSched=4 ngreenV142=3
-ngreenblmax=48000
+ngreenblmax=17777 gfxrst=1
 ```
+
+`gfxrst=1` is a WhateverGreen argument: it stops WEG's boot-framebuffer copy, which took ~18 s at 3840×2400 with
+OpenCore `Resolution=Max` (see XE-BOOTHOLD below and [EXPERIMENTS.md](EXPERIMENTS.md) #76).
 
 `-ngreenxefix` turns on the Raptor Lake / Tahoe fix set. Lilu truncates boot-args at about 228 characters, so keep the
 line short.
@@ -31,6 +34,7 @@ were tried and dropped are in [EXPERIMENTS.md](EXPERIMENTS.md).
 | XE-FMT | `performTransaction` reads the frame format from `IOSurface+0xa4`; Tahoe moved it (now `+0x80`) → plane programmed as YUV 4:2:2 (green screen) | force `'BGRA'` | — |
 | fixbootmode | WindowServer aborted (no display mode / timings at start) | inject detailed timings early | `-ngreenfixbootmode` is opt-in |
 | XE-BLR | Brightness topped out at ~50 % | keep the hardware PWM period, rescale duty (`ngreenblmax`) | `-ngreennoblr` |
+| XE-BOOTHOLD (v4) | ~1 s of garbage at the first mode set: Apple re-declares the boot buffer X-tiled and WindowServer's first ring buffers are shown before they are drawn | from Apple's first tiled PLANE_CTL write, keep plane A and the backlight (`BLC_PWM_PCH_CTL1` bit 31) off until a PLANE_SURF address repeats (WindowServer's ring has wrapped) and at least `xebbms` ms (default 600) have passed; safety release after `xebbms`+900 ms. One-shot per boot. Also logs `XeNG BOOTDIAG` register snapshots | `-xenobb` |
 
 ## Command submission (host scheduler, no GuC)
 

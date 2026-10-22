@@ -9,7 +9,8 @@ This is the long version. For the current state read [STATUS.md](STATUS.md); for
 abandoned approach is collected in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 The work was done by the owner of the laptop ("the user") pair-programming with Claude (Anthropic) ("the assistant"),
-over about six days in October 2026.
+over about a week in October 2026. From 21 Oct the work widened from graphics to the rest of the laptop (Wi-Fi,
+boot screen, sleep, touchpad haptics and, from 21–22 Oct, the internal speakers: Phases 22–25).
 
 ## Conventions
 
@@ -22,7 +23,8 @@ over about six days in October 2026.
   `IOAcceleratorFamily2` (25G241). Kernel patches are applied by pattern search, so the offsets are informational.
 - **Names.** Kernel patches written for this project are tagged `XE-*` (or `xe/*` in the source) and most are enabled
   by `-ngreenxefix`. Patches inherited from the NootedGreen lineage are `V1…V509`. Metal driver builds are `v1…v12`,
-  then `MTL13…MTL18`. The user-space adapter is `libxedrv` (v7…v15).
+  then `MTL13…MTL18`. The user-space adapter is `libxedrv` (v7…v17). The audio kext `AudShim` was built in milestones
+  `M1…M6` (versions 0.1.0…0.8.0).
 - **Uncertain points** are marked *(uncertain)*. Hypotheses that were later disproved are labelled as such.
 - Development-tree paths (`build/…`, `nooted/tahoe/…`) are from the working tree the repository was later cut from.
   The repository equivalents are in `src/`, `macos/` and `tools/`.
@@ -64,6 +66,11 @@ over about six days in October 2026.
 | 18 | 20 Oct 14:30 → 17:30 | Clean-install regressions; repository | PLANES2, NOGVA, libxedrv v15 icons fix, reproducible build |
 | 19 | 20 Oct, after the repository | Audit and new problems | MTL v11 byte bug → MTL18 (in test); display sleep; colour-profile panics |
 | 20 | 20 Oct evening → 21 Oct | Hardware video decode | H.264 decodes on VDBOX, bit-exact; HEVC plugin fixed |
+| 21 | 21 Oct | Stability, touch and E-cores | Fast shutdown, 16 threads, touchscreen gestures |
+| 22 | 21 Oct | Chrome blits, lock-screen clock, `w30r` | libxedrv v16 (blit ordering) and v17 (Stencil8 alignment); XR formats are Apple-silicon-only |
+| 23 | 21 Oct afternoon | Boot screen and boot speed | `Resolution=Max` + `gfxrst=1` + XE-BOOTHOLD: clean boot, no 20 s stall |
+| 24 | 21–22 Oct | Wi-Fi, haptics, sleep, power, side investigations | Native Wi-Fi; vibration strength; no system sleep, lid → display off |
+| 25 | 21–22 Oct | Internal speakers (AudShim M1 → M6) | SOF firmware, SoundWire and RT1316 from our own kext; speakers are a macOS output device |
 
 ---
 
@@ -1079,6 +1086,128 @@ orphaned-memory code (`orphanIt`) as XE-NOORPHAN and the shutdown "corrupt list"
   logical_per_package 64, so xnu divided by threads-per-core = 0. Spoofing EBX[23:16] = 0x80 in `Cpuid1Data` fixed
   it: 16 threads.
 
+---
+
+## Phase 22 — Chrome blits, the lock-screen clock and `w30r` (21 Oct)
+
+**Chrome UI breakage (libxedrv v16).** Chrome (Graphite/Dawn) drew without toolbar icons, ignored `border-radius` and
+drew the Google logo as a bar, and it looked tied to the GPU disk cache: a fresh cache often helped, `xe-chrome-limpa.sh`
+and a locked cache folder lowered the odds. Several explanations were tested and dropped (EXPERIMENTS #70, #71): the
+Metal per-app function cache (a test with an empty, redirected cache was still broken), Dawn toggles (results were
+state-dependent, not toggle-dependent), XE-RCPOLICY and the newly enabled E-cores. The decisive tool was a capture
+library injected into a test Chrome that recorded pipelines, bound buffers and draw arguments, plus a standalone replay:
+the static **index buffer** of the rounded-rect draws was **all zero** on the GPU while its vertex buffer was correct.
+Dawn zero-fills each new buffer (`fillBuffer`) and then uploads Graphite's static data with copies in the same blit
+encoder. Small tests (`fillcopy`, `paths`, `fcoff`, `blitrender`) showed that the 16.0.32 driver runs fills and
+64-byte-aligned copies on a 2D blitter path and the other copies on a 3D path, and that 3D work in a command buffer is
+**not ordered** after earlier 2D writes in the same command buffer (11–17 of 20 wrong). A warm cache only made Chrome
+start faster, so it lost the race more often. **libxedrv v16** never writes buffers on the 2D path (fills become copies
+from a pattern buffer, aligned copies go through a misaligned temporary): a stress test went from 9/227 errors to 0, and
+a test Chrome profile from 2/12 to 12/12 correct launches. The login → desktop flash disappeared with it.
+
+**Lock-screen clock streaks (libxedrv v17).** SecurityAgent draws the Liquid Glass clock with SwiftUI's RenderBox
+(R16F + RG16F colour targets, a Stencil8 stencil). A SwiftUI test app reproduced the streaks without locking the screen,
+and a pass-dump library showed whole 4-row bands where the stencil test had failed. A freshly allocated stencil fixed
+it; its GPU address showed why: the driver places `Stencil8` with **4 KB** alignment (everything else 64 KB), so the
+stencil started inside the last 64 KB block of the RG16F target. A standalone repro failed 5/5 only when the colour
+target was ≥ 32 bpp and shared the block. **v17** moves such stencils into their own 64 KB-aligned heap. Details:
+[METAL.md](METAL.md) §3 items 6–7.
+
+**`w30r` / BGR10_XR.** The extended-range 10-bit layer format was examined in three layers: Metal's own format
+validation accepts the XR formats only on Apple-family GPUs, CoreAnimation maps `w30r` only when the device is Apple2+,
+and Gen12 has no XR-bias surface format to sample. A proof of concept that flips the checks in a test process also
+switches 10-bit video to Apple-only paths, so nothing was shipped (EXPERIMENTS #72). Real Intel Macs do not composite
+`w30r` layers either.
+
+---
+
+## Phase 23 — Boot screen and boot speed (21 Oct afternoon)
+
+**Goal.** Remove three glitches seen while booting: (1) a bright line early on, (2) a stretched low-resolution stage,
+and (3) about one second of garbage when the display switched to the native mode.
+
+- **Diagnostics first.** A NootedGreen build with XE-BOOTDIAG (log only) recorded Apple's writes to plane A, FBC, PSR,
+  CDCLK and backlight registers with timestamps, and dumped the kernel console description around the framebuffer
+  start. The first boot (16:17) killed the FBC theory: frame-buffer compression was never enabled (EXPERIMENTS #73).
+- **Glitch 2** was the 1024×768 GOP mode stretched to the panel. OpenCore `UEFI>Output>Resolution=Max` removed it, and
+  glitch 1 disappeared in the same boots (a CDCLK reprogramming theory was left untested, #75).
+- **Glitch 3** was Apple's first mode set: it re-declares the linear boot buffer as X-tiled and arms it with
+  `SURF=0`, then shows WindowServer's buffers before they have been drawn. **XE-BOOTHOLD** went through four versions
+  in one afternoon (#74): v1 kept the plane off until the first real surface, v2 until the second, v3 until a surface
+  address repeated (the buffer ring had wrapped); the flash remained, because part of it was not plane-A scanout. **v4**
+  also keeps the backlight off during the hold and releases it only after the ring wraps and at least 600 ms
+  (`xebbms`) have passed. Result: the logo is sharp from the first frame and nothing flashes.
+- **The 20 s stall.** With `Resolution=Max` WindowServer's "Creating FB 1 of 3" step took ~22 s instead of 2–6 s.
+  CoreDisplay's `needs_refresh = NO` appeared exactly in the Max boots, which pointed at IOGraphics' "keep the boot
+  logo" path. A NootedGreen route on `IOFramebuffer::initFB` (XE-MAXRES) **panicked at boot** twice: WhateverGreen
+  already routes that function, and Lilu refuses a second route on it (#77). Reading WhateverGreen's source found the
+  real cause: its default `gfxrst` mode copies the whole boot console framebuffer with the CPU through an uncached
+  mapping on the first `initFB` — 36.9 MB at 3840×2400, ~18 s, versus ~1.6 s for 3.1 MB at 1024×768 (the 11.6× ratio
+  matched the byte ratio). **`gfxrst=1`** (reset instead of copy) fixed it with a boot-arg only (#76).
+- **Boot speed.** A timeline of one boot showed the remaining fixed costs: OpenCore file logging (~3–4 s; now off),
+  the picker timeout (now 1 s), a 6.5 s wait for accelerator stamp 3 inside `IntelAccelerator::start` that always ends
+  by timeout (a shortcut was built but not installed, #78), the Aux KC load of the TGL kexts at ~7.5 s, and up to 25 s
+  of "reopen windows at login" before login items start.
+
+---
+
+## Phase 24 — Wi-Fi, haptics, sleep, power and side investigations (21–22 Oct)
+
+- **Native Wi-Fi.** Upstream itlwm has no Tahoe build. Two forks existed: laobamac's AirportItlwm-Tahoe (links Tahoe's
+  own IO80211Family/Skywalk, EFI-only change) and a legacy build that needs an OCLP-style root patch, breaks the system
+  seal and must be re-applied after every update (#79). An open issue reported the same AX211 CNVi failing with the
+  laobamac build, so it was tried as a reversible EFI change with itlwm disabled. It worked: native Wi-Fi menu, en0 is the
+  Wi-Fi port, HeliPort retired. AirDrop/AWDL is not possible with either fork.
+- **Touchpad haptics.** The Elan `04F3:31D1` HID descriptor has one host control, feature report 0x09 (vibration
+  intensity plus one more byte), and none of the Microsoft haptic trigger/waveform usages. `xe-haptic` sets it
+  (confirmed by feel; GET 0x09 returns nothing, so the value cannot be read back) and `xe-hapticbar` puts it in the menu
+  bar. The vendor packages showed that the pad is an Aito haptic module behind the Elan HID endpoint; no command for an
+  on-demand pulse was found (#82).
+- **Sleep.** The power log had zero sleep attempts in 88 boots. The firmware is Modern Standby only (LPIT, `S0ID`), the
+  DSDT hides `_S3`, and the TGL framebuffer cannot retrain eDP after a power cycle (the reason XE-FBDPMS only turns the
+  backlight off). With macOS defaults a lid close would have started an untested real sleep. Chosen: no system sleep
+  (`10-pmset-safe.sh`) and a small LaunchAgent, `xe-lid`, that turns the display off on lid close. Hibernation-only and
+  an injected `_S3` were prepared but not tried (#80).
+- **Power.** RAPL through XeShim: ~17 W package at PL1 while playing video, GT in RC6 ~90 % of the time, XCPM and HWP
+  active. SMCProcessor does not attach because Lilu does not know CPU model 0xBA (no CPU temperatures in the SMC). The
+  biggest idle consumer is the panel; display sleep is now on.
+- **Safari decode.** The WebKit GPU-process sandbox never allows executable mappings from `/Library/GPUBundles`, while
+  `/System/Library/Extensions` is allowed and is the second place the driver lookup tries. Sandbox overrides, symlinks
+  and Safari Technology Preview cannot work; a sealed-volume root patch was prepared and left unapplied (#81).
+- **iServices** readiness checked read-only (no identifiers recorded): SMBIOS consistent, APNs connected.
+- **Camera** identified (OmniVision OV01A10 behind an Intel VSC on the IPU6); no work started.
+
+---
+
+## Phase 25 — Internal speakers: AudShim M1 → M6 (21–22 Oct)
+
+**Starting point.** The audio function `8086:51CA` is an Intel cAVS 2.5 DSP in SOF mode. The speakers are two Realtek
+RT1316 amplifiers on SoundWire links 1 and 2, the microphones an RT714 codec on link 0. macOS has no driver for any of
+it, and AppleHDA is gone on Tahoe. The plan followed Linux's SOF driver step by step, with every hardware write
+whitelisted in the kext, logged, and undone by a rollback on failure or client death, and each milestone run by hand
+with `audctl` before the next was written.
+
+| Milestone | AudShim | What it did | Result |
+|---|---|---|---|
+| M1 | 0.1.0 | read-only register dump through a user client (no write method, read-only BAR maps, FIFO windows refused) | config space fine, but PCI memory decode was off: every MMIO read refused |
+| M1b | 0.2.0 | one 16-bit config write: Memory Space Enable | HDA registers readable (GCAP ISS 7 / OSS 9, capability chain with the processing pipe); the SoundWire shim reads 0 until the DSP is up |
+| M2 | 0.3.0 | DSP core 0 power-up and ROM handshake (`ROM_CONTROL` IPC) | **failed twice**: IPC sent after the core ran → no answer; IPC first (Linux order) → the ROM took the message and the SRAM window went to `0xffffffff` (#84, #85) |
+| M2b | 0.4.0 | the Linux prerequisites the ROM needs: controller reset cycle, `PPCTL` (GPROCEN/PIE), `EM2.L1SEN` off, bus mastering, the TGL-family **ICCMAX** capture stream with the LTR guardband, and the **code-loader stream** with the tag named in the IPC | ROM `INIT_DONE` (`0x05000001`, waiting for the DMA) on the first attempt. Before that, a pre-check had rejected this controller's 16 streams (#86); later it turned out the optional SSP write had been silently refused by the whitelist (#87) |
+| M3 | 0.5.0 | firmware download over the code-loader DMA: Intel-signed SOF 2.2.0 IPC3 image (`sof-rpl.ri`, 512 KB `$CPD` payload after the extended manifest) | ROM states through CSE validation to `FW_ENTERED`, then **FW_READY**: SOF 2.2.0, ABI 3.22.1 |
+| M4 | 0.6.0 | SoundWire link power-up, Cadence master start, enumeration driven from user space | RT714 on link 0, RT1316 on links 1 and 2, IDs as in the DSDT |
+| M5 | 0.7.0 | `audctl tplg` parses `sof-rpl-rt1316-l12-rt714-l0.tplg` and builds the same 25 IPC3 topology messages Linux sends; RT1316 init, SoundWire stream on links 1+2, host DMA, `TRIG_START` | M5a (no audio) then M5b: **a 1 kHz tone at −30 dBFS on both speakers**, DMA at exactly 48 kHz, 0 xruns, 43 IPCs all error 0 |
+| M6 | 0.8.0 | kext **driver mode** (the whole M3–M5 sequence in the kernel from a generated header, START/STOP with a 5 s deferred stop, −6 dB cap, PM-tree membership for teardown on sleep/shutdown) + the **XeSpeakers** AudioServerPlugIn (shared 64 KiB ring, DMA-position clock) | first install: the plug-in loaded and the hardware came up, but **coreaudiod dropped the device** — it queries several device properties in the input scope too, which the plug-in answered only for output (#88). Fixed: system sounds and music play through System Settings › Sound |
+
+**Why M2 failed.** In run 2 the ROM reacted to `ROM_CONTROL | PURGE_FW | tag 1` and then its SRAM window stopped decoding:
+it went looking for a host DMA stream with that tag, which did not exist. Every working implementation (Linux, and two
+earlier community macOS experiments on older cAVS) prepares that stream, enables bus mastering and resets the controller
+before the IPC; Linux additionally runs the ICCMAX stream on TGL-family parts. M2b added all of them at once, with
+switches to bisect them later; it never needed bisecting.
+
+**Firmware and data.** The firmware and topology are Intel's, from the official sof-bin release; the repository ships
+neither. `audctl gen-header` turns them into `AudShimData.h` (firmware payload, IPC messages, SoundWire parameters, the
+RT1316 init table), which the kext compiles in.
+
 ## Version index
 
 ### Metal driver (`AppleIntelTGLGraphicsMTLDriver.bundle`)
@@ -1115,7 +1244,9 @@ orphaned-memory code (`orphanIt`) as XE-NOORPHAN and the shutdown "corrupt list"
 | v12 | 18 Oct 23:15 | `allowGPUOptimizedContents = NO` on every texture (ineffective, kept) |
 | v13 | 20 Oct 16:17 | texture logging to `/tmp/xedrv-<process>.log` |
 | v14 | 20 Oct 16:25 | pipeline-creation logging |
-| v15 | 20 Oct 16:37 | **NOCOPY**: copy textures whose zero-copy offset is not 256-byte aligned (`XE_NOCOPY_ZERO=1` disables) — release |
+| v15 | 20 Oct 16:37 | **NOCOPY**: copy textures whose zero-copy offset is not 256-byte aligned (`XE_NOCOPY_ZERO=1` disables) |
+| v16 | 21 Oct | buffer fills and aligned buffer copies moved off the driver's 2D blit path (not ordered against later 3D work in the same command buffer): the Chrome fix (`XE_FILL_NATIVO=1`, `XE_COPIA_NATIVA=1` disable) |
+| v17 | 21 Oct | private render-target Stencil8 textures re-created 64 KB-aligned: the lock-screen clock fix (`XE_STENCIL_NATIVO=1` disables) — current |
 
 There were no libxedrv v10/v11 (MTL v10/v11 bundle v9).
 
@@ -1133,7 +1264,21 @@ V99 off, POOL, POOLALIGN, FLIPDIAG, SCHEDDIAG, `ngreenV142=3`, V193 off, BLITDIA
 EVALDIAG, FWREF, FWHOLD, FWSUBMIT, ELSQ, V509 logs, POSH, ELSQWAIT, NOPOSH, ELSQDELAY, ELSQIDLE (IDLW), ELSQRETRY,
 NOPREEMPT, POSHCTX, IDLEANY, NOAUX, NOTCF, NOTCF2, BLIT16, BLITSCRATCH, LOGQUIET, BLITSCRATCH2, PLANES, QUIETLOG,
 CSBGUARD, CSBGUARD2, NOPAGE, PAGEONGUARD, RPCS, SAMETAIL, POOL2, BLR, NODEPTH, RESFREE, GTFREQ, NOORPHAN, PLANES2,
-NOGVA. Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2.
+NOGVA, FBDPMS, BLITALIGN (v1, v2), PAGESYNC, GVAID, GVAHEVC, IDLEBOUND, RCPOLICY, csbresync, BOOTDIAG, BOOTHOLD (v1–v4).
+Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2 and [KERNEL-PATCHES.md](KERNEL-PATCHES.md).
+
+### Audio (`tools/AudShim`, `tools/audctl`, `tools/XeSpeakers`)
+
+| AudShim | Milestone | User-client interface | New capability |
+|---|---|---|---|
+| 0.1.0 | M1 | v1 | read-only config/MMIO reads |
+| 0.2.0 | M1b | v2 | PCI Memory Space Enable at start |
+| 0.3.0 | M2 | v3 | whitelisted DSP power-up and ROM IPC (failed) |
+| 0.4.0 | M2b | v4 | controller reset, PPCTL, L1SEN, bus mastering, ICCMAX + code-loader streams: ROM INIT_DONE |
+| 0.5.0 | M3 | v5 | firmware download, FW_READY |
+| 0.6.0 | M4 | v6 | SoundWire links, enumeration |
+| 0.7.0 | M5 | v7 | IPC3 messages, RT1316 init, playback: test tone |
+| 0.8.0 | M6 | v8 | driver mode for the XeSpeakers HAL plug-in (0.8.0): macOS output device |
 
 ---
 
@@ -1167,16 +1312,34 @@ NOGVA. Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2.
     silently corrupted two instructions in MTL v11 (Phase 19).
 13. **Leave disproved hypotheses written down:** GPU DMA corruption, forcewake, "3D state lost on context switch",
     POSH_LRCA, Tile Cache Flush, SIMD32, L3ALLOC, PSMI, topology — each was tested and recorded as not the cause.
+14. **A correlation is not a cause.** Chrome's breakage followed the GPU cache, and the 20 s boot stall followed
+    `needs_refresh = NO`; both were timing side effects of something else (a blit race, a CPU copy in WhateverGreen).
+    Capture-and-replay and reading the other kexts' source found the causes.
+15. **Check who else hooks a function before routing it.** WhateverGreen already routed `IOFramebuffer::initFB`; a second
+    Lilu route panics at boot. A boot-arg of the existing hook (`gfxrst=1`) was the whole fix.
+16. **Bring up unknown hardware the way Linux does, step by step, with a rollback for every write.** Each audio milestone
+    ran by hand with a dry-run plan, a whitelist in the kext and an automatic undo; the one failure (M2) was diagnosed
+    from what the ROM did to its SRAM window, and the missing prerequisites came straight from the Linux SOF driver.
+17. **The OS-facing layer matters as much as the hardware path.** The speakers worked from the kext long before macOS
+    showed the device: coreaudiod drops a device if any property it asks for, in any scope, is unanswered.
+18. **Know when the platform says no.** S3 is hidden by the firmware, AirDrop needs Apple's Wi-Fi stack, and the haptic
+    module has no pulse command; documenting the limit and the safe workaround (display-off on lid close) was the result.
 
 ## Open items
 
 - System Settings › Displays and colour-profile changes panic in GPU memory management; some mode switches go black
-  until reboot.
-- "corrupt list" panic at shutdown (`IOAccelSysMemory::free → IOAccelOrphanedMemoryPool::addMemory`).
-- Occasional GPU hang in long sessions (gpuRestart → WindowServer watchdog); the c01dbead Blit3D hang was never
-  root-caused.
-- Video: Safari cannot load the VA plugin (WebKit GPU-process sandbox) and decodes on the CPU; HEVC hardware decode needs
-  the `IOGVAHEVCDecode` property in NootedGreen; hardware encode untested; Chrome's GPU path draws blank windows.
-- Brightness keys; `w30r`/BGR10_XR; lock-screen clock glitch; Blit3D sampler-state tail beyond
-  `0xd000`; a fixed 1100 MHz floor instead of a real governor; E-cores off.
-- MTL18 verification.
+  until reboot (use `xe-res`).
+- "corrupt list" panic at shutdown (`IOAccelSysMemory::free → IOAccelOrphanedMemoryPool::addMemory`), rare.
+- Occasional WindowServer hang before login / on UI-scale changes (csbresync in testing); the c01dbead Blit3D hang was
+  never root-caused.
+- Video: Safari cannot load the VA plugin (WebKit GPU-process sandbox) and decodes on the CPU; the root patch that would
+  fix it is prepared but not applied. Hardware encode untested.
+- Brightness keys and lid events: on some boots the EC/Dell SMM does not report the sun keys or the lid (firmware state);
+  `xe-brilho daemon` covers F6/F7, nothing covers the lid on those boots.
+- No system sleep (Modern Standby firmware, eDP retraining); hibernation-only is the untested next experiment.
+- Audio: microphones (RT714) not configured; no speaker protection (−6 dB cap instead); the DSP stays powered while the
+  output device is open; power cost not measured.
+- 6.5 s accelerator stamp-3 wait at every boot (shortcut built, not tested); SMCProcessor does not attach (Lilu does not
+  know CPU model 0xBA).
+- Camera (OV01A10 + Intel VSC + IPU6) and fingerprint reader not started; `w30r`/BGR10_XR stays Apple-silicon-only.
+- MTL18 verification; a fixed GPU frequency floor (1500 MHz request) instead of a real governor.

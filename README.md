@@ -26,16 +26,25 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | HEIC / YUV images (wallpapers, photos) | ✅ |
 | App icons, Finder icons, image thumbnails | ✅ (the 10-bit extended-range layer format `w30r`/`BGR10_XR` is Apple-silicon-only: real Intel Macs don't render it either) |
 | Hardware video decode | ✅ **H.264 on the GPU** (bit-exact vs. software) for apps that use VideoToolbox: QuickTime, Photos, video editors, conversions. Needs `-ngreengva` and the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed by hand for now) · ✅ **HEVC** too (NootedGreen XE-GVAHEVC) · ⚠️ Safari decodes on the CPU: its WebKit GPU process may not load drivers from `/Library/GPUBundles` |
-| YouTube | ✅ Chrome with GPU compositing, up to 4K (VP9/AV1 decoded on the CPU) · ✅ Safari up to 1080p H.264 (needs an audio output: Bluetooth or the BlackHole virtual device, `tools/build-blackhole.sh`) |
+| YouTube | ✅ Chrome with GPU compositing, up to 4K (VP9/AV1 decoded on the CPU) · ✅ Safari up to 1080p H.264 (needs an audio output: the internal speakers, Bluetooth, or the BlackHole virtual device) |
 | Screen recording | ✅ |
 | Touchscreen | ✅ up to 10 fingers via VoodooI2C; `tools/xe-toque` adds one-finger scroll, hold-for-right-click, edge swipes, pen, magnifier and a touch mode |
 | Trackpad, keyboard | ✅ trackpad and touchscreen on GPIO/APIC interrupts (no polling freezes) |
 | Brightness | ✅ `tools/xe-brilho` (the macOS slider now covers the full panel range with `ngreenblmax=17777`) · ⚠️ the sun keys depend on a Dell firmware state that changes from boot to boot; F6/F7 always work through `xe-brilho daemon` |
 | Shutdown / restart | ✅ fast (XE-IDLEBOUND; used to stall ~3 min and panic) |
+| Boot screen | ✅ sharp Apple logo from the first frame, no garbage flash (OpenCore `Resolution=Max` + `gfxrst=1` + XE-BOOTHOLD) |
+| Internal speakers | ✅ our own `AudShim` kext runs Intel's SOF firmware on the audio DSP, SoundWire and both RT1316 amplifiers; `XeSpeakers` makes them a normal macOS output (volume, mute). Capped at −6 dB, no speaker protection · ❌ microphones not yet |
+| Wi-Fi, Bluetooth | ✅ native Wi-Fi menu via AirportItlwm-Tahoe (no HeliPort) · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
+| Touchpad haptics | ✅ click-vibration strength with `tools/xe-haptic` / the `xe-hapticbar` menu-bar slider · ❌ no on-demand pulse (Force Touch feedback) |
+| Sleep | ❌ no system sleep (Modern Standby only firmware); ✅ display sleep, and lid close turns the display off (`tools/sleep`) |
 | System Settings › Displays, colour profiles | ⚠️ may panic: change resolution with `tools/xe-res` and keep the factory colour profile |
 | WindowServer hang | ⚠️ rare, before login or on a UI-scale change (reboot recovers); fix in testing (csbresync) |
 
-Everything else about the laptop (native Wi-Fi via AirportItlwm, Bluetooth, NVMe, battery) is a regular OpenCore setup. The camera does **not** work on macOS. **Internal speakers: in progress** — our own `AudShim` kext boots the Intel cAVS 2.5 audio DSP with Intel's SOF firmware, starts SoundWire, initialises the two RT1316 amplifiers and has played a test tone on both speakers (2026-10-22); the macOS output device (CoreAudio) is next.
+Everything else about the laptop (NVMe, battery, USB) is a regular OpenCore setup. The camera (OV01A10 behind Intel's
+IPU6) and the fingerprint reader do **not** work on macOS. **Internal speakers** work since 2026-10-22 without any Apple
+audio driver: `AudShim` boots the Intel cAVS 2.5 audio DSP with Intel's SOF firmware (taken from the official sof-bin
+release at install time, not shipped here), starts SoundWire and the RT1316 amplifiers, and the `XeSpeakers`
+AudioServerPlugIn publishes the output device ([docs/INSTALL.md](docs/INSTALL.md#internal-speakers)).
 
 ## How it works (one paragraph)
 
@@ -52,7 +61,9 @@ build-nootedgreen.sh     builds src/NootedGreen with only the Command Line Tools
 patches/                 diff of this fork against upstream NootedGreen 95f8189
 macos/                   user-space stack: Metal driver patcher, libxedrv, shader compiler, VA (video) plugin patcher, installer
 tools/                   xe-res (resolution/DPI), xe-brilho (brightness), xe-perfil (color profile), xe-toque (touchscreen gestures),
-                         XeShim + xectl (register access), diagnostics/ (the test programs used to find bugs)
+                         XeShim + xectl (register access), diagnostics/ (the test programs used to find bugs),
+                         AudShim + audctl + XeSpeakers + audio/ (internal speakers), sleep/ (pmset + lid agent),
+                         xe-haptic + xe-hapticbar (touchpad vibration)
 docs/                    install guide, patch catalogs, status, debugging notes
 ```
 
@@ -89,7 +100,9 @@ EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTAL
 
 - **NootedGreen** by StezzaPilot ([sgiammori/NootedGreen](https://github.com/sgiammori/NootedGreen)): the base of the kernel plugin and the source of the 16.0.32 driver bundles. Licensed under the *Thou Shalt Not Profit License 1.0*, which also covers the fork in `src/`.
 - **WhateverXe** and **OpenCore Legacy Patcher fork** by b00t0x, and jkbuha's WhateverXe work: reference for Gen12 on macOS (including the Tahoe VA-plugin payload-header fix).
-- **BlackHole** by Existential Audio (virtual audio output, GPL-3.0), built by `tools/build-blackhole.sh`.
+- **BlackHole** by Existential Audio (virtual audio output, GPL-3.0), built by `tools/build-blackhole.sh`; also the reference for the AudioServerPlugIn property set.
+- **Sound Open Firmware** (Intel SOF firmware and topologies, sof-bin) and the Linux `sound/soc/sof` + SoundWire drivers: the reference for every AudShim step. The firmware is downloaded by you, not shipped.
+- **laobamac/itlwm** (AirportItlwm-Tahoe, GPL-2.0), shipped in `EFI/OC/Kexts`.
 - **IntelIGPU-Tahoe**: reference for running the TGL Metal driver on Tahoe.
 - **acidanthera** (OpenCore, Lilu, WhateverGreen, VirtualSMC, MacKernelSDK), **OpenIntelWireless** (itlwm, IntelBluetoothFirmware), **VoodooI2C**, **USBToolBox**.
 - Developed on one Dell XPS 13 Plus by its owner, pair-programming with Claude (Anthropic).

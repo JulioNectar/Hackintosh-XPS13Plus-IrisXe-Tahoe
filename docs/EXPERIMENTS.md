@@ -79,6 +79,26 @@ it did not fix the problem it was written for.
 | 66 | XR / EDR format theory for the icons | 20 Oct | 18 | wrong cause |
 | 67 | XE-NOORPHAN against all "corrupt list" panics | 20 Oct | 18 | partial |
 | 68 | ITU-709 colour profile | 20 Oct | 19 | three panics; reverted |
+| 69 | E-cores: CpuTopologyRebuild / HT patch / fewer CPUs | 20–21 Oct | 21 | not the cause; divide by zero |
+| 70 | Chrome: "the GPU disk cache is bad" | 21 Oct | 22 | wrong; blit race |
+| 71 | Chrome: XE-RCPOLICY or the E-cores | 21 Oct | 22 | wrong |
+| 72 | `w30r` / BGR10_XR proof of concept | 21 Oct | 22 | works in a test process; not shipped |
+| 73 | FBC theory for the boot-bar glitch (XE-FBCWA) | 21 Oct | 23 | FBC never on; removed |
+| 74 | XE-BOOTHOLD v1–v3 | 21 Oct | 23 | not enough → v4 |
+| 75 | CDCLK reprogramming as the boot line | 21 Oct | 23 | untested; gone with `Resolution=Max` |
+| 76 | `Resolution=Max` without `gfxrst` | 21 Oct | 23 | ~20 s stall |
+| 77 | XE-MAXRES (route on `IOFramebuffer::initFB`) | 21 Oct | 23 | panic at boot |
+| 78 | Fast stamp-3 wait, OpenCore without picker | 21 Oct | 23 | prepared, not installed |
+| 79 | Legacy AirportItlwm + root patch | 21 Oct | 24 | not done |
+| 80 | Hibernate-only, injected `_S3`, BIOS `setup_var` | 22 Oct | 24 | prepared / not tried |
+| 81 | Safari decode: sandbox overrides, symlinks, SLE root patch | 21 Oct | 24 | rejected; patch not applied |
+| 82 | On-demand touchpad pulse | 21–22 Oct | 24 | no command exists |
+| 83 | Display audio via AppleGFXHDA (device-id spoof) | 21 Oct | 25 | assessed, not run |
+| 84 | M2: ROM handshake, IPC after the core runs | 21 Oct | 25 | ROM did not answer |
+| 85 | M2: IPC first (Linux order) | 21 Oct | 25 | SRAM window `0xffffffff` |
+| 86 | M2b stream-count pre-check | 21 Oct | 25 | bug: rejected 16 streams |
+| 87 | M2b SSP clock-port write | 21 Oct | 25 | silently refused; not needed |
+| 88 | M6: first XeSpeakers install | 22 Oct | 25 | device dropped by coreaudiod |
 
 ---
 
@@ -333,6 +353,113 @@ driver, but the invisible icons had a different cause: zero-copy textures at off
 `IGHardwarePageTable::commitRange`). Reverting to the factory profile restored stability. Do not change the display
 profile.
 
+## Stability, Chrome and formats, 20–21 Oct
+
+**69. E-cores: CpuTopologyRebuild, the HT patch and fewer CPUs.** With any E-core enabled the kernel froze right after
+EXITBS. CpuTopologyRebuild 2.0.2 (first without its required HT patch), the HT patch itself, and boots with only one,
+six or eight E-cores all froze the same way, and E-cores off with CTR stopped before the progress bar. A diff of the
+OpenCore logs showed the only difference was ProvideCurrentCpuInfo setting cores-per-package to 128 on a hybrid CPU;
+this 4P+8E part reports 64 logical per package, so xnu divided by zero in `cpu_thread_alloc` before any console
+output. The `Cpuid1Data` spoof fixed it; CTR then works in its default mode.
+
+**70. "Chrome breaks when its GPU disk cache is populated."** Clearing the cache, locking the cache folders
+(`chflags uchg`) and redirecting Metal's per-app function cache to an empty folder were tried. A fresh profile with an
+empty Metal cache was still broken, and Dawn toggles only seemed to help because each new toggle forced new
+compiles. The cache only changed timing: the real cause was a fill/copy ordering race in the driver's 2D blit path
+(fixed by libxedrv v16). `tools/xe-chrome-limpa.sh` remains as a harmless cleanup.
+
+**71. XE-RCPOLICY and the E-cores as the Chrome trigger.** Both arrived on the same day the breakage became frequent.
+Neither was involved: the captured index buffer was zero with both unchanged, and the blit tests reproduce the race in
+a small Metal program.
+
+**72. `w30r` / BGR10_XR.** A test library made Metal accept the XR pixel formats (answering the Apple-family query only
+for those formats) and made CoreAnimation map `w30r`. Gen12 has no XR-bias sampling format, so the values would be
+wrong anyway (XR black would show as ~37 % grey), and flipping CoreAnimation's check also moves 10-bit video onto
+Apple-only formats, which would crash WindowServer. Not shipped; real Intel Macs behave the same.
+
+## Boot screen and boot speed, 21 Oct
+
+**73. Frame-buffer compression behind the boot-bar glitch.** NootedGreen enables the FBC platform flag and Apple's
+`hwFBCSet` lacks two display-13 workaround bits, so a CPU-drawn progress bar on a compressed plane looked plausible. An
+XE-FBCWA write filter was built together with BOOTDIAG logging. The first log showed FBC disabled for the whole boot;
+FBCWA was removed.
+
+**74. XE-BOOTHOLD v1–v3.** v1 kept plane A disabled until the first non-zero surface address, v2 until the second, v3
+until an address repeated (WindowServer's ring had wrapped). Each moved the hold to the right moment, but the flash
+stayed: the plane disable latched in the same frame as Apple's new stride and size, and part of what was seen was not
+plane-A scanout. v4 adds the backlight to the hold and a minimum time (`xebbms`); that removed it.
+
+**75. CDCLK reprogramming as the bright line early in boot.** NootedGreen always disables and re-programs the display
+clock inside the framebuffer start while the pipe scans out, which could cause one underrun line. Before a fix was
+written, the line disappeared together with the 1024×768 stretch stage once OpenCore used `Resolution=Max`. Not
+tested further.
+
+**76. `Resolution=Max` alone.** The native-resolution GOP removed the stretched boot stage but added a ~20 s black stall
+at WindowServer's first framebuffer open (22–24 s instead of 2–6 s). Cause: WhateverGreen's default framebuffer-copy
+mode reads the whole boot console framebuffer with the CPU through an uncached mapping (36.9 MB at 3840×2400).
+`gfxrst=1` keeps Max and removes the stall.
+
+**77. XE-MAXRES.** A NootedGreen route on `IOFramebuffer::initFB`, forcing the "do not keep the boot logo" path, panicked
+at boot twice ("previous plugin had short jump type on a multiroute function"): WhateverGreen routes the same function
+first, and Lilu does not allow a second route there. Never install that build.
+
+**78. Faster accelerator start and no picker.** A NootedGreen variant that ends the 6.5 s wait for accelerator stamp 3
+after 250 ms (the wait always ends by timeout today), and an OpenCore config without the picker, were built but not
+installed. OpenCore file logging off and a 1 s picker timeout were applied instead.
+
+## Platform, 21–22 Oct
+
+**79. Legacy AirportItlwm with a root patch.** A second Tahoe build of AirportItlwm restores the Ventura wireless stack
+through an OCLP-derived root patch: it brings AWDL, AirPlay and Handoff but still not reliable AirDrop, breaks the
+system-volume seal and must be re-applied after every macOS update, during which there is no network. The EFI-only
+native build worked, so this route was not taken.
+
+**80. Real sleep.** Three ways to get any sleep were prepared and not tried: hibernation only (`hibernatemode 25` with
+OpenCore resuming the image, so the panel is lit by GOP again), an SSDT that exposes `_S3` (the BIOS may have no S3
+resume code; same-generation Dell reports crash on wake), and BIOS `setup_var` changes (offsets unknown; a wrong write can
+leave the machine unbootable). The TGL framebuffer cannot retrain eDP after a power cycle in any of them.
+
+**81. Safari GPU-process decode.** WebKit's GPU-process sandbox is compiled in and has no entitlement or default that
+allows executable mappings from `/Library/GPUBundles`; sandbox defaults keys, symlinks (resolved before matching) and
+Safari Technology Preview (same profile) cannot help. Installing the VA plugin in `/System/Library/Extensions` through
+a sealed-volume root patch would work and is reversible (`bless --last-sealed-snapshot`); the script was prepared and
+not applied.
+
+**82. An on-demand touchpad pulse.** The Elan HID endpoint exposes only the vibration intensity (feature 0x09); the
+Microsoft haptic trigger and waveform usages are absent, and VoodooInput's Force Touch actuator requests have nowhere to
+go. The vendor firmware packages show an Aito haptic module behind the Elan endpoint, reachable only through
+undocumented vendor reports that also carry its bootloader. No pulse command is known; blind probing was rejected as
+unsafe for the module's flash and calibration.
+
+## Internal speakers, 21–22 Oct
+
+**83. Display audio through AppleGFXHDA.** Spoofing the audio function as an Ice Lake controller (`device-id 0x34C8`,
+`hda-gfx`) might give HDMI/DP audio through Apple's driver. It conflicts with AudShim (both match the same function),
+depends on the TGL framebuffer enabling the display-audio power well, and needs an external monitor. Assessed only.
+
+**84. M2: ROM handshake with the IPC sent after the core runs.** Power, reset and stall of DSP core 0 behaved exactly as
+on Linux and the ROM initialised its SRAM window, but it stayed in `INIT` and ignored the late `ROM_CONTROL` IPC
+(BUSY never consumed). Rolled back cleanly.
+
+**85. M2: IPC first, in Linux's order.** This time the ROM picked up `ROM_CONTROL | PURGE_FW | tag 1` and then its SRAM
+window read `0xffffffff`: it acted on the message and died or powered the memory down, because the host DMA stream with
+that tag did not exist. Fixed in M2b by preparing what Linux prepares first (controller reset, PPCTL, L1SEN off, bus
+mastering, the ICCMAX stream and the code-loader stream).
+
+**86. M2b stream-count pre-check.** The kext refused to arm when input + output streams exceeded 15; this controller has
+ISS 7 + OSS 9 = 16 (HDA allows 30). Caught on the dry run, before any write.
+
+**87. M2b SSP clock-port write.** Linux sets the SSP clock-port bits before the ROM IPC. AudShim's BAR4 write whitelist
+did not include those registers, so the write was refused and logged, yet M2b succeeded. Noticed while building M3;
+the write stayed off by default (`--ssp` opt-in) because the SSPs are unused on this SoundWire-only laptop.
+
+**88. M6: XeSpeakers device dropped.** On the first install coreaudiod loaded the plug-in and the kext brought the
+hardware up, but the device never appeared: coreaudiod logged an unknown-property error (`'who?'`) and "Caught exception
+trying to add device". While adding a device the HAL reads latency, safety offset, default-device eligibility and
+preferred channel properties in every scope, including input, and the plug-in answered them only for output; it also
+lacked the empty box and clock-device lists. With those answered (input scope reports 0/none) the device appears and
+plays.
+
 ---
 
 ## Negative results worth keeping
@@ -362,3 +489,9 @@ Tests that ruled something out are as useful as fixes. Each of these was measure
 | IconServices output | `xe-icontest` | correct bitmaps |
 | CVPixelBuffer / pixel transfer | `xe-pbtest`, `xe-xfertest` | work in isolation |
 | L3ALLOC, PSMI, Tile Cache Flush, SIMD32 Blit3D, render compression, POSH_LRCA, forcewake | the experiments above | not the causes of the hangs they were aimed at |
+| Metal function cache corrupting Chrome's shaders | redirected empty cache; cache-hit vs fresh-compile pipeline tests | identical output; not the cause |
+| Draw parameters (baseVertex/baseInstance, strips, restart) | `baseinst`, `multidraw`, `rastdraw`, `restart` tests | all correct |
+| Frame-buffer compression during boot | BOOTDIAG register log | FBC never enabled |
+| Stencil corruption without a shared 64 KB block | standalone stencil test variants | 16 bpp colour target or stencil in its own block: always correct |
+| HDA register reads having side effects | HDA spec / Linux register review before M1 | no read-to-clear registers; SoundWire FIFO window kept unreadable |
+| DSP power or reset sequencing (M2) | ADSPCS readback | identical to Linux; the missing piece was the DMA stream |

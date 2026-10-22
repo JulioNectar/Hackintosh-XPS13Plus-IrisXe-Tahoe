@@ -61,6 +61,7 @@ Approve the extension in **System Settings › Privacy & Security** if asked, an
 - Touchscreen trail (optional): `zsh tools/build-xe-toque.sh`, then `open tools/xe-toque.app` and allow it in
   Privacy & Security › Input Monitoring. Only touches on the screen draw; the trackpad is ignored.
 - Check: `system_profiler SPDisplaysDataType` shows **Metal Support** and the chipset model you set.
+- Internal speakers, Wi-Fi, lid/sleep setup and touchpad vibration: see the sections below.
 
 ## 7. Moving OpenCore to the internal disk
 
@@ -100,3 +101,95 @@ A hand icon in the menu bar holds the toggles (saved in `defaults read local.xe.
   *Clear drawing* wipes it), **Touch mode** (switches to a 1152-pt-wide HiDPI mode with `~/xe/build/xe-res` and back
   to the previous mode).
 - Log: `~/xe/build/toque/xe-toque.log`. Diagnostic: `xe-toque.app/Contents/MacOS/xe-toque --probe-events`.
+
+## Internal speakers
+
+Output only (no microphones yet), 48 kHz stereo. Two pieces: the `AudShim` kext (loaded by OpenCore; it talks to the
+audio DSP `8086:51CA`, SoundWire and the RT1316 amplifiers) and the `XeSpeakers` AudioServerPlugIn (the macOS output
+device). The device shows up in System Settings › Sound › Output as **"Alto-falantes internos"** (the name is
+`kDeviceName` in `tools/XeSpeakers/XeSpeakers.c`).
+
+**1. Firmware and topology (Intel, not shipped here).** Download the official SOF release tarball (`sof-bin-<version>.tar.gz`,
+from github.com/thesofproject/sof-bin; tested with 2026.09.2) and take two files from it:
+
+| File in sof-bin | Use |
+|---|---|
+| `sof/intel-signed/sof-adl.ri` (`sof-rpl.ri` is a link to it) | the IPC3 SOF 2.2 firmware for Raptor Lake-P, Intel-signed |
+| `sof-tplg/sof-rpl-rt1316-l12-rt714-l0.tplg` | the topology for this laptop: RT714 on SoundWire link 0, RT1316 on links 1 and 2 |
+
+The firmware is distributed by Intel under its own licence (`LICENCE.Intel` in the tarball). Put both files in
+`~/xe/build/audio/fw/use/` (renaming `sof-adl.ri` to `sof-rpl.ri`), which is `audctl`'s default, or pass the paths.
+
+**2. Generate the kext's data header and build.** `AudShimData.h` holds the firmware payload, the IPC3 messages derived
+from the topology and the amplifier init table. It is generated, reproducible byte for byte, and not committed
+(`.gitignore`):
+
+```sh
+clang -O2 -Wall -Wextra -o tools/build/audctl tools/audctl.c -framework IOKit -framework CoreFoundation
+tools/build/audctl tplg PATH/sof-rpl-rt1316-l12-rt714-l0.tplg     # optional: parse the topology offline
+tools/build/audctl gen-header tools/AudShim/AudShimData.h --fw=PATH/sof-rpl.ri --tplg=PATH/sof-rpl-rt1316-l12-rt714-l0.tplg
+zsh tools/audio/install-audio.sh build     # audctl, AudShim.kext, XeSpeakers.driver -> tools/build/
+```
+
+**3. Kext.** Mount the EFI (`sudo diskutil mount disk0s1`), then `zsh tools/audio/install-audio.sh kext`: it copies
+`AudShim.kext` to `EFI/OC/Kexts` and appends its `Kernel>Add` entry if missing (config backed up as
+`config.plist.before-audshim`). Reboot. At boot the kext only maps the device and enables memory decode; nothing else
+is touched until a client asks. Check:
+
+```sh
+tools/build/audctl info        # "interface v8"
+tools/build/audctl drv test    # three short ~1 kHz tones on both speakers at a low level, then "DRV TEST RESULT: SUCCESS"
+```
+
+**4. Output device.** `zsh tools/audio/install-audio.sh hal` (sudo: copies `XeSpeakers.driver` to
+`/Library/Audio/Plug-Ins/HAL` and restarts coreaudiod). Choose the device in System Settings › Sound › Output. The
+volume starts at 30 % the first time.
+
+Notes:
+- **Level.** The kext caps the DSP gain at −6 dB and ramps every change; the SOF topology has no speaker protection.
+  Boot-arg `audshimcapdb=N` (0–20) moves the cap, `audshimlingerms=N` the 5 s delay before the amps are switched off
+  after playback stops, `-audshimverbose` logs every register access, `-audshimoff` stops AudShim from attaching.
+- The hardware is brought up when coreaudiod loads the plug-in (~1–2 s after login) and fully torn down (amps muted
+  and off, DMA, links and DSP off) on coreaudiod exit, sleep, shutdown/restart or kext stop.
+- `audctl drv state` shows starts, xruns and DMA errors while the device is in use. Logs:
+  `log show --last 10m --predicate 'subsystem == "local.xe.XeSpeakers" OR eventMessage CONTAINS "AudShim DRV"'`.
+- The step-by-step bring-up commands used during development (`audctl m1`, `m2b`, `m3`, `m4`, `m5`, each with `--dry`
+  and `--undo`) still work when the HAL driver is not installed.
+- Undo: `zsh tools/audio/uninstall-audio.sh hal`, then `… kext` (disables the entry and removes the kext) and reboot.
+
+## Wi-Fi (AirportItlwm)
+
+The shipped `config.plist` loads **AirportItlwm-Tahoe 2.4.0-alpha** (laobamac fork of itlwm, commit 738d4c6) and keeps
+`itlwm.kext` disabled. AirportItlwm uses Tahoe's own IO80211Family/IOSkywalkFamily, so no root patch is needed, and Wi-Fi
+appears in the menu bar like on a Mac (HeliPort is not needed; remove its login item if you had one).
+- `MinKernel 25.0.0` / `MaxKernel 25.99.99`: it only loads on Tahoe. Never enable `itlwm.kext` and `AirportItlwm.kext`
+  together (the boot halts).
+- After the switch macOS may keep an old "Ethernet" service for en0: System Settings › Network › remove it, then "+" →
+  Wi-Fi. en0 should be the Wi-Fi port (iMessage/FaceTime expect a built-in en0).
+- Optional: boot-arg `itlwm_he=1` turns on Wi-Fi 6 (HE) rates.
+- Fallback: `config-install.plist` still uses itlwm (connect with HeliPort). Switch back the same way if a macOS update
+  breaks AirportItlwm.
+- Not available with this driver: AirDrop/AWDL, WPA3-only networks.
+
+## Sleep, lid and display sleep
+
+This laptop has no working system sleep on macOS (Modern Standby firmware, `_S3` hidden, eDP cannot be retrained by
+the TGL framebuffer). With macOS defaults, **closing the lid starts a real sleep that does not come back**. Use:
+
+```sh
+sudo zsh tools/sleep/10-pmset-safe.sh     # sleep 0, disablesleep 1, hibernatemode 0, display sleep 3 min battery / 10 min AC
+zsh tools/sleep/install-xe-lid.sh         # LaunchAgent: lid close -> display off, lid open -> display on (log /tmp/xe-lid.log)
+```
+
+The machine stays awake (a few watts) with the lid closed: shut it down for long breaks, and consider
+`sudo pmset -b lowpowermode 1` on battery. Undo: `sudo zsh tools/sleep/90-pmset-revert.sh` and
+`zsh tools/sleep/install-xe-lid.sh --remove`. On boots where the EC does not report the lid (see STATUS), turn the display
+off by hand.
+
+## Touchpad vibration
+
+The haptic touchpad clicks by itself; macOS can only change how strong the vibration is (HID feature report 0x09,
+0–100). `clang -O2 -o tools/build/xe-haptic tools/xe-haptic.c -framework IOKit -framework CoreFoundation`, then
+`xe-haptic list` (read-only dump) or `xe-haptic set 60 100`. The value is lost at reboot. For a persistent setting,
+`zsh tools/build-xe-hapticbar.sh` and `open tools/xe-hapticbar.app` (add it to Login Items): a hand icon in the menu bar
+with a slider, applied at login and on every change.
