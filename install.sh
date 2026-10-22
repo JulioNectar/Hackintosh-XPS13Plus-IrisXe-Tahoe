@@ -10,9 +10,10 @@
 # What it does:
 #   1. checks the machine (Intel, macOS build, Command Line Tools, GPU spoof, NootedGreen loaded)
 #   2. downloads NootedGreen at the pinned commit, which provides Apple's 16.0.32 Tiger Lake driver bundles
-#   3. builds NootedGreen.kext, the patched Metal driver, libxedrv and the shader compiler
+#   3. builds NootedGreen.kext, HookCase.kext (the TGL kexts depend on it), the patched Metal driver, libxedrv and
+#      the shader compiler
 #   4. installs them (sudo) and tells you what to copy to the EFI
-set -e
+set -e; setopt pipe_fail   # a failed build is not hidden by "| tail -1"
 ROOT=${0:A:h}
 BUILD_REQ=25G241
 NG_REPO=https://github.com/sgiammori/NootedGreen.git
@@ -29,7 +30,7 @@ if [[ "$1" == "--uninstall" ]]; then
     rm -rf /System/Library/Caches/xe.bundle
     for k in AppleIntelTGLGraphics.kext AppleIntelTGLGraphicsFramebuffer.kext AppleIntelTGLGraphicsMTLDriver.bundle \
              AppleIntelTGLGraphicsGLDriver.bundle AppleIntelTGLGraphicsVADriver.bundle AppleIntelTGLGraphicsVAME.bundle \
-             AppleIntelGraphicsShared.bundle; do rm -rf /Library/Extensions/$k; done
+             AppleIntelGraphicsShared.bundle HookCase.kext; do rm -rf /Library/Extensions/$k; done
     kmutil load -z --load-style match-only 2>/dev/null || true'
   echo "done. Also disable NootedGreen.kext in your config.plist (or boot config-install.plist), then reboot."
   exit 0
@@ -58,8 +59,9 @@ SLE=$NG/sle_Internal/sle; LE=$NG/sle_Internal/le
 
 echo "== 3. build"
 zsh $ROOT/build-nootedgreen.sh | tail -1
+zsh $ROOT/build-hookcase.sh | tail -1
 zsh $ROOT/macos/build-all.sh $SLE | tail -1
-ok "built build/NootedGreen.kext and macos/out/"
+ok "built build/NootedGreen.kext, build/HookCase.kext and macos/out/"
 
 [[ "$1" == "--build-only" ]] && { echo "build only: nothing installed"; exit 0; }
 echo "== 4. install (your password is needed once)"
