@@ -28,15 +28,17 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Brilho | ✅ `tools/xe-brilho` (o slider do macOS agora cobre toda a faixa do painel com `ngreenblmax=17777`) · ⚠️ as teclas de sol dependem de um estado do firmware da Dell que muda de um boot para outro; F6/F7 sempre funcionam pelo `xe-brilho daemon` |
 | Desligar / reiniciar | ✅ rápido (XE-IDLEBOUND; antes travava ~3 min e dava panic) |
 | Tela de boot | ✅ logo da Apple nítido desde o início, sem lixo na tela (OpenCore `Resolution=Max` + `gfxrst=1` + XE-BOOTHOLD) |
-| Alto-falantes internos | ✅ o nosso kext `AudShim` roda o firmware SOF da Intel no DSP de áudio, o SoundWire e os dois amplificadores RT1316; o `XeSpeakers` vira uma saída de som normal do macOS (volume, mudo). Limitado a −6 dB, sem proteção dos alto-falantes · ❌ microfones ainda não |
+| Alto-falantes internos | ✅ o nosso kext `AudShim` roda o firmware SOF da Intel no DSP de áudio, o SoundWire e os dois amplificadores RT1316; o `XeSpeakers` vira uma saída de som normal do macOS (volume, mudo). Limitado a −6 dB, sem proteção dos alto-falantes · ✅ microfones internos (RT714) como **"Microfone interno"** |
 | Wi-Fi, Bluetooth | ✅ Wi-Fi nativo (menu do macOS) com o AirportItlwm-Tahoe, sem HeliPort · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
 | Vibração do trackpad | ✅ intensidade do clique com `tools/xe-haptic` / o controle `xe-hapticbar` na barra de menus · ❌ sem pulso sob demanda (resposta do Force Touch) |
+| Leitor de digitais | ✅ para o `sudo` (Goodix 27C6:63BC via libfprint, módulo PAM no `sudo_local`; `tools/fingerprint`) · ❌ login, desbloqueio da tela e Touch ID (sem Secure Enclave) |
+| Botão liga/desliga | ✅ um aperto curto bloqueia a tela (`tools/xe-pblock`) |
 | Repouso | ❌ sem repouso do sistema (firmware só tem Modern Standby); ✅ repouso da tela, e fechar a tampa apaga a tela (`tools/sleep`) |
 
-A câmera (OV01A10 atrás do IPU6 da Intel) e o leitor de digitais **não funcionam** no macOS. **Os alto-falantes internos
-funcionam** desde 22/10/2026, sem nenhum driver de áudio da Apple: o `AudShim` liga o DSP de áudio da Intel (cAVS 2.5)
+A câmera (OV01A10 atrás do IPU6 da Intel) **não funciona** no macOS; o leitor de digitais funciona só para o `sudo`.
+**Os alto-falantes internos funcionam** desde 22/10/2026, sem nenhum driver de áudio da Apple: o `AudShim` liga o DSP de áudio da Intel (cAVS 2.5)
 com o firmware SOF da Intel (baixado do sof-bin oficial na instalação, não vem neste repositório), inicia o SoundWire e
-os amplificadores RT1316, e o plug-in `XeSpeakers` publica a saída de som ([docs/INSTALL.md](docs/INSTALL.md#internal-speakers)).
+os amplificadores RT1316, e o plug-in `XeSpeakers` publica a saída de som e o microfone ([docs/INSTALL.md](docs/INSTALL.md#internal-speakers-and-microphones)).
 
 ## Documentação
 

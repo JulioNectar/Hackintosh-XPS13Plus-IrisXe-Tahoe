@@ -36,13 +36,15 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | Internal speakers | ✅ our own `AudShim` kext runs Intel's SOF firmware on the audio DSP, SoundWire and both RT1316 amplifiers; `XeSpeakers` makes them a normal macOS output (volume, mute). Capped at −6 dB, no speaker protection · ✅ internal microphones (RT714) as **"Microfone interno"** |
 | Wi-Fi, Bluetooth | ✅ native Wi-Fi menu via AirportItlwm-Tahoe (no HeliPort) · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
 | Touchpad haptics | ✅ click-vibration strength with `tools/xe-haptic` / the `xe-hapticbar` menu-bar slider · ❌ no on-demand pulse (Force Touch feedback) |
+| Fingerprint reader | ✅ for `sudo` (Goodix 27C6:63BC via libfprint, PAM module in `sudo_local`; `tools/fingerprint`) · ❌ login, screen unlock and Touch ID prompts (no Secure Enclave) |
+| Power button | ✅ a short press locks the screen (`tools/xe-pblock`) |
 | Sleep | ❌ no system sleep (Modern Standby only firmware); ✅ display sleep, and lid close turns the display off (`tools/sleep`) |
 
 Everything else about the laptop (NVMe, battery, USB) is a regular OpenCore setup. The camera (OV01A10 behind Intel's
-IPU6) and the fingerprint reader do **not** work on macOS. **Internal speakers** work since 2026-10-22 without any Apple
-audio driver: `AudShim` boots the Intel cAVS 2.5 audio DSP with Intel's SOF firmware (taken from the official sof-bin
-release at install time, not shipped here), starts SoundWire and the RT1316 amplifiers, and the `XeSpeakers`
-AudioServerPlugIn publishes the output device ([docs/INSTALL.md](docs/INSTALL.md#internal-speakers)).
+IPU6) does **not** work on macOS; the fingerprint reader works for `sudo` only. **Internal speakers** work since
+2026-10-22 without any Apple audio driver: `AudShim` boots the Intel cAVS 2.5 audio DSP with Intel's SOF firmware
+(taken from the official sof-bin release at install time, not shipped here), starts SoundWire and the RT1316
+amplifiers, and the `XeSpeakers` AudioServerPlugIn publishes the output and microphone devices ([docs/INSTALL.md](docs/INSTALL.md#internal-speakers-and-microphones)).
 
 ## How it works (one paragraph)
 
@@ -63,7 +65,8 @@ macos/                   user-space stack: Metal driver patcher, libxedrv, shade
 tools/                   xe-res (resolution/DPI), xe-brilho (brightness), xe-perfil (color profile), xe-toque (touchscreen gestures),
                          XeShim + xectl (register access), diagnostics/ (the test programs used to find bugs),
                          AudShim + audctl + XeSpeakers + audio/ (internal speakers), sleep/ (pmset + lid agent),
-                         xe-haptic + xe-hapticbar (touchpad vibration)
+                         xe-haptic + xe-hapticbar (touchpad vibration), fingerprint/ (fingerprint for sudo: libfprint patch,
+                         xe-fp, PAM module), xe-pblock/ (power button locks the screen)
 docs/                    install guide, patch catalogs, status, debugging notes
 ```
 

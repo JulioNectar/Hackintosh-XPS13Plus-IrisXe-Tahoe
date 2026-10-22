@@ -1,0 +1,137 @@
+xe-fp changes to libfprint for macOS (Goodix MOC 27c6:63bc).
+Base: https://gitlab.freedesktop.org/libfprint/libfprint commit 6f9479c3d55f847c1b3769f28ceb99227f9858cf
+Licence: LGPL-2.1-or-later, like libfprint (see licenses/LGPL-2.1.txt). Applied by tools/fingerprint/build.sh.
+1. meson.build: no --version-script / --disable-new-dtags on darwin (Apple ld rejects them).
+2. fpi-device.c: skip the sysfs wakeup configuration on non-Linux.
+3. goodixmoc: never wipe the sensor storage implicitly (XEFP_ALLOW_STORAGE_RESET=1 to allow);
+   skip the USB reset on macOS (XEFP_USB_RESET=1 restores it); XEFP_CFG_NO_FLASH=1 experiment knob.
+
+diff --git a/libfprint/drivers/goodixmoc/goodix.c b/libfprint/drivers/goodixmoc/goodix.c
+index 1b48480..4cbad6d 100644
+--- a/libfprint/drivers/goodixmoc/goodix.c
++++ b/libfprint/drivers/goodixmoc/goodix.c
+@@ -1138,7 +1138,11 @@ fp_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
+       break;
+ 
+     case GOODIX_INIT_CONFIG:
+-      goodix_sensor_cmd (self, MOC_CMD0_UPDATE_CONFIG, MOC_CMD1_WRITE_CFG_TO_FLASH,
++      /* xe-fp: XEFP_CFG_NO_FLASH=1 sends the (identical) sensor config without
++       * persisting it to the sensor flash (read-only probing). */
++      goodix_sensor_cmd (self, MOC_CMD0_UPDATE_CONFIG,
++                         g_strcmp0 (g_getenv ("XEFP_CFG_NO_FLASH"), "1") == 0 ?
++                         MOC_CMD1_NWRITE_CFG_TO_FLASH : MOC_CMD1_WRITE_CFG_TO_FLASH,
+                          false,
+                          (guint8 *) self->sensorcfg,
+                          sizeof (gxfp_sensor_cfg_t),
+@@ -1161,6 +1165,17 @@ fp_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
+       break;
+ 
+     case GOODIX_INIT_RESET_DEVICE:
++      /* xe-fp safety patch: never wipe the on-chip template DB implicitly.
++       * Upstream silently sends DELETE_ALL here when listing templates fails.
++       * Only proceed if the user explicitly opts in. */
++      if (g_strcmp0 (g_getenv ("XEFP_ALLOW_STORAGE_RESET"), "1") != 0)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                                         "Template list failed; upstream would wipe sensor storage here. "
++                                                         "Refusing (set XEFP_ALLOW_STORAGE_RESET=1 to allow)."));
++          return;
++        }
+       fp_warn ("Resetting device storage, you will need to enroll all prints again!");
+       goodix_sensor_cmd (self, MOC_CMD0_DELETETEMPLATE, MOC_CMD1_DELETE_ALL,
+                          FALSE,
+@@ -1349,6 +1364,19 @@ fp_template_list_cb (FpiDeviceGoodixMoc  *self,
+  *  Interface Function
+  *
+  *****************************************************************************/
++/* xe-fp: on macOS a USB reset forces a re-enumeration; right after it the device is
++ * transiently held exclusively by IOKit and claiming fails ~50% of the time.
++ * Skip the reset on macOS unless XEFP_USB_RESET=1. */
++static gboolean
++xefp_usb_reset (GUsbDevice *dev, GError **error)
++{
++#ifdef __APPLE__
++  if (g_strcmp0 (g_getenv ("XEFP_USB_RESET"), "1") != 0)
++    return TRUE;
++#endif
++  return g_usb_device_reset (dev, error);
++}
++
+ static void
+ gx_fp_probe (FpDevice *device)
+ {
+@@ -1366,7 +1394,7 @@ gx_fp_probe (FpDevice *device)
+       return;
+     }
+ 
+-  if (!g_usb_device_reset (usb_dev, &error))
++  if (!xefp_usb_reset (usb_dev, &error))
+     goto err_close;
+ 
+   if (!g_usb_device_claim_interface (usb_dev, 0, 0, &error))
+@@ -1469,7 +1497,7 @@ gx_fp_init (FpDevice *device)
+     }
+   self->sensorcfg->config[6] = self->max_enroll_stage;
+ 
+-  if (!g_usb_device_reset (fpi_device_get_usb_device (device), &error))
++  if (!xefp_usb_reset (fpi_device_get_usb_device (device), &error))
+     {
+       fpi_device_open_complete (FP_DEVICE (self), error);
+       return;
+diff --git a/libfprint/fpi-device.c b/libfprint/fpi-device.c
+index 9500b3a..efaa89f 100644
+--- a/libfprint/fpi-device.c
++++ b/libfprint/fpi-device.c
+@@ -1850,6 +1850,11 @@ fpi_device_configure_wakeup (FpDevice *device, gboolean enabled)
+         g_autofree gchar *sysfs_persist = NULL;
+         int res;
+ 
++#ifndef __linux__
++        /* xe-fp: sysfs wakeup/persist knobs only exist on Linux. */
++        (void) wakeup_command; (void) bus; (void) res;
++        break;
++#endif
+         ports = g_string_new (NULL);
+         bus = g_usb_device_get_bus (priv->usb_device);
+ 
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533c..e491a9f 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -263,7 +263,7 @@ if meson.version().version_compare('>=1.4')
+ else
+     mapfile_path = meson.project_source_root() / '@0@'.format(mapfile)
+ endif
+-vflag = '-Wl,--version-script,@0@'.format(mapfile_path)
++vflag = host_machine.system() == 'darwin' ? [] : '-Wl,--version-script,@0@'.format(mapfile_path)
+ 
+ libfprint = shared_library(versioned_libname.split('lib')[1],
+     sources: [
+@@ -308,7 +308,7 @@ udev_hwdb = executable('fprint-list-udev-hwdb',
+     dependencies: libfprint_private_dep,
+     link_with: libfprint_drivers,
+     install: false,
+-    link_args: ['-Wl,--disable-new-dtags'],
++    link_args: host_machine.system() == 'darwin' ? [] : ['-Wl,--disable-new-dtags'],
+ )
+ 
+ udev_hwdb_generator = custom_target('udev-hwdb',
+@@ -324,7 +324,7 @@ metainfo = executable('fprint-list-metainfo',
+     dependencies: libfprint_private_dep,
+     link_with: libfprint_drivers,
+     install: false,
+-    link_args: ['-Wl,--disable-new-dtags'],
++    link_args: host_machine.system() == 'darwin' ? [] : ['-Wl,--disable-new-dtags'],
+ )
+ 
+ metainfo_generator = custom_target('metainfo',
+@@ -342,7 +342,7 @@ if install_udev_rules
+         dependencies: libfprint_private_dep,
+         link_with: libfprint_drivers,
+         install: false,
+-        link_args: ['-Wl,--disable-new-dtags'],
++        link_args: host_machine.system() == 'darwin' ? [] : ['-Wl,--disable-new-dtags'],
+     )
+ 
+     custom_target('udev-rules',

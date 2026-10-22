@@ -18,6 +18,12 @@
 - **Native Wi-Fi** (AirportItlwm-Tahoe, macOS Wi-Fi menu; no HeliPort). Bluetooth as before.
 - Clean boot screen (sharp logo, no garbage flash) and lid close → display off (`xe-lid`).
 - Touchpad click-vibration strength (`xe-haptic`, `xe-hapticbar` menu-bar slider).
+- **Fingerprint for sudo** (since 2026-10-22): the Goodix 27C6:63BC sensor works through libfprint's goodixmoc driver
+  (match-on-chip, built for macOS with a small patch) and a PAM module in `/etc/pam.d/sudo_local` (`tools/fingerprint`).
+  Login, screen unlock, Touch ID settings, Apple Pay and LocalAuthentication prompts are **not** supported: they need
+  the Secure Enclave, which a hackintosh does not have.
+- **Power button locks the screen**: a short press locks at once, like a Mac with Touch ID (`tools/xe-pblock`, user
+  LaunchAgent). Touching the fingerprint sensor in the button does not trigger it.
 
 ## Known problems
 
@@ -66,7 +72,7 @@ How each of these was reached, and what was already tried, is in [HISTORY.md](HI
 - AirDrop, AWDL and Continuity features that need Apple Wi-Fi.
 - An on-demand touchpad pulse (Force Touch feedback): the haptic module only fires on physical clicks
   ([EXPERIMENTS.md](EXPERIMENTS.md) #82).
-- Camera (OV01A10 + Intel VSC + IPU6) and fingerprint reader: no driver work started.
+- Camera (OV01A10 + Intel VSC + IPU6): no driver work started.
 - Safari hardware video decode: needs the VA plugin in `/System/Library/Extensions` (a sealed-volume root patch,
   prepared but not applied; [EXPERIMENTS.md](EXPERIMENTS.md) #81).
 

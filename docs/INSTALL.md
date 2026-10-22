@@ -202,3 +202,35 @@ The haptic touchpad clicks by itself; macOS can only change how strong the vibra
 `xe-haptic list` (read-only dump) or `xe-haptic set 60 100`. The value is lost at reboot. For a persistent setting,
 `zsh tools/build-xe-hapticbar.sh` and `open tools/xe-hapticbar.app` (add it to Login Items): a hand icon in the menu bar
 with a slider, applied at login and on every change.
+
+## Fingerprint for sudo (optional)
+
+The Goodix sensor in the power button (27C6:63BC, match-on-chip) works through libfprint's `goodixmoc` driver. Only
+`sudo` (and other PAM services you add it to) can use it: login, screen unlock, Touch ID settings and
+LocalAuthentication need the Secure Enclave and are **not** supported. The sensor stores the prints itself.
+
+```sh
+bash tools/fingerprint/build.sh          # ~4 min: downloads and builds libusb, glib, libgusb, patched libfprint -> tools/build/fingerprint
+F=tools/build/fingerprint/dist/xefp/xe-fp
+$F list                                  # device info and prints on the chip (as yourself, no sudo)
+$F enroll right-index                    # 12 touches, lift and re-place each time
+$F verify                                # exit 0 = match
+sudo bash tools/fingerprint/install-pam.sh                  # copies xe-fp + pam_xefp.so to /usr/local (root-owned)
+sudo bash tools/fingerprint/install-pam.sh --enable-sudo    # adds one line to /etc/pam.d/sudo_local (backup kept)
+```
+
+Keep that terminal open and test in a new one: `sudo -k; sudo -v` should ask you to touch the sensor, and falls back to
+the password after 10 s, on no match, over SSH or when the sensor is busy. Only prints enrolled by xe-fp for the same
+user name are accepted; prints from other systems (e.g. Windows Hello) are listed as foreign and never used or deleted.
+Our libfprint patch also removes upstream's automatic wipe of the sensor storage when listing fails.
+Undo: `sudo bash tools/fingerprint/uninstall-pam.sh` (prints stay on the sensor; `xe-fp delete right-index` removes one).
+
+## Power button locks the screen (optional)
+
+`sh tools/xe-pblock/install.sh` builds `xe-pblock.app`, copies it to `~/Library/Application Support/xe/`, runs two
+15-second checks (touching the fingerprint sensor must not count as a press; one press must be seen) and loads the
+user LaunchAgent `local.xe.pblock`. Allow **xe-pblock** in Privacy & Security › Input Monitoring when asked. A short
+press then locks the screen at once (the same call as Apple menu › Lock Screen); with the screen already locked it does
+nothing. No `pmset` change is needed: on this laptop loginwindow ignores short presses. `sh tools/xe-pblock/probe.sh`
+shows the events live without locking. Log: `~/Library/Logs/xe-pblock.log`. Undo: `sh tools/xe-pblock/uninstall.sh`
+(`--reset-tcc` also removes the permission).
