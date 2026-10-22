@@ -8,6 +8,7 @@ The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
 
 | Date | Change | Status |
 |---|---|---|
+| 2026-10-22 | WKWebView apps (e.g. Tauri) drew a dark box over very tall cards: Apple's CPU drawing fallback (used because WebKit can't load our Metal driver) mis-renders tall `box-shadow`s. Workaround: `WebKitDebugAcceleratedDrawingEnabled = NO` per app (STATUS) | confirmed |
 | 2026-10-22 | Documentation brought up to date: STATUS, INSTALL (speakers, Wi-Fi, sleep, haptics), HISTORY phases 22–25, EXPERIMENTS #69–#88 | — |
 | 2026-10-22 | **Internal speakers are a macOS output device** (M6): AudShim 0.8.0 gets an autonomous driver mode (the whole M3–M5 sequence in the kext, data from the generated `AudShimData.h`; −6 dB gain cap, 5 s deferred stop, full teardown on close/client death/sleep/shutdown) and the new AudioServerPlugIn `tools/XeSpeakers` publishes a 48 kHz stereo built-in output with volume and mute. System sounds and music play through System Settings › Sound. First install dropped the device: the HAL queries some properties in the input scope too, and they were only answered for output (fixed). Install: `tools/audio/install-audio.sh`. Microphones (RT714) not done | confirmed |
 | 2026-10-22 | `tools/AudShim/AudShimData.h` is no longer meant to be committed (it embeds Intel's 512 KB SOF firmware, 2.8 MB as C): `.gitignore`d, regenerate it with `audctl gen-header` from the official sof-bin release ([INSTALL.md](docs/INSTALL.md)) | — |
