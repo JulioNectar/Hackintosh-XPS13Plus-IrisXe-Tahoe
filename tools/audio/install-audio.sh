@@ -5,7 +5,7 @@
 #                                            (needs tools/AudShim/AudShimData.h: see docs/INSTALL.md, "Internal speakers")
 #   zsh tools/audio/install-audio.sh kext    copy AudShim.kext to the EFI and add its Kernel>Add entry if missing
 #                                            (EFI mounted at $EFI, default /Volumes/EFI; config.plist is backed up). REBOOT,
-#                                            then check: tools/build/audctl info (interface v8) and tools/build/audctl drv test
+#                                            then check: tools/build/audctl info (interface v9) and tools/build/audctl drv test / audctl rec
 #   zsh tools/audio/install-audio.sh hal     install XeSpeakers.driver in /Library/Audio/Plug-Ins/HAL (sudo) and restart
 #                                            coreaudiod; then pick the speakers in System Settings > Sound > Output
 #
@@ -58,7 +58,7 @@ kext)
 hal)
     [[ -d $B/XeSpeakers.driver ]] || { echo "missing $B/XeSpeakers.driver: run the build stage first"; exit 1; }
     I=$(ioreg -r -c AudShim -d 1 2>/dev/null | awk -F'= ' '/"AudShimInterface"/ {print $2}')
-    [[ "$I" == "8" ]] || { echo "the loaded AudShim is not interface v8 (got '${I:-none}'): install the kext and reboot first"; exit 1; }
+    [[ "$I" == "8" || "$I" == "9" ]] || { echo "the loaded AudShim is not interface v8/v9 (got '${I:-none}'): install the kext and reboot first"; exit 1; }
     codesign -v $B/XeSpeakers.driver || { echo "XeSpeakers.driver signature check failed"; exit 1; }
     sudo rm -rf /Library/Audio/Plug-Ins/HAL/XeSpeakers.driver
     sudo cp -R $B/XeSpeakers.driver /Library/Audio/Plug-Ins/HAL/

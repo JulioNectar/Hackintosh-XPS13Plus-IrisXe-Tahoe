@@ -1,4 +1,4 @@
-// audctl: user-space tool for the AudShim kext (milestones M1/M1b/M2/M2b/M3/M4/M5/M6, audctl 0.8.0).
+// audctl: user-space tool for the AudShim kext (milestones M1/M1b/M2/M2b/M3/M4/M5/M6/M7, audctl 0.9.0).
 // Intel cAVS 2.5 audio DSP, PCI 8086:51CA (RPL-P), Dell XPS 13 Plus 9320.
 //
 //   audctl info               PCI IDs, command/status, BAR addresses and sizes, PM state
@@ -45,6 +45,10 @@
 //   audctl drv state|open|start|stop|close   M6: the kext driver mode (interface v8) through a driver connection
 //   audctl drv test [--seconds=N] [--level=dB]  M6: OPEN, map the shared ring, sine, START/STOP twice, CLOSE
 //                             (only when no other driver connection, i.e. the XeSpeakers HAL plug-in, owns it)
+//   audctl rec [OUT.wav] [--seconds=N]  M7 (interface v9): record the internal microphones (RT714 on SoundWire link 0)
+//                             to a 48 kHz / 2 ch / 32-bit WAV and print RMS / peak levels; works while the HAL plug-in
+//                             owns the hardware (capture-only connection) or alone (then it brings the hardware up)
+//   audctl rec --dry-run [--hex]  M7 (offline, no kext access): the planned RT714 register / SoundWire / DMA / IPC3 sequence
 //
 // Everything except `m2` (without --dry/--state) is read-only. (Since M1b the kext itself sets
 // PCI COMMAND.MSE once at start, unless booted with -audshimnomse; `info` reports it.) The M2
@@ -788,7 +792,7 @@ static int cmd_m2(int argc, char **argv) {
     if (dry + undo + state > 1) { fprintf(stderr, "m2: --dry, --undo and --state are exclusive\n"); return 2; }
 
     if (dry) {
-        printf("audctl 0.8.0  m2 --dry: NOTHING is armed or written.\n");
+        printf("audctl 0.9.0  m2 --dry: NOTHING is armed or written.\n");
         uint32_t c44 = 0x00, c48 = 0xFF, cs = 0x00000F0F; int live = 0;
         if (offline) printf("(--offline: kext not opened, using the M1 dump values)\n");
         else if (aud_open() == 0) {
@@ -824,7 +828,7 @@ static int cmd_m2(int argc, char **argv) {
     }
 
     if (undo) {
-        printf("audctl 0.8.0  m2 --undo: return DSP core 0 and cfg 0x44/0x48 to the M1 state\n");
+        printf("audctl 0.9.0  m2 --undo: return DSP core 0 and cfg 0x44/0x48 to the M1 state\n");
         if (m2call(M2_ARM, MAGIC_UNDO, 0, o)) return 1;
         if (o[0] != M2R_OK) { printf("  ARM(undo) %s (fail mask 0x%llx)\n", m2rc(o[0]), o[11]); m2_precheck(p, 1); return 1; }
         { uint64_t q[16]; if (m2call(M2B_INFO, 2, 0, q) == 0 && q[11])
@@ -839,7 +843,7 @@ static int cmd_m2(int argc, char **argv) {
     }
 
     // ---------------- the real M2 run
-    printf("audctl 0.8.0  m2 (ipc=%s, ROM poll %u ms%s)\n", ipc, romms, teardown ? ", teardown at end" : "");
+    printf("audctl 0.9.0  m2 (ipc=%s, ROM poll %u ms%s)\n", ipc, romms, teardown ? ", teardown at end" : "");
     uint32_t f = m2_precheck(p, 1);
     if (f == 0xFFFFFFFFu) return 1;
     if (f) {
@@ -1149,6 +1153,8 @@ static int fw_parse(struct fwfile *f, const char *path, int verbose) {
 static void m4_plan(unsigned links, unsigned attachms);
 struct m5plan;
 static void m5_plan_print(const struct bootopt *op, const struct m5plan *pl, int hex);
+struct tplg;
+static int pl_build(const struct tplg *tp, struct m5plan *pl, int verbose);
 static struct m5plan *g_m5plan;
 static void boot_plan(const struct bootopt *op, uint32_t iss, uint32_t oss, uint32_t spb, uint32_t pp, int live,
                       const struct fwfile *f) {
@@ -2021,6 +2027,7 @@ struct m5plan {
     uint32_t vol_max, vol_min, vol_ch; int tlv[3];
     int order[32], norder;            // DFS pre-order (widget indices)
     char pcm_name[TP_NAME]; uint32_t pcm_id;
+    int cap;                          // M7: 1 = microphone (capture) plan
 };
 
 static void put32(uint8_t *b, uint32_t o, uint32_t v) { b[o] = (uint8_t)v; b[o + 1] = (uint8_t)(v >> 8); b[o + 2] = (uint8_t)(v >> 16); b[o + 3] = (uint8_t)(v >> 24); }
@@ -2075,22 +2082,50 @@ static void pl_config(struct ipcmsg *m, const struct tp_widget *w) {
     put32(m->b, 48, tp_fmt(tp_s(w, 402)));
 }
 
-static int pl_build(const struct tplg *tp, struct m5plan *pl, int verbose) {
+// cap = 0: the speaker PCM ('Speaker', playback): the walk starts at its host (AIF_IN) widget.
+// cap = 1 (M7): the microphone PCM ('Microphone', capture): Linux starts the walk at the DAI_OUT widget whose path
+// reaches the PCM's host (AIF_OUT) widget (sof_walk_widgets_in_order, sof-audio.c:684-692) and sets the widgets up
+// source to sink (sof_set_up_widgets_in_path, sof-audio.c:599-667).
+static int pl_build_dir(const struct tplg *tp, struct m5plan *pl, int verbose, int cap) {
     memset(pl, 0, sizeof *pl);
     pl->host_w = pl->pga_w = -1;
-    // 1. the speaker PCM and its host (AIF_IN) widget ([SP] / [TP] spcm, stream name match)
+    pl->cap = cap;
+    const char *pname = cap ? "Microphone" : "Speaker";
+    // 1. the PCM and its host widget ([SP] / [TP] spcm, stream name match)
     const struct tp_pcm *pc = NULL;
-    for (int i = 0; i < tp->np; i++) if (tp->p[i].pb && !strcmp(tp->p[i].name, "Speaker")) pc = &tp->p[i];
-    if (!pc) { printf("  !! no playback PCM named 'Speaker' in the topology\n"); return -1; }
+    for (int i = 0; i < tp->np; i++) if ((cap ? tp->p[i].cap : tp->p[i].pb) && !strcmp(tp->p[i].name, pname)) pc = &tp->p[i];
+    if (!pc) { printf("  !! no %s PCM named '%s' in the topology\n", cap ? "capture" : "playback", pname); return -1; }
     snprintf(pl->pcm_name, sizeof pl->pcm_name, "%s", pc->name); pl->pcm_id = pc->pcm_id;
     int hw = -1;
-    for (int i = 0; i < tp->nw; i++) if (tp->w[i].id == W_AIF_IN && !strcmp(tp->w[i].sname, pc->sname[0])) hw = i;
-    if (hw < 0) { printf("  !! no AIF_IN widget with stream name '%s'\n", pc->sname[0]); return -1; }
+    for (int i = 0; i < tp->nw; i++)
+        if (tp->w[i].id == (cap ? W_AIF_OUT : W_AIF_IN) && !strcmp(tp->w[i].sname, pc->sname[cap ? 1 : 0])) hw = i;
+    if (hw < 0) { printf("  !! no %s widget with stream name '%s'\n", cap ? "AIF_OUT" : "AIF_IN", pc->sname[cap ? 1 : 0]); return -1; }
     pl->host_w = hw; pl->host_comp = tp->w[hw].comp_id;
+    int start = hw;
+    if (cap) {   // the DAI_OUT widget the host widget is reachable from
+        start = -1;
+        for (int d = 0; d < tp->nw && start < 0; d++) {
+            if (tp->w[d].id != W_DAI_OUT) continue;
+            int st[96], n = 0, vis[96] = {0};
+            st[n++] = d;
+            while (n) {
+                int x = st[--n];
+                if (vis[x]) continue;
+                vis[x] = 1;
+                if (x == hw) { start = d; break; }
+                for (int r = 0; r < tp->nr; r++) {
+                    if (strcmp(tp->r[r].src, tp->w[x].name)) continue;
+                    int s2 = tp_widget_by_name(tp, tp->r[r].sink);
+                    if (s2 >= 0 && !vis[s2] && n < 96) st[n++] = s2;
+                }
+            }
+        }
+        if (start < 0) { printf("  !! no DAI_OUT widget reaches %s\n", tp->w[hw].name); return -1; }
+    }
     // 2. DFS pre-order from the host widget. DAPM keeps a widget's out-edges in reverse insertion order
     //    (list_add in dapm_add_path, [SDP]:693-696), so the route added last is walked first.
     int stack[32], sp = 0, seen[96] = {0};
-    stack[sp++] = hw;
+    stack[sp++] = start;
     while (sp && pl->norder < 32) {
         int wi = stack[--sp];
         if (seen[wi]) continue;
@@ -2158,6 +2193,7 @@ static int pl_build(const struct tplg *tp, struct m5plan *pl, int verbose) {
                      w->name, w->comp_id, ch, vmin, vmax, tp_u32(w, 250, 0), tp_u32(w, 251, 0), fmt_name(tp_fmt(tp_s(w, 402))));
             pl->n++;
             pl->pga_w = pl->order[oi]; pl->pga_comp = w->comp_id; pl->vol_min = vmin; pl->vol_max = vmax; pl->vol_ch = ch;
+            if (kc && pl->n + 2 > 46) { printf("  !! too many messages\n"); return -1; }
             if (kc) {   // sof_ipc3_widget_kcontrol_setup [I3C]:703-738 -> SET_VALUE with the cached value (0 dB, [I3T]:1866-1896)
                 struct ipcmsg *v = pl_new(&pl->m[pl->n++], 92 + 8 * ch, IPC_GLB_COMP | IPC_SET_VALUE,
                     "COMP_SET_VALUE %s: '%s' %u ch = VOL_ZERO_DB 0x%x (kcontrol restore)  [I3C]:14-120, 703-738", w->name, kc->name, ch, VOL_ZERO_DB);
@@ -2169,11 +2205,27 @@ static int pl_build(const struct tplg *tp, struct m5plan *pl, int verbose) {
                 for (uint32_t c = 0; c < ch; c++) put32(pl->vol_mute.b, 96 + 8 * c, 0);
                 snprintf(pl->vol_mute.what, sizeof pl->vol_mute.what, "COMP_SET_VALUE %s: volume 0 (mute, ramped) before stop (M5 fade-out, not Linux)", w->name);
             }
+            // M7: a switch kcontrol on the same PGA ('5 Master Capture Switch', max 1). Linux loads it with cmd SWITCH
+            // and value 0 ([I3T] sof_ipc3_control_load_volume) and restores that at widget set-up; alsactl / UCM then
+            // turn it on. We send the "on" state right away (SOF volume.c: value != 0 = unmute). Playback PGAs of this
+            // topology have no switch, so the speaker plan is unchanged.
+            for (int k = 0; k < w->nk; k++) {
+                const struct tp_kctl *sw = &w->k[k];
+                if (sw->type != 1 || sw->max != 1) continue;
+                uint32_t sch = (uint32_t)sw->nch;
+                if (sch < 1 || sch > 8 || pl->n > 46) { printf("  !! switch '%s' unusable\n", sw->name); return -1; }
+                struct ipcmsg *v = pl_new(&pl->m[pl->n++], 92 + 8 * sch, IPC_GLB_COMP | IPC_SET_VALUE,
+                    "COMP_SET_VALUE %s: '%s' %u ch = 1 (SWITCH on; Linux restores 0, alsactl/UCM then set 1)  [I3C]:14-120", w->name, sw->name, sch);
+                put32(v->b, 12, w->comp_id); put32(v->b, 16, 1); put32(v->b, 20, 2); put32(v->b, 24, 0); put32(v->b, 56, sch);
+                for (uint32_t c = 0; c < sch; c++) { put32(v->b, 92 + 8 * c, c); put32(v->b, 96 + 8 * c, 1); }
+            }
             break;
         }
         case W_EFFECT: {   // sof_widget_update_ipc_comp_process + sof_process_load [I3T]:895-1012
             const char *pt = tp_s(w, 900);
-            uint32_t ctype = !pt ? 0 : !strcmp(pt, "DEMUX") ? 18 : !strcmp(pt, "MUX") ? 7 : 0;
+            // [I3T]:40-50 sof_process[] -> enum sof_comp_type (SOF topology.h): MUX 7, EQ_IIR 13, EQ_FIR 14, DEMUX 18
+            uint32_t ctype = !pt ? 0 : !strcmp(pt, "DEMUX") ? 18 : !strcmp(pt, "MUX") ? 7 : !strcmp(pt, "EQIIR") ? 13 :
+                             !strcmp(pt, "EQFIR") ? 14 : 0;
             if (!ctype) { printf("  !! effect %s of type '%s' is not supported by M5\n", w->name, pt ? pt : "?"); return -1; }
             const struct tp_kctl *kc = NULL;
             for (int k = 0; k < w->nk; k++) if (w->k[k].type == 2) kc = &w->k[k];
@@ -2285,12 +2337,12 @@ static int pl_build(const struct tplg *tp, struct m5plan *pl, int verbose) {
     }
     // 7. stream messages ([I3P]:16-160)
     struct ipcmsg *m = pl_new(&pl->pcm_params, 108, IPC_GLB_STREAM | IPC_PCM_PARAMS,
-        "STREAM_PCM_PARAMS host comp %u: 48000 Hz, 2 ch, S32_LE (4/4 bytes), interleaved, buffer 65536 B / 16 pages, period 4096 B, "
-        "stream tag 1, no_stream_position 1 (page table address patched by the kext)  [I3P]:39-143", pl->host_comp);
+        "STREAM_PCM_PARAMS host comp %u: %s, 48000 Hz, 2 ch, S32_LE (4/4 bytes), interleaved, buffer 65536 B / 16 pages, period 4096 B, "
+        "stream tag 1, no_stream_position 1 (page table address patched by the kext)  [I3P]:39-143", pl->host_comp, cap ? "capture" : "playback");
     put32(m->b, 8, pl->host_comp);
     put32(m->b, 24, 84);                       // params.hdr.size = sizeof(pcm.params)
     put32(m->b, 36, 16); put32(m->b, 40, 65536);   // buffer.pages = PFN_UP(dma_bytes), buffer.size
-    put32(m->b, 56, 0);                        // direction playback
+    put32(m->b, 56, cap ? 1 : 0);              // direction: SOF_IPC_STREAM_PLAYBACK 0 / CAPTURE 1 (stream.h)
     put32(m->b, 60, 2);                        // SOF_IPC_FRAME_S32_LE
     put32(m->b, 64, 0);                        // SOF_IPC_BUFFER_INTERLEAVED
     put32(m->b, 68, 48000);
@@ -2303,6 +2355,19 @@ static int pl_build(const struct tplg *tp, struct m5plan *pl, int verbose) {
     put32(m->b, 8, pl->host_comp);
     m = pl_new(&pl->trig_stop, 12, IPC_GLB_STREAM | IPC_TRIG_STOP, "STREAM_TRIG_STOP host comp %u  [I3P]:145-180", pl->host_comp);
     put32(m->b, 8, pl->host_comp);
+    if (cap) {   // M7 sanity: exactly the RT714 pin (SDW0 Pin2: link 0, PDI 2), 48 kHz, 2 ch, a PGA on the path
+        if (pl->ndai != 1 || pl->dai[0].link != 0 || pl->dai[0].pdi != 2 || pl->dai[0].rate != 48000 || pl->dai[0].ch != 2) {
+            printf("  !! microphone path: expected 1 ALH DAI on link 0 PDI 2 at 48 kHz / 2 ch (found %d)\n", pl->ndai);
+            return -1;
+        }
+        if (pl->pga_w < 0) { printf("  !! no PGA on the microphone path\n"); return -1; }
+        if (verbose) {
+            printf("  microphone path (DFS from '%s' to '%s', DAPM edge order):", tp->w[start].name, tp->w[hw].name);
+            for (int oi = 0; oi < pl->norder; oi++) printf(" %s%s", oi ? "-> " : "", tp->w[pl->order[oi]].name);
+            printf("\n");
+        }
+        return 0;
+    }
     // sanity: exactly the two RT1316 ALH pins
     if (pl->ndai != 2) { printf("  !! expected 2 ALH DAIs on the speaker path, found %d\n", pl->ndai); return -1; }
     for (int k = 0; k < 2; k++) {
@@ -2321,6 +2386,8 @@ static int pl_build(const struct tplg *tp, struct m5plan *pl, int verbose) {
     }
     return 0;
 }
+
+static int pl_build(const struct tplg *tp, struct m5plan *pl, int verbose) { return pl_build_dir(tp, pl, verbose, 0); }
 
 static void pl_hex(const struct ipcmsg *m, const char *pfx) {
     for (uint32_t i = 0; i < m->len; i += 4) {
@@ -2984,7 +3051,7 @@ static int cmd_boot(int argc, char **argv, int mode) {   // mode 0 m2b, 1 m3, 2 
     memset(&fw, 0, sizeof fw);
     uint64_t o[16], p[16];
     if (dry) {
-        printf("audctl 0.8.0  %s --dry: NOTHING is armed or written.\n", cmd);
+        printf("audctl 0.9.0  %s --dry: NOTHING is armed or written.\n", cmd);
         if (m3) { printf("\n"); if (fw_parse(&fw, op.fw, 1)) printf("  (firmware file problem: a real run would abort here)\n"); }
         if (m5) {
             printf("\n");
@@ -3054,7 +3121,7 @@ static int cmd_boot(int argc, char **argv, int mode) {   // mode 0 m2b, 1 m3, 2 
     }
 
     // ---------------- the real run
-    printf("audctl 0.8.0  %s (attempts %d, ROM poll %u ms, ctrl-reset %s, iccmax %s, L1SEN %s, SSP %s, PIE %s%s%s, %s)\n",
+    printf("audctl 0.9.0  %s (attempts %d, ROM poll %u ms, ctrl-reset %s, iccmax %s, L1SEN %s, SSP %s, PIE %s%s%s, %s)\n",
            cmd, op.attempts, op.romms, op.ctrl ? "on" : "OFF", op.icc ? "on" : "OFF", op.l1 ? "on" : "OFF",
            op.ssp ? "WRITE" : "record-only", op.pie ? "on" : "OFF", m3 ? ", FW_READY wait " : "",
            m3 ? (op.post ? "+ post_fw_run" : "") : "", op.leave ? "leave-up" : "teardown");
@@ -3392,6 +3459,178 @@ fail_nodump:
 #undef CALL
 }
 
+// ------------------------------------------------------------------ M7: RT714 microphones (capture)
+// References (besides the M5 ones):
+//   [R7]  sound/soc/codecs/rt715-sdca.c (RT714 = rt715-sdca, part 0x714, SDCA function 2 = MIC_ARRAY)
+//   [R7S] sound/soc/codecs/rt715-sdca-sdw.c (source ports 0x50 = DP4 + DP6, simple_ch_prep_sm, paging)
+//   [R7H] sound/soc/codecs/rt715-sdca.h      [MBQ] drivers/base/regmap/regmap-sdw-mbq.c
+//   [UCM7] alsa-ucm-conf ucm2/codecs/rt715-sdca/init.conf + ucm2/sof-soundwire/rt715-sdca.conf
+//   [SU]  sound/soc/sdw_utils/soc_sdw_utils.c: rt714 -> dai "rt715-sdca-aif2" (DP4), SOC_SDW_DMIC_DAI_ID
+// Copies of the files used are in ~/xe/build/mic/ref/.
+//
+// The sequence is a table so that the kext (driver mode, AudShimData.h) and `audctl rec --dry-run` use the same bytes.
+// kinds: W8 = sdw_write; U8 = sdw_update (read + write (v & ~mask) | val); C8 = read, write `mask` back if any of
+// its bits is set (w1c); WQ = 16-bit MBQ write (MSB to reg | 0x2000 first, then LSB to reg, [MBQ]:75-92); UQ = MBQ
+// read (LSB at reg, MSB at reg | 0x2000, [MBQ]:128-151) + MBQ write of (v & ~mask) | val; RQ = MBQ read, kept as the
+// hardware version (v & 0xf). cond 1/2: only when hw_ver == 0 / 1 ([R7] rt715_sdca_io_init).
+// phases: 1 = attach (sdw_initialize_slave + rt715_sdca_io_init + UCM BootSequence), 2 = BE hw_params,
+//         3 = power up (UCM EnableSequence + DAPM PDE23_24 POST_PMU), 4 = power down (PRE_PMD + UCM DisableSequence)
+enum { MK_W8 = 1, MK_U8 = 2, MK_C8 = 3, MK_WQ = 4, MK_UQ = 5, MK_RQ = 6 };
+struct micop { uint8_t phase, kind, cond; uint32_t reg; uint16_t mask, val; const char *what; };
+#define FUN_MIC 2
+// SDW_SDCA_CTL as a constant expression ([SR]:335-342, same as sdca())
+#define SDCA(fun, ent, ctl, ch) ((1u << 30) | (((fun) & 7u) << 22) | (((ent) & 0x40u) << 15) | (((ent) & 0x3Fu) << 7) | \
+                                 (((ctl) & 0x30u) << 15) | (((ctl) & 0xFu) << 3) | (((ch) & 0x38u) << 12) | ((ch) & 7u))
+static const struct micop mic_ops[] = {
+    {1, MK_W8, 0, 0x4D, 0, 1, "SCP_BusClock_Base = 1 (sdw_slave_set_frequency, bus.c:1377-1417)"},
+    {1, MK_W8, 0, 0x62, 0, 3, "SCP_BusClock_Scale_B0 = 3"},
+    {1, MK_W8, 0, 0x72, 0, 3, "SCP_BusClock_Scale_B1 = 3"},
+    {1, MK_C8, 0, 0x40, 0x02, 0, "SCP_Int1: clear BUS_CLASH if set (bus.c:1430-1447)"},
+    {1, MK_U8, 0, 0x41, 0x00, 0, "SCP_IntMask1 |= scp_int1_mask (0 for rt715-sdca: read + same write, bus.c:1475-1483)"},
+    {1, MK_RQ, 0, 0x2000000, 0, 0, "VENDOR_REG(0x20) PRODUCT_NUM: hw_ver = value & 0xf ([R7] io_init)"},
+    {1, MK_W8, 0, SDCA(FUN_MIC, 0x10, 0x01, 0), 0, 1, "SDCA CX_CLK_SEL (ent 0x10 ctl 1) = 1: external clock"},
+    {1, MK_UQ, 1, 0x2000036, 0x54, 0x54, "AD_FUNC_EN |= 0x54 (hw_ver 0: GPIO4/5/6 as DMIC3/4)"},
+    {1, MK_UQ, 2, 0x2000036, 0x55, 0x55, "AD_FUNC_EN |= 0x55 (hw_ver 1)"},
+    {1, MK_UQ, 2, 0x2000037, 0x40, 0x40, "REV_1 |= 0x40 (hw_ver 1)"},
+    {1, MK_UQ, 0, 0x2000044, 0x01, 0x01, "DFLL_VAD |= 1: DFLL calibration trigger"},
+    {1, MK_W8, 0, SDCA(FUN_MIC, 0x05, 0x10, 0), 0, 2, "SDCA SMPU_TRIG_ST_EN (ent 0x05 ctl 0x10) = 2: trigger mode VAD"},
+    {1, MK_U8, 0, 0x5E, 0x01, 0x01, "RT715_INT_MASK (SDCA IntMask3) |= 1: SMPU-1"},
+    {1, MK_U8, 0, SDCA(FUN_MIC, 0x0A, 0x01, 1), 0x01, 0x01, "FU0A (ADC7/27) mute ch1 = 1 ([UCM7] 'FU0A Capture Switch' 0)"},
+    {1, MK_U8, 0, SDCA(FUN_MIC, 0x0A, 0x01, 2), 0x01, 0x01, "FU0A mute ch2 = 1"},
+    {1, MK_UQ, 0, 0x6100000, 0xF000, 0x6000, "HDA_LEGACY_MUX_CTL1: ADC 22 Mux = DMIC3 ([UCM7])"},
+    {1, MK_UQ, 0, 0x6100000, 0x0F00, 0x0700, "HDA_LEGACY_MUX_CTL1: ADC 23 Mux = DMIC4 ([UCM7])"},
+    {1, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 1), 0x01, 0x00, "FU02 (ADC8/9) unmute ch1 ([UCM7] 'FU02 Capture Switch' 1)"},
+    {1, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 2), 0x01, 0x00, "FU02 unmute ch2"},
+    {1, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 3), 0x01, 0x00, "FU02 unmute ch3"},
+    {1, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 4), 0x01, 0x00, "FU02 unmute ch4"},
+    {1, MK_WQ, 0, SDCA(FUN_MIC, 0x02, 0x02, 1), 0, 0x0000, "FU02 volume ch1 = 0x0000 = 0 dB ([UCM7] 'FU02 Capture Volume' 47)"},
+    {1, MK_WQ, 0, SDCA(FUN_MIC, 0x02, 0x02, 2), 0, 0x0000, "FU02 volume ch2 = 0 dB"},
+    {1, MK_WQ, 0, SDCA(FUN_MIC, 0x02, 0x02, 3), 0, 0x0000, "FU02 volume ch3 = 0 dB"},
+    {1, MK_WQ, 0, SDCA(FUN_MIC, 0x02, 0x02, 4), 0, 0x0000, "FU02 volume ch4 = 0 dB"},
+    {2, MK_WQ, 0, 0x2000039, 0, 0xaf00, "SDW_INPUT_SEL = 0xaf00 (rt715_sdca_pcm_hw_params, AIF2 = DP4)"},
+    {2, MK_W8, 0, SDCA(FUN_MIC, 0x01, 0x10, 0), 0, 0x09, "SDCA CS_FREQ_IND (ent 0x01 ctl 0x10) = 0x9: 48 kHz"},
+    {3, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 1), 0x01, 0x00, "FU02 unmute ch1 ([UCM7] EnableSequence)"},
+    {3, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 2), 0x01, 0x00, "FU02 unmute ch2"},
+    {3, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 3), 0x01, 0x00, "FU02 unmute ch3"},
+    {3, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 4), 0x01, 0x00, "FU02 unmute ch4"},
+    {3, MK_W8, 0, SDCA(FUN_MIC, 0x18, 0x01, 0), 0, 0x00, "SDCA PDE23_24 REQ_POWER (ent 0x18 ctl 1) = PS0 (DAPM POST_PMU)"},
+    {4, MK_W8, 0, SDCA(FUN_MIC, 0x18, 0x01, 0), 0, 0x03, "SDCA PDE23_24 REQ_POWER = PS3 (DAPM PRE_PMD)"},
+    {4, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 1), 0x01, 0x01, "FU02 mute ch1 ([UCM7] DisableSequence)"},
+    {4, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 2), 0x01, 0x01, "FU02 mute ch2"},
+    {4, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 3), 0x01, 0x01, "FU02 mute ch3"},
+    {4, MK_U8, 0, SDCA(FUN_MIC, 0x02, 0x01, 4), 0x01, 0x01, "FU02 mute ch4"},
+};
+#define NMICOPS ((int)(sizeof mic_ops / sizeof mic_ops[0]))
+static uint32_t mic_reg(int i) { return mic_ops[i].reg; }
+static const char *mic_kind(int k) {
+    static const char *n[] = {"?", "W8", "U8", "C8", "WQ", "UQ", "RQ"};
+    return k < 7 ? n[k] : "?";
+}
+// how a 32-bit address goes out on the command FIFO (cdns_program_scp_addr [CD]:677-768, SCP_AddrPage1/2)
+static void mic_addr(char *b, size_t n, uint32_t a) {
+    if (a < 0x8000) snprintf(b, n, "reg 0x%04x", a);
+    else snprintf(b, n, "page1 0x%02x page2 0x%02x reg 0x%04x", (a >> 23) & 0xFF, (a >> 15) & 0xFF, (a & 0x7FFF) | 0x8000);
+}
+static void mic_print_phase(int phase, int dev) {
+    char ab[64], ab2[64];
+    for (int i = 0; i < NMICOPS; i++) {
+        const struct micop *m = &mic_ops[i];
+        if (m->phase != phase) continue;
+        uint32_t a = mic_reg(i);
+        mic_addr(ab, sizeof ab, a);
+        const char *cond = m->cond == 1 ? " [only if hw_ver == 0]" : m->cond == 2 ? " [only if hw_ver == 1]" : "";
+        switch (m->kind) {
+        case MK_W8: printf("    L0 dev %d W  0x%08x = 0x%02x          (%s)  %s%s\n", dev, a, m->val, ab, m->what, cond); break;
+        case MK_U8: printf("    L0 dev %d RW 0x%08x &~0x%02x |0x%02x    (%s)  %s%s\n", dev, a, m->mask, m->val, ab, m->what, cond); break;
+        case MK_C8: printf("    L0 dev %d R  0x%08x, W 0x%02x if set  (%s)  %s%s\n", dev, a, m->mask, ab, m->what, cond); break;
+        case MK_WQ: case MK_UQ: case MK_RQ:
+            mic_addr(ab2, sizeof ab2, a | 0x2000);
+            if (m->kind == MK_RQ) printf("    L0 dev %d R  0x%08x (LSB, %s) + 0x%08x (MSB, %s)  %s\n", dev, a, ab, a | 0x2000, ab2, m->what);
+            else printf("    L0 dev %d %s 0x%08x %s0x%04x: %sW 0x%08x = MSB (%s), W 0x%08x = LSB  %s%s\n", dev,
+                        m->kind == MK_UQ ? "RMW" : "W  ", a, m->kind == MK_UQ ? "mask " : "", m->kind == MK_UQ ? m->mask : m->val,
+                        m->kind == MK_UQ ? "read LSB+MSB, " : "", a | 0x2000, ab2, a, m->what, cond);
+            break;
+        }
+    }
+}
+
+// RT714 DP4 (slave) port registers, SDW_DPN_* with n = 4 ([SR]): base 0x400
+#define MIC_DP 4u
+static uint32_t dpn(uint32_t off) { return MIC_DP * 0x100 + off; }
+
+// The microphone capture plan: what the kext driver mode (AudShim 0.9.0, interface v9) does for CAP_START / CAP_STOP,
+// in the Linux order (BE hw_params, FE hw_params, BE prepare (sdw_prepare_stream), DAPM power-up, BE trigger
+// (sdw_enable_stream), FE trigger (DMA RUN, TRIG_START); stop in reverse; [SPC]/[SP]/[ST2]).
+static void mic_plan_print(const struct m5plan *cp, int hex) {
+    struct sdwxp x; m5_compute(&x, 0);
+    const struct m5dai *d = &cp->dai[0];
+    uint32_t l = d->link, pdi = d->pdi, cb = 0x30000u + 0x10000u * l;
+    printf("== audctl rec plan (DRY RUN: nothing below is executed; the kext does it on CAP_START / CAP_STOP) ==\n\n");
+    printf("0. hardware up (only if no driver connection has it up yet): the M6 bring-up (M3 firmware, M4 links 0-3 + enumeration,\n"
+           "   M5 speaker set-up). Enumeration must find RT714 = 025D:0714 on link 0 (DSDT SWD0 _ADR 0x000030025D071401);\n"
+           "   the kext records its device number (expected 1).\n\n");
+    printf("1. RT714 attach-time init, once per bring-up (sdw_initialize_slave, rt715_sdca_io_init, UCM BootSequence):\n");
+    mic_print_phase(1, 1);
+    printf("\n2. SOF capture pipeline %s (pcm %u '%s'), once per bring-up: widget set-up in the Linux order\n", cp->dai[0].wname, cp->pcm_id, cp->pcm_name);
+    for (int i = 0; i < cp->n; i++) {
+        printf("   IPC %2d %-18s %3u B  %s\n", i + 1, ipc_cmd_name(le32(cp->m[i].b + 4)), cp->m[i].len, cp->m[i].what);
+        if (hex) pl_hex(&cp->m[i], "        ");
+    }
+    printf("\n3. BE hw_params (intel_hw_params -> intel_pdi_shim_configure / intel_pdi_alh_configure / sdw_cdns_config_stream,\n"
+           "   [IS]:625-675, [CD] sdw_cdns_config_stream) for %s: link %u PDI %u, ALH stream %u, RX (capture):\n", d->wname, l, pdi, d->alh_id);
+    printf("    BAR4+0x%05x (16) PCMSyCHM(%u,%u) = 0x%04x  (STREAM %u << 8 | HCHN %u << 4 | LCHN 0 | DIR(RX) bit 15)\n",
+           0x2C000 + 0x22 + 0x60 * l + 2 * pdi, l, pdi, (d->alh_id << 8) | ((d->ch - 1) << 4) | 0x8000, d->alh_id, d->ch - 1);
+    printf("    BAR4+0x%05x (32) ALH STRMZCFG(%u): DMAT = 3, CHN = %u (read-modify-write)\n", 0x2C800 + 4 * d->alh_id, d->alh_id, d->ch - 1);
+    printf("    BAR4+0x%05x (32) CDNS PORTCTRL(%u): DIRN = 1 (RX), TEST_FAILED 0, BULK 0 (read-modify-write)\n", cb + 0x130 + pdi * 0x80, pdi);
+    printf("    BAR4+0x%05x (32) CDNS PDI_CONFIG(%u) = 0x%08x (port %u | ch mask 0x%x << 8 | SOFT_RESET bit 24)\n", cb + 0x1100 + pdi * 16, pdi,
+           pdi | (1u << 24) | (x.chmask << 8), pdi, x.chmask);
+    printf("   RT714 hw_params (port DP%u, [R7] rt715_sdca_pcm_hw_params):\n", MIC_DP);
+    mic_print_phase(2, 1);
+    printf("\n4. FE hw_params: host capture stream SD0 (first input stream, tag 1; hda_dsp_stream_hw_params [HST]:563-755):\n"
+           "    EM2.L1SEN = 0 if set; PPCTL |= PROCEN(0); SD0 CTL RUN/int off, STS clear, SRST cycle, BDLPL/U = 0,\n"
+           "    SD0 CTL tag = 1, CBL = 65536, FORMAT = 0x0041 (48 kHz, 32 bit, 2 ch), LVI = 15, BDLPL/U = ring BDL (16 x 4096 B, IOC),\n"
+           "    SD0 CTL int-enable bits, SPIB(0) off. Ring: 64 KiB contiguous < 4 GiB + BDL + SOF page table (kext memory).\n");
+    printf("   IPC %-18s %3u B  %s\n", "STREAM_PCM_PARAMS", cp->pcm_params.len, cp->pcm_params.what);
+    if (hex) pl_hex(&cp->pcm_params, "        ");
+    printf("\n5. BE prepare = sdw_prepare_stream on link %u ([ST2]:666-752): program bank 1, then bank switch to 1\n", l);
+    for (int bank = 1; bank >= 0; bank--) {
+        if (bank == 0) printf("\n6. DAPM power-up, then BE trigger START = sdw_enable_stream: program bank 0 + enable ports, bank switch to 0\n");
+        if (bank == 0) mic_print_phase(3, 1);
+        printf("    L0 dev 1 W  0x%04x = 3       SCP_BusClock_Scale_B%d\n", bank ? 0x72 : 0x62, bank);
+        printf("    L0 dev 1 RW 0x%04x &~0x0f    DP%u_PortCtrl: data mode 0, flow mode 0\n", dpn(0x02), MIC_DP);
+        printf("    L0 dev 1 W  0x%04x = %u      DP%u_BlockCtrl1: word length - 1\n", dpn(0x03), x.bps - 1, MIC_DP);
+        printf("    L0 dev 1 W  0x%04x = 0x%02x    DP%u_SampleCtrl1_B%d = (si %u - 1) & 0xff\n", dpn(bank ? 0x32 : 0x22), (x.si - 1) & 0xFF, MIC_DP, bank, x.si);
+        printf("    L0 dev 1 W  0x%04x = %u       DP%u_OffsetCtrl1_B%d\n", dpn(bank ? 0x34 : 0x24), x.offset1, MIC_DP, bank);
+        printf("    L0 dev 1 W  0x%04x = %u       DP%u_OffsetCtrl2_B%d\n", dpn(bank ? 0x35 : 0x25), x.offset2, MIC_DP, bank);
+        printf("    L0 dev 1 W  0x%04x = 0       DP%u_BlockCtrl3_B%d\n", dpn(bank ? 0x37 : 0x27), MIC_DP, bank);
+        printf("    L0 dev 1 W  0x%04x = %u       DP%u_SampleCtrl2_B%d = (si - 1) >> 8\n", dpn(bank ? 0x33 : 0x23), (x.si - 1) >> 8, MIC_DP, bank);
+        printf("    L0 dev 1 W  0x%04x = 0x%02x    DP%u_HCtrl_B%d = hstart %u << 4 | hstop %u\n", dpn(bank ? 0x36 : 0x26), (x.hstart << 4) | x.hstop, MIC_DP, bank, x.hstart, x.hstop);
+        uint32_t cfg = bank ? 0x218 : 0x200;
+        printf("    BAR4+0x%05x CDNS DP%u B%d CONFIG: BGC 0, BPM 0, then WL %u, flow 0, data 0\n", cb + cfg, pdi, bank, x.bps - 1);
+        printf("    BAR4+0x%05x CDNS DP%u B%d OFFSET_CTRL = 0x%x\n", cb + cfg + 0x0C, pdi, bank, x.offset1 | (x.offset2 << 8));
+        printf("    BAR4+0x%05x CDNS DP%u B%d HCTRL = 0x%02x\n", cb + cfg + 0x10, pdi, bank, (x.hstart << 4) | x.hstop);
+        printf("    BAR4+0x%05x CDNS DP%u B%d SAMPLE_CTRL = %u\n", cb + cfg + 0x08, pdi, bank, x.si - 1);
+        printf("    BAR4+0x%05x CDNS CLK_CTRL%d MCLKD = 3\n", cb + (bank ? 0x38 : 0x30), bank);
+        if (bank == 0) {
+            printf("    L0 dev 1 W  0x%04x = 0x%x     DP%u_ChannelEn_B0 = ch mask\n", dpn(0x20), x.chmask, MIC_DP);
+            printf("    BAR4+0x%05x CDNS DP%u B0 CH_EN = 0x%x\n", cb + 0x204, pdi, x.chmask);
+        }
+        printf("    bank switch (kext op 49, link mask 0x%x): SYNC.CMDSYNC(%u), deferred broadcast SCP_FrameCtrl_B%d (0x%02x) = 0x09 with the\n"
+               "      SSP tag, SYNCGO, response polled (3 s)\n", 1u << l, l, bank, bank ? 0x70 : 0x60);
+    }
+    printf("\n7. FE trigger START: SD0 CTL RUN = 1 (host DMA, DSP -> memory), then\n");
+    printf("   IPC %-18s %3u B  %s\n", "STREAM_TRIG_START", cp->trig_start.len, cp->trig_start.what);
+    printf("   capture runs: the HAL / audctl read the 64 KiB ring behind DPIB (BAR0+0x%x = SD0 DPIB), method 7 (lock-free)\n", 0x1084);
+    printf("\n8. CAP_STOP (reverse): IPC %s; SD0 RUN = 0; IPC %s; SD0 hw_free (SRST, PPCTL PROCEN(0) = 0);\n", cp->trig_stop.what, cp->pcm_free.what);
+    mic_print_phase(4, 1);
+    printf("    disable: DP%u_ChannelEn_B1 = 0, CDNS CH_EN B1 = 0, program bank 1, bank switch 1; DP%u_ChannelEn_B0 = 0, CH_EN B0 = 0,\n"
+           "    program bank 0, bank switch 0 (sdw_disable_stream + sdw_deprepare_stream). The capture widgets stay set up until\n"
+           "    the hardware is torn down; then (best effort, before the DSP is powered off):\n", MIC_DP, MIC_DP);
+    for (int i = 0; i < cp->nf; i++) printf("   IPC %2d %-18s %3u B  %s\n", i + 1, ipc_cmd_name(le32(cp->f[i].b + 4)), cp->f[i].len, cp->f[i].what);
+    printf("\n9. rollback on any failure / client death: SD0 RUN = 0, RT714 PS3 + FU02 muted, link 0 port 2 CH_EN = 0 (both banks),\n"
+           "   then the M5/M4/M3/M2b rollback (all writes through the same kext whitelists).\n");
+}
+
 // ------------------------------------------------------------------ M6: gen-header (static data for the kext's driver mode)
 // Writes a C header with everything the kext needs to run the M3 -> M5 sequence by itself (AudShim 0.8.0
 // "driver mode"): the firmware payload (the .ri file minus its SOF extended manifest), the IPC3 messages that
@@ -3419,16 +3658,17 @@ static int cmd_genheader(int argc, char **argv) {
         else if (!strncmp(argv[i], "--tplg=", 7)) tpp = argv[i] + 7;
         else out = argv[i];
     }
-    static struct fwfile fw; static struct tplg tp; static struct m5plan pl;
+    static struct fwfile fw; static struct tplg tp; static struct m5plan pl, cp;
     if (fw_parse(&fw, fwp, 0)) { fprintf(stderr, "gen-header: firmware %s unusable\n", fwp); return 1; }
     if (tplg_load(&tp, tpp, 0) || pl_build(&tp, &pl, 0)) { fprintf(stderr, "gen-header: topology %s unusable\n", tpp); return 1; }
+    if (pl_build_dir(&tp, &cp, 0, 1)) { fprintf(stderr, "gen-header: no usable microphone (capture) path in %s\n", tpp); return 1; }
     if (!pl.vol_0db.len || pl.vol_ch < 1 || pl.vol_ch > 8) { fprintf(stderr, "gen-header: no PGA volume control\n"); return 1; }
     struct sdwxp x; m5_compute(&x, 0);
     FILE *f = fopen(out, "w");
     if (!f) { perror(out); return 1; }
     uint32_t tfnv = 0;
     { FILE *t = fopen(tpp, "rb"); if (t) { static uint8_t b[1 << 20]; size_t n = fread(b, 1, sizeof b, t); fclose(t); tfnv = fnv1a(b, n); } }
-    fprintf(f, "// AudShimData.h: GENERATED by `audctl gen-header` (audctl 0.8.0). Do not edit.\n"
+    fprintf(f, "// AudShimData.h: GENERATED by `audctl gen-header` (audctl 0.9.0). Do not edit.\n"
                "// firmware: %s (%zu bytes, payload %u bytes at offset %u, payload FNV-1a 0x%08x)\n"
                "//   Intel SOF firmware, redistributable under LICENCE.Intel (~/xe/build/audio/fw/use/LICENCE.Intel)\n"
                "// topology: %s (FNV-1a 0x%08x), speaker PCM '%s' (pcm %u)\n"
@@ -3474,6 +3714,35 @@ static int cmd_genheader(int argc, char **argv) {
     for (size_t k = 0; k < sizeof rt1316_blind / sizeof rt1316_blind[0]; k++)
         fprintf(f, "%s{0x%x, 0x%02x},%s", k % 6 ? " " : "    ", rt1316_blind[k].reg, rt1316_blind[k].val, (k % 6 == 5) ? "\n" : "");
     fprintf(f, "\n};\n");
+    // ---- M7 (AudShim 0.9.0): microphone capture (pcm 'Microphone', RT714 on link 0)
+    fprintf(f, "\n// ==== M7: microphone capture ('%s', pcm %u), generated from the same topology ====\n#define AUDSHIM_DATA_CAPTURE 1\n",
+            cp.pcm_name, cp.pcm_id);
+    for (int i = 0; i < cp.n; i++) { snprintf(nm, sizeof nm, "kDrvCapSetup%d", i); gh_msg(f, nm, &cp.m[i]); }
+    for (int i = 0; i < cp.nf; i++) { snprintf(nm, sizeof nm, "kDrvCapFree%d", i); gh_msg(f, nm, &cp.f[i]); }
+    gh_msg(f, "kDrvCapPcmParamsW", &cp.pcm_params); gh_msg(f, "kDrvCapPcmFreeW", &cp.pcm_free);
+    gh_msg(f, "kDrvCapTrigStartW", &cp.trig_start); gh_msg(f, "kDrvCapTrigStopW", &cp.trig_stop);
+    fprintf(f, "static const AudDrvMsg kDrvCapSetup[%d] = {\n", cp.n);
+    for (int i = 0; i < cp.n; i++) { fprintf(f, "    {%u, kDrvCapSetup%d, ", cp.m[i].len, i); gh_escape(f, cp.m[i].what); fprintf(f, "},\n"); }
+    fprintf(f, "};\nstatic const AudDrvMsg kDrvCapFree[%d] = {\n", cp.nf);
+    for (int i = 0; i < cp.nf; i++) { fprintf(f, "    {%u, kDrvCapFree%d, ", cp.f[i].len, i); gh_escape(f, cp.f[i].what); fprintf(f, "},\n"); }
+    fprintf(f, "};\n");
+    fprintf(f, "static const AudDrvMsg kDrvCapPcmParams = {%u, kDrvCapPcmParamsW, \"STREAM_PCM_PARAMS (capture)\"};\n", cp.pcm_params.len);
+    fprintf(f, "static const AudDrvMsg kDrvCapPcmFree = {%u, kDrvCapPcmFreeW, \"STREAM_PCM_FREE (capture)\"};\n", cp.pcm_free.len);
+    fprintf(f, "static const AudDrvMsg kDrvCapTrigStart = {%u, kDrvCapTrigStartW, \"STREAM_TRIG_START (capture)\"};\n", cp.trig_start.len);
+    fprintf(f, "static const AudDrvMsg kDrvCapTrigStop = {%u, kDrvCapTrigStopW, \"STREAM_TRIG_STOP (capture)\"};\n", cp.trig_stop.len);
+    fprintf(f, "static const uint32_t kDrvCapHostComp = %u, kDrvCapPgaComp = %u, kDrvCapVolCh = %u;\n", cp.host_comp, cp.pga_comp, cp.vol_ch);
+    fprintf(f, "// microphone DAI (SDW0 Pin2)\nstatic const AudDrvDai kDrvCapDai = {%u, %u, %u, %u, 0x%x};   // %s\n", cp.dai[0].link,
+            cp.dai[0].pdi, cp.dai[0].alh_id, cp.dai[0].ch, cp.dai[0].dai_index, cp.dai[0].wname);
+    fprintf(f, "// RT714 (rt715-sdca) data port of the capture DAI (rt715-sdca-aif2 = DP4); transport parameters = kDrvXp* (same\n"
+               "// 48 kHz / 2 ch / 24 bit single-stream link)\nstatic const uint32_t kDrvMicPort = %u;\n", MIC_DP);
+    fprintf(f, "// RT714 register sequence (audctl mic_ops[]): phase 1 attach, 2 BE hw_params, 3 power up, 4 power down;\n"
+               "// kind 1 W8 2 U8 3 C8 4 WQ (MBQ 16-bit write) 5 UQ (MBQ read-modify-write) 6 RQ (MBQ read = hw_ver); cond 1/2: hw_ver 0/1\n"
+               "struct AudDrvMicOp { uint8_t phase, kind, cond; uint32_t reg; uint16_t mask, val; };\n"
+               "static const AudDrvMicOp kDrvMicOps[%d] = {\n", NMICOPS);
+    for (int i = 0; i < NMICOPS; i++)
+        fprintf(f, "    {%u, %u, %u, 0x%08x, 0x%04x, 0x%04x},   // %s %s\n", mic_ops[i].phase, mic_ops[i].kind, mic_ops[i].cond, mic_reg(i),
+                mic_ops[i].mask, mic_ops[i].val, mic_kind(mic_ops[i].kind), mic_ops[i].what);
+    fprintf(f, "};\n");
     fprintf(f, "\n// firmware payload (DMA image, starts with $CPD)\nstatic const uint32_t kDrvFwLen = %u, kDrvFwHash = 0x%08x;\n", fw.psize, fw.hash);
     fprintf(f, "static const uint8_t kDrvFw[%u] __attribute__((aligned(16))) = {\n", fw.psize);
     const uint8_t *p = fw.data + fw.off;
@@ -3483,6 +3752,8 @@ static int cmd_genheader(int argc, char **argv) {
     printf("wrote %s: %d set-up + %d free IPC messages, PGA comp %u (%u ch), DAIs ALH %u/%u, %zu RT1316 writes,\n"
            "  firmware payload %u bytes FNV-1a 0x%08x\n", out, pl.n, pl.nf, pl.pga_comp, pl.vol_ch, pl.dai[0].alh_id, pl.dai[1].alh_id,
            sizeof rt1316_blind / sizeof rt1316_blind[0], fw.psize, fw.hash);
+    printf("  M7 capture: %d set-up + %d free IPC messages, host comp %u, PGA comp %u, ALH %u (link %u PDI %u), %d RT714 ops\n",
+           cp.n, cp.nf, cp.host_comp, cp.pga_comp, cp.dai[0].alh_id, cp.dai[0].link, cp.dai[0].pdi, NMICOPS);
     free(fw.data);
     return 0;
 }
@@ -3511,9 +3782,15 @@ static const char *drv_rc(uint64_t r) {
                               "FAILED (see kernel log: AudShim DRV)", "bad op", "not ready", "retry later (recent failure)"};
     return r < 7 ? n[r] : "?";
 }
+static void cap_print_state(const uint64_t o[16]);
 static void drv_print_state(void) {
     uint64_t o[16];
     if (drv_call(kDrvOpState, 0, o)) return;
+    if (o[15] >= 9) {   // M7
+        uint64_t c[16];
+        uint64_t in[2] = {kDrvOpCapState, 0}; uint32_t n = 16;
+        if (!IOConnectCallScalarMethod(dconn, AUDSHIM_METHOD_DRV, in, 2, c, &n)) cap_print_state(c);
+    }
     printf("state %s, last failure step %llu code %llu; gain applied 0x%llx (cap 0x%llx = -%llu dB), requested 0x%llx%s\n"
            "starts %llu, bring-ups %llu (last %llu ms), DSP notifications %llu (xruns %llu), host DMA errors %llu, suspended %llu,%s iface v%llu\n",
            drv_st(o[1]), o[2], o[3], o[4], o[5], o[6], o[13] & 0xFFFFFFFF, (o[13] >> 32) ? " (muted)" : "", o[7], o[11], o[12], o[9], o[8],
@@ -3545,7 +3822,7 @@ static int cmd_drv(int argc, char **argv) {
         }
         if (!(secs >= 0.5 && secs <= 5)) { fprintf(stderr, "--seconds 0.5..5\n"); return 2; }
         if (!(level >= -60 && level <= -12)) { fprintf(stderr, "--level -60..-12 dBFS\n"); return 2; }
-        printf("audctl 0.8.0 drv test: %.1f s of a ~1 kHz sine at %.1f dBFS through the kext driver mode, 3 times:\n"
+        printf("audctl 0.9.0 drv test: %.1f s of a ~1 kHz sine at %.1f dBFS through the kext driver mode, 3 times:\n"
                "  round 1 = first START, round 2 = resume 0.3 s after STOP (deferred stop pending), round 3 = START 6 s later\n"
                "  (after the deferred stop really stopped the stream: amps PS3, DMA off, widgets kept)\n", secs, level);
         struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
@@ -3605,6 +3882,139 @@ static int cmd_drv(int argc, char **argv) {
     return rc;
 }
 
+// ------------------------------------------------------------------ M7: rec (microphones -> WAV)
+static const char *cap_st(uint64_t s) { static const char *n[] = {"OFF", "RUNNING", "FAILED"}; return s < 3 ? n[s] : "?"; }
+static void cap_print_state(const uint64_t o[16]) {
+    printf("capture %s (driver %s), last failure step %llu code 0x%llx, starts %llu, capture DMA errors %llu, RT714 dev %llu "
+           "(hw_ver %s%llu), init %llu, widgets %llu, ring gen %llu, owner %s, DSP xruns %llu, iface v%llu\n",
+           cap_st(o[2]), drv_st(o[1]), o[3], o[4], o[5], o[6], o[7], o[12] == 0xFF ? "?" : "", o[12] == 0xFF ? 0 : o[12], o[10], o[14],
+           o[8], o[9] == 1 ? "this connection" : o[9] == 2 ? "another connection" : "none", o[13], o[15]);
+}
+static void wav_hdr(FILE *f, uint32_t frames) {
+    uint32_t data = frames * 8, v;
+    fwrite("RIFF", 1, 4, f); v = 36 + data; fwrite(&v, 4, 1, f); fwrite("WAVEfmt ", 1, 8, f);
+    v = 16; fwrite(&v, 4, 1, f);
+    uint16_t fmt = 1, ch = 2, bits = 32, align = 8; uint32_t rate = 48000, bps = 48000 * 8;
+    fwrite(&fmt, 2, 1, f); fwrite(&ch, 2, 1, f); fwrite(&rate, 4, 1, f); fwrite(&bps, 4, 1, f); fwrite(&align, 2, 1, f); fwrite(&bits, 2, 1, f);
+    fwrite("data", 1, 4, f); fwrite(&data, 4, 1, f);
+}
+static double dbfs(double x) { return x > 0 ? 20.0 * log10(x) : -200.0; }
+static int cmd_rec(int argc, char **argv) {
+    double secs = 5.0;
+    int dry = 0, hex = 0;
+    const char *out = "mic.wav", *tpath = NULL;
+    char tdef[1024]; const char *home = getenv("HOME");
+    snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/sof-rpl-rt1316-l12-rt714-l0.tplg", home ? home : "");
+    for (int i = 0; i < argc; i++) {
+        if (!strncmp(argv[i], "--seconds=", 10)) secs = strtod(argv[i] + 10, NULL);
+        else if (!strcmp(argv[i], "--dry-run") || !strcmp(argv[i], "--dry")) dry = 1;
+        else if (!strcmp(argv[i], "--hex")) hex = 1;
+        else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
+        else if (!strncmp(argv[i], "--tplg=", 7)) tpath = argv[i] + 7;
+        else if (argv[i][0] != '-') out = argv[i];
+        else { fprintf(stderr, "rec: unknown option %s\n", argv[i]); return 2; }
+    }
+    if (!(secs >= 0.5 && secs <= 60)) { fprintf(stderr, "--seconds 0.5..60\n"); return 2; }
+    if (dry) {   // offline: no kext access at all
+        static struct tplg tp; static struct m5plan cp;
+        printf("audctl 0.9.0 rec --dry-run: %.1f s from the internal microphones to %s would run the sequence below.\n", secs, out);
+        if (tplg_load(&tp, tpath ? tpath : tdef, 1) || pl_build_dir(&tp, &cp, 1, 1)) return 1;
+        printf("\n");
+        mic_plan_print(&cp, hex);
+        printf("\nthen: read the ring behind DPIB every 20 ms for %.1f s, CAP_STOP, close (the kext tears down if this connection owned\n"
+               "the hardware), write %s (RIFF/WAVE PCM, 48000 Hz, 2 ch, 32 bit) and print the RMS / peak level per channel.\n", secs, out);
+        return 0;
+    }
+    if (drv_open_conn()) return 1;
+    uint64_t o[16];
+    if (drv_call(kDrvOpState, 0, o)) return 1;
+    if (o[15] < 9) { fprintf(stderr, "the loaded AudShim is interface v%llu: rec needs v9 (AudShim 0.9.0)\n", o[15]); return 1; }
+    printf("audctl 0.9.0 rec: %.1f s from the internal microphones (RT714, SOF pipeline 5) -> %s\n", secs, out);
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    if (drv_call(kDrvOpCapStart, 0, o)) return 1;
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    printf("CAP_START: %s (%.0f ms)\n", drv_rc(o[0]), (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6);
+    cap_print_state(o);
+    if (o[0] || o[2] != 1) {
+        printf("REC RESULT: FAIL start (step %llu code 0x%llx; kernel log: AudShim DRV)\n", o[3], o[4]);
+        IOServiceClose(dconn);
+        return 1;
+    }
+    mach_vm_address_t addr = 0; mach_vm_size_t size = 0;
+    kern_return_t kr = IOConnectMapMemory64(dconn, AUDSHIM_MEM_CRING, mach_task_self(), &addr, &size, kIOMapAnywhere | kIOMapReadOnly);
+    if (kr || size < AUDSHIM_RING_BYTES) {
+        fprintf(stderr, "map capture ring: 0x%x size %llu\n", kr, (unsigned long long)size);
+        drv_call(kDrvOpCapStop, 0, o); IOServiceClose(dconn);
+        printf("REC RESULT: FAIL map\n");
+        return 1;
+    }
+    const volatile int32_t *ring = (const volatile int32_t *)(uintptr_t)addr;
+    uint32_t want = (uint32_t)(secs * 48000.0);
+    int32_t *buf = calloc((size_t)want + 8192, 8);
+    if (!buf) { drv_call(kDrvOpCapStop, 0, o); IOServiceClose(dconn); return 1; }
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    uint64_t p[8]; uint32_t n, got = 0, prev = 0, laps_lost = 0;
+    uint64_t t0 = 0, tl = 0, moved = 0;
+    int rc = 0, first = 1;
+    double el = 0;
+    while (got < want) {
+        usleep(20000);
+        n = 8;
+        if (IOConnectCallScalarMethod(dconn, AUDSHIM_METHOD_CPOS, NULL, 0, p, &n)) { fprintf(stderr, "capture position failed\n"); rc = 1; break; }
+        if (p[0] != 1) { printf("  !! capture stopped (state %llu)\n", p[0]); rc = 1; break; }
+        uint32_t d = (uint32_t)(p[1] % AUDSHIM_RING_BYTES) & ~7u;
+        if (first) { first = 0; t0 = tl = p[2]; prev = d; continue; }   // start reading from here (older data is pre-roll)
+        uint32_t nb = (d - prev) & (AUDSHIM_RING_BYTES - 1);
+        if (nb > AUDSHIM_RING_BYTES - 8192) laps_lost++;   // > 7/8 of the ring in 20 ms would mean we fell behind
+        for (uint32_t k = 0; k < nb / 8 && got < want; k++) {
+            uint32_t fr = ((prev / 8) + k) % AUDSHIM_RING_FRAMES;
+            buf[2 * got] = ring[2 * fr]; buf[2 * got + 1] = ring[2 * fr + 1];
+            got++;
+        }
+        moved += nb; prev = d;
+        el = (double)(p[2] - t0) * tb.numer / tb.denom / 1e9;
+        if (p[2] - tl > 1000000000ull * tb.denom / tb.numer) {
+            printf("  t=%5.2f s DPIB 0x%05llx LPIB 0x%05llx moved %llu B (%.0f B/s) SD 0x%08llx xruns %llu frames %u\n", el, p[1], p[5],
+                   (unsigned long long)moved, el > 0 ? moved / el : 0, p[4], p[6], got);
+            tl = p[2];
+        }
+        if (el > secs + 3) { printf("  !! timeout: only %u of %u frames in %.1f s\n", got, want, el); rc = 1; break; }
+    }
+    drv_call(kDrvOpCapStop, 0, o);
+    printf("CAP_STOP: %s\n", drv_rc(o[0]));
+    cap_print_state(o);
+    IOConnectUnmapMemory64(dconn, AUDSHIM_MEM_CRING, mach_task_self(), addr);
+    IOServiceClose(dconn);
+    double rate = el > 0 ? moved / 8.0 / el : 0;
+    // levels (24 valid bits in a 32-bit container: dBFS relative to INT32 full scale)
+    double ss[2] = {0, 0}, mean[2] = {0, 0}; int32_t pk[2] = {0, 0}; uint32_t zeros = 0, same = 0;
+    for (uint32_t i = 0; i < got; i++) for (int c = 0; c < 2; c++) mean[c] += buf[2 * i + c];
+    for (int c = 0; c < 2; c++) mean[c] = got ? mean[c] / got : 0;
+    for (uint32_t i = 0; i < got; i++) {
+        for (int c = 0; c < 2; c++) {
+            double x = (buf[2 * i + c] - mean[c]) / 2147483648.0;
+            ss[c] += x * x;
+            int32_t ax = buf[2 * i + c] == INT32_MIN ? INT32_MAX : abs(buf[2 * i + c]);
+            if (ax > pk[c]) pk[c] = ax;
+        }
+        if (!buf[2 * i] && !buf[2 * i + 1]) zeros++;
+        if (i && buf[2 * i] == buf[2 * i - 2] && buf[2 * i + 1] == buf[2 * i - 1]) same++;
+    }
+    double rms[2], rmsdb[2];
+    for (int c = 0; c < 2; c++) { rms[c] = got ? sqrt(ss[c] / got) : 0; rmsdb[c] = dbfs(rms[c]); }
+    FILE *f = fopen(out, "wb");
+    if (f) { wav_hdr(f, got); fwrite(buf, 8, got, f); fclose(f); }
+    else { perror(out); rc = 1; }
+    free(buf);
+    printf("\nwrote %s: %u frames (%.2f s), DMA rate %.0f frames/s, DC L %.0f R %.0f\n", out, got, got / 48000.0, rate, mean[0], mean[1]);
+    printf("level: L RMS %.1f dBFS peak %.1f dBFS | R RMS %.1f dBFS peak %.1f dBFS | all-zero frames %u, repeated frames %u, ring overruns %u\n",
+           rmsdb[0], dbfs(pk[0] / 2147483648.0), rmsdb[1], dbfs(pk[1] / 2147483648.0), zeros, same, laps_lost);
+    int dma_ok = rate > 0.8 * 48000 && rate < 1.2 * 48000 && got >= want;
+    printf("REC RESULT: %s frames=%u rate=%.0f rms_l_db=%.1f rms_r_db=%.1f peak_db=%.1f zero_frames=%u\n",
+           rc || !dma_ok ? "FAIL" : "OK", got, rate, rmsdb[0], rmsdb[1], dbfs((pk[0] > pk[1] ? pk[0] : pk[1]) / 2147483648.0), zeros);
+    return (rc || !dma_ok) ? 1 : 0;
+}
+
 // ------------------------------------------------------------------ main
 
 static uint32_t num(const char *s) { return (uint32_t)strtoul(s, NULL, 0); }
@@ -3625,7 +4035,8 @@ int main(int argc, char **argv) {
                         "       audctl m5a [...]    = m5 --no-play (M5a: topology/pipeline/amp set-up and teardown, no audio)\n"
                         "       audctl tplg [PATH] [--hex] [--plan]   topology dump + generated IPC3 messages (offline)\n"
                         "       audctl gen-header [OUT.h] [--fw=PATH] [--tplg=PATH]   M6: static data header for the kext driver mode\n"
-                        "       audctl drv state | open | start | stop | close | test [--seconds=N] [--level=dB]   M6: kext driver mode\n");
+                        "       audctl drv state | open | start | stop | close | test [--seconds=N] [--level=dB]   M6: kext driver mode\n"
+                        "       audctl rec [OUT.wav] [--seconds=N (0.5..60, default 5)] [--dry-run [--hex] [--tplg=PATH]]   M7: microphones\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -3637,12 +4048,13 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "m5a")) return cmd_boot(argc - 2, argv + 2, 4);
     if (!strcmp(argv[1], "gen-header")) return cmd_genheader(argc - 2, argv + 2);   // offline (M6)
     if (!strcmp(argv[1], "drv")) return cmd_drv(argc - 2, argv + 2);                 // M6 driver mode
+    if (!strcmp(argv[1], "rec")) return cmd_rec(argc - 2, argv + 2);                 // M7 microphones
     if (!strcmp(argv[1], "tplg")) {   // offline: topology dump + the generated IPC3 plan (no kext needed)
         static struct tplg tp; static struct m5plan pl;
         char tdef[1024]; const char *home = getenv("HOME"), *path = NULL; int hex = 0, quiet = 0;
         snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/sof-rpl-rt1316-l12-rt714-l0.tplg", home ? home : "");
         for (int i = 2; i < argc; i++) { if (!strcmp(argv[i], "--hex")) hex = 1; else if (!strcmp(argv[i], "--plan")) quiet = 1; else path = argv[i]; }
-        printf("audctl 0.8.0  tplg: ALSA/SOF topology parser + IPC3 plan for the speaker PCM (read-only, no kext access)\n\n");
+        printf("audctl 0.9.0  tplg: ALSA/SOF topology parser + IPC3 plans for the speaker and microphone PCMs (read-only, no kext access)\n\n");
         if (tplg_load(&tp, path ? path : tdef, 1)) return 1;
         if (!quiet) tplg_dump(&tp);
         printf("\n-- speaker playback plan (what Linux sends for 'Speaker', pcm 2) --\n");
@@ -3651,6 +4063,12 @@ int main(int argc, char **argv) {
             printf("  %s: link %u PDI %u ALH stream id %u, FW dai_index 0x%x, %u Hz %u ch fmt %u\n", pl.dai[k].wname, pl.dai[k].link,
                    pl.dai[k].pdi, pl.dai[k].alh_id, pl.dai[k].dai_index, pl.dai[k].rate, pl.dai[k].ch, pl.dai[k].fmt);
         pl_print(&pl, hex);
+        static struct m5plan cp;   // M7
+        printf("\n-- microphone capture plan (what Linux sends for 'Microphone', pcm 4) --\n");
+        if (pl_build_dir(&tp, &cp, 1, 1)) return 1;
+        printf("  %s: link %u PDI %u ALH stream id %u, FW dai_index 0x%x, %u Hz %u ch fmt %u\n", cp.dai[0].wname, cp.dai[0].link,
+               cp.dai[0].pdi, cp.dai[0].alh_id, cp.dai[0].dai_index, cp.dai[0].rate, cp.dai[0].ch, cp.dai[0].fmt);
+        pl_print(&cp, hex);
         return 0;
     }
     if (aud_open()) return 1;

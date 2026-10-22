@@ -109,12 +109,12 @@ A hand icon in the menu bar holds the toggles (saved in `defaults read local.xe.
   to the previous mode).
 - Log: `~/xe/build/toque/xe-toque.log`. Diagnostic: `xe-toque.app/Contents/MacOS/xe-toque --probe-events`.
 
-## Internal speakers
+## Internal speakers and microphones
 
-Output only (no microphones yet), 48 kHz stereo. Two pieces: the `AudShim` kext (loaded by OpenCore; it talks to the
-audio DSP `8086:51CA`, SoundWire and the RT1316 amplifiers) and the `XeSpeakers` AudioServerPlugIn (the macOS output
-device). The device shows up in System Settings › Sound › Output as **"Alto-falantes internos"** (the name is
-`kDeviceName` in `tools/XeSpeakers/XeSpeakers.c`).
+48 kHz stereo output and input. Two pieces: the `AudShim` kext (loaded by OpenCore; it talks to the
+audio DSP `8086:51CA`, SoundWire, the RT1316 amplifiers and the RT714 microphone codec) and the `XeSpeakers`
+AudioServerPlugIn (the macOS devices). They show up in System Settings › Sound as **"Alto-falantes internos"** (Output)
+and **"Microfone interno"** (Input); the names are in `tools/XeSpeakers/XeSpeakers.c`.
 
 **1. Firmware and topology (Intel, not shipped here).** Download the official SOF release tarball (`sof-bin-<version>.tar.gz`,
 from github.com/thesofproject/sof-bin; tested with 2026.09.2) and take two files from it:
@@ -144,13 +144,15 @@ zsh tools/audio/install-audio.sh build     # audctl, AudShim.kext, XeSpeakers.dr
 is touched until a client asks. Check:
 
 ```sh
-tools/build/audctl info        # "interface v8"
+tools/build/audctl info        # "interface v9"
 tools/build/audctl drv test    # three short ~1 kHz tones on both speakers at a low level, then "DRV TEST RESULT: SUCCESS"
+tools/build/audctl rec /tmp/mic.wav --seconds=5   # talk or clap: "REC RESULT: OK", RMS well above -100 dBFS
 ```
 
-**4. Output device.** `zsh tools/audio/install-audio.sh hal` (sudo: copies `XeSpeakers.driver` to
-`/Library/Audio/Plug-Ins/HAL` and restarts coreaudiod). Choose the device in System Settings › Sound › Output. The
-volume starts at 30 % the first time.
+**4. Devices.** `zsh tools/audio/install-audio.sh hal` (sudo: copies `XeSpeakers.driver` to
+`/Library/Audio/Plug-Ins/HAL` and restarts coreaudiod). Choose the devices in System Settings › Sound › Output and
+Input. The volume starts at 30 % the first time; the input level slider is a software gain (0 to +30 dB, default +12 dB).
+With an older 0.8.0 kext (interface v8) only the speakers appear.
 
 Notes:
 - **Level.** The kext caps the DSP gain at −6 dB and ramps every change; the SOF topology has no speaker protection.

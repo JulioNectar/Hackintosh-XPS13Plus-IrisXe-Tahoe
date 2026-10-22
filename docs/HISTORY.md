@@ -1179,7 +1179,7 @@ and (3) about one second of garbage when the display switched to the native mode
 
 ---
 
-## Phase 25 — Internal speakers: AudShim M1 → M6 (21–22 Oct)
+## Phase 25 — Internal speakers and microphones: AudShim M1 → M7 (21–22 Oct)
 
 **Starting point.** The audio function `8086:51CA` is an Intel cAVS 2.5 DSP in SOF mode. The speakers are two Realtek
 RT1316 amplifiers on SoundWire links 1 and 2, the microphones an RT714 codec on link 0. macOS has no driver for any of
@@ -1197,6 +1197,7 @@ with `audctl` before the next was written.
 | M4 | 0.6.0 | SoundWire link power-up, Cadence master start, enumeration driven from user space | RT714 on link 0, RT1316 on links 1 and 2, IDs as in the DSDT |
 | M5 | 0.7.0 | `audctl tplg` parses `sof-rpl-rt1316-l12-rt714-l0.tplg` and builds the same 25 IPC3 topology messages Linux sends; RT1316 init, SoundWire stream on links 1+2, host DMA, `TRIG_START` | M5a (no audio) then M5b: **a 1 kHz tone at −30 dBFS on both speakers**, DMA at exactly 48 kHz, 0 xruns, 43 IPCs all error 0 |
 | M6 | 0.8.0 | kext **driver mode** (the whole M3–M5 sequence in the kernel from a generated header, START/STOP with a 5 s deferred stop, −6 dB cap, PM-tree membership for teardown on sleep/shutdown) + the **XeSpeakers** AudioServerPlugIn (shared 64 KiB ring, DMA-position clock) | first install: the plug-in loaded and the hardware came up, but **coreaudiod dropped the device** — it queries several device properties in the input scope too, which the plug-in answered only for output (#88). Fixed: system sounds and music play through System Settings › Sound |
+| M7 | 0.9.0 | the **microphones**: RT714 (Linux `rt715-sdca`) attach/hw_params/power sequence, SoundWire link 0 data port 4 → master port 2 (PDI 2, ALH stream 7) with the bank switch on one link, SOF capture pipeline 5 (ALH → EQ IIR high-pass → PGA → host PCM4) on host capture stream SD0, kext ops `CAP_START`/`CAP_STOP` independent of playback; XeSpeakers 0.9.0 adds the input device **"Microfone interno"** (software gain 0 to +30 dB) | first hardware run: 5 s at 48 kHz, 0 xruns, speech and claps recorded on both channels, speakers unchanged |
 
 **Why M2 failed.** In run 2 the ROM reacted to `ROM_CONTROL | PURGE_FW | tag 1` and then its SRAM window stopped decoding:
 it went looking for a host DMA stream with that tag, which did not exist. Every working implementation (Linux, and two
@@ -1279,6 +1280,7 @@ Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2 and [KERNEL
 | 0.6.0 | M4 | v6 | SoundWire links, enumeration |
 | 0.7.0 | M5 | v7 | IPC3 messages, RT1316 init, playback: test tone |
 | 0.8.0 | M6 | v8 | driver mode for the XeSpeakers HAL plug-in (0.8.0): macOS output device |
+| 0.9.0 | M7 | v9 | capture: RT714 microphones, SOF pipeline 5, read-only capture ring; XeSpeakers 0.9.0 input device |
 
 ---
 
@@ -1337,8 +1339,7 @@ Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2 and [KERNEL
 - Brightness keys and lid events: on some boots the EC/Dell SMM does not report the sun keys or the lid (firmware state);
   `xe-brilho daemon` covers F6/F7, nothing covers the lid on those boots.
 - No system sleep (Modern Standby firmware, eDP retraining); hibernation-only is the untested next experiment.
-- Audio: microphones (RT714) not configured; no speaker protection (−6 dB cap instead); the DSP stays powered while the
-  output device is open; power cost not measured.
+- Audio: no speaker protection (−6 dB cap instead); the DSP stays powered while a device is open; power cost not measured.
 - 6.5 s accelerator stamp-3 wait at every boot (shortcut built, not tested); SMCProcessor does not attach (Lilu does not
   know CPU model 0xBA).
 - Camera (OV01A10 + Intel VSC + IPU6) and fingerprint reader not started; `w30r`/BGR10_XR stays Apple-silicon-only.

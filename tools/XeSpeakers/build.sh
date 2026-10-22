@@ -2,7 +2,7 @@
 # Build the XeSpeakers AudioServerPlugIn (HAL driver) without Xcode: zsh tools/XeSpeakers/build.sh
 #   -> tools/build/XeSpeakers.driver (x86_64, ad-hoc signed)
 # Install (user, sudo): sudo cp -R tools/build/XeSpeakers.driver /Library/Audio/Plug-Ins/HAL/ && sudo killall coreaudiod
-# Needs AudShim 0.8.0 (interface v8) loaded; without it the plug-in publishes no device.
+# Needs AudShim >= 0.8.0 (interface v8: speakers; v9 = AudShim 0.9.0 adds the microphones); without it no device.
 set -e
 SRC=${0:A:h}
 OUT=${0:A:h:h}/build/XeSpeakers.driver
