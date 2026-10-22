@@ -30,7 +30,7 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Ajustes › Telas, perfis de cor | ⚠️ pode dar panic: troque a resolução com `tools/xe-res` e mantenha o perfil de cor de fábrica |
 | Travamento do WindowServer | ⚠️ raro, antes do login ou numa troca de escala (reiniciar resolve); correção em teste (csbresync) |
 
-Som interno (SoundWire) e câmera **não funcionam** no macOS neste notebook.
+A câmera **não funciona** no macOS. **Alto-falantes internos: em andamento** — o nosso kext `AudShim` liga o DSP de áudio da Intel (cAVS 2.5) com o firmware SOF, inicia o SoundWire, configura os dois amplificadores RT1316 e já tocou um tom de teste nos dois alto-falantes (22/10/2026); a saída de som do macOS (CoreAudio) vem a seguir.
 
 ## Documentação
 

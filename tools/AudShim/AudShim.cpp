@@ -1,0 +1,3023 @@
+// AudShim (milestone M5, v0.7.0): kernel shim for the Intel cAVS 2.5 audio DSP
+// (PCI 8086:51CA, RPL-P, Dell XPS 13 Plus 9320, ACPI \_SB.PC00.HDAS at 0:31.3).
+//
+// M5 (v0.7.0, interface v7) adds a fifth arming magic ('M5GO' = M4 + speaker playback) and ops 43-49.
+// audctl parses the SOF topology in user space and drives the Linux sequence; the kext only executes
+// validated primitives:
+//   43 M5_STATE    read-only state
+//   44 M5_IPC      one IPC3 host->DSP message (cnl_ipc_send_msg, cnl.c:284-330 / ipc3.c:234-353): the
+//                  message is copied from the caller, checked against an allowlist of the IPC3 commands
+//                  the speaker path needs (TPLG COMP/BUFFER/PIPE NEW/FREE/CONNECT/COMPLETE, DAI_CONFIG for
+//                  ALH 0x100/0x200 only, STREAM PCM_PARAMS/PCM_FREE/TRIG_START/TRIG_STOP, COMP SET/GET),
+//                  PCM_PARAMS gets the kext's own page table / size / stream tag patched in (no physical
+//                  address ever comes from user space), written to the host box (BAR4+0xA0000), HIPCIDR =
+//                  BUSY, HIPCIDA.DONE polled (500 ms, TIMEOUT_DEFAULT_IPC_MS), reply read, DONE acked.
+//   45 M5_SALLOC   playback ring (64 KiB, contiguous, < 4 GiB) + BDL + SOF compressed page table
+//                  (sof-utils.c snd_sof_create_page_table); the samples are copied from the caller
+//   46 M5_STREAM   host DMA stream SD[ISS] (tag 1): hw_params / start / stop / hw_free exactly like
+//                  hda_dsp_stream_hw_params / _trigger / _hw_free (hda-stream.c:563-755, 397-482, 757-787)
+//                  incl. the DMI L1 rule of _hda_dsp_stream_get (EM2.L1SEN=0 while open)
+//   47 M5_REGW     SoundWire stream registers: shim PCMSyCHM and ALH STRMZCFG of PDI 2 on links 1/2,
+//                  Cadence DPN port 2 bank 0/1, PORTCTRL(2), PDI_CONFIG(2), CLK_CTRL0/1 (whitelist)
+//   48 M5_XFER     one command-FIFO message to the RT1316 (device 1 on links 1/2 only), register
+//                  allowlist (SCP, DP1, RT1316 vendor ranges, SDCA function 4), SCP_AddrPage1/2 paging
+//                  done in the kext like cdns_program_scp_addr (cadence_master.c:677-768)
+//   49 M5_BANK     multi-link bank switch on links 1+2 (stream.c:754-965, intel_bus_common.c:243-280):
+//                  CMDSYNC per link, deferred broadcast SCP_FrameCtrl write with the SSP tag, SYNCGO,
+//                  responses polled (3000 ms, DEFAULT_BANK_SWITCH_TIMEOUT)
+// Rollback (failure, --undo, client death, stop()) first stops the host DMA, puts both amps back to
+// PS3 + muted (best effort, bounded), clears the master port channel enables, then the M4 and M3
+// rollbacks run (links off, DSP off, BME off, all DMA freed).
+//
+// M4 (v0.6.0, interface v6) adds a fourth arming magic ('M4GO', = M3 + SoundWire) and ops 32-42:
+// after FW_READY has been acknowledged (no IPC is sent: Linux hda_dsp_post_fw_run -> hda_sdw_startup,
+// hda.c:443-450, runs straight after the FW_READY handshake, loader.c:150-171), the SoundWire links
+// are brought up exactly like sdw_intel_startup -> intel_link_startup (intel_init.c:284-320,
+// intel_auxdevice.c:383-487): intel_link_power_up (SYNCPRD/SYNCCPU, LCTL.SPA for the whole ACPI
+// link mask, intel.c:337-449), intel_shim_init (IOCTL/CTMCTL, intel.c:258-289), intel_start_bus
+// (intel_bus_common.c:12-73: soft reset, sync arm, sdw_cdns_init, CONFIG_UPDATE, sync go, interrupt
+// masks, exit reset / bus reset). Enumeration (sdw_program_device_num, bus.c:827-912) is driven by
+// audctl through the polled command-FIFO op (_cdns_xfer_msg / cdns_read_response semantics,
+// cadence_master.c:602-675), which only accepts SCP_DevId_0..5 reads (0x50-0x55) and
+// SCP_DevNumber (0x46) writes to device 0 with a value 1..11. No interrupts are ever delivered
+// (ADSPIC2.SNDW and INTx stay off), everything is polled with bounded waits. Rollback first stops
+// every started link like intel_stop_bus (intel_bus_common.c:205-238: interrupt masks off, master
+// IP -> glue, LCTL.SPA=0, WAKEEN off), then does the M3 rollback.
+//
+// M3 (v0.5.0, interface v5) adds a third arming magic ('M3GO', = M2b + firmware) and ops 25-31:
+// the SOF base firmware payload (the .ri file minus its SOF extended manifest, exactly what Linux
+// snd_sof_load_firmware_raw + hda_dsp_cl_boot_firmware send, loader.c:48-51, hda-loader.c:375-395)
+// is copied from the calling audctl process into a kernel IOBufferMemoryDescriptor (page-aligned,
+// below 4 GiB, not physically contiguous), mapped with IODMACommand, and described by the
+// code-loader BDL built like hda_dsp_stream_setup_bdl (hda-stream.c:112-185). After ROM INIT_DONE
+// the CL stream is started (hda_cl_trigger, hda-loader.c:185-215), FW_ENTERED is polled
+// (hda-loader.c:245-249, 3 s), the CL and ICCMAX streams are stopped and cleaned up exactly like
+// hda_cl_copy_fw / hda_cl_cleanup / the iccmax cleanup (hda-loader.c:264, 305-317,
+// hda-stream.c:397-482, 1333-1375), then the firmware's first message (HIPCTDR.BUSY, FW_READY) is
+// polled (loader.c:154-156, boot_timeout 2000 ms, core.c:65) and acknowledged the cnl way
+// (cnl.c:184 -> 201-216: HIPCTDR |= BUSY, then HIPCTDA |= DONE). The mailbox itself is read by
+// audctl through the read-only MMIO method (BAR4 0x80000+ is readable while CPA0=1).
+// New BAR4 stores: HIPCTDR (0xC0) and HIPCTDA (0xC4), only in the M3 ack op and in rollback.
+// Rollback additionally acks a pending DSP->host message and powers down every core whose SPA bit
+// is set (normally only core 0), and frees the firmware buffer after the streams are stopped.
+//
+// M2b (v0.4.0) extends method 4 with a second arming magic ('M2BG') and ops 15-24 that add the
+// Linux prerequisites M2 skipped (see the "M2b" section): Bus Master Enable (+INTx disable) for
+// the duration of the run, the hda_dsp_ctrl_init_chip controller-reset cycle, PPCTL setup,
+// EM2.L1SEN=0, the TGL ICCMAX capture stream (+LTRP guardband 95), a real code-loader output
+// stream (tag 1, BDL, CBL, FMT 0x40, SPIB) backed by an IOBufferMemoryDescriptor mapped through
+// the device's VT-d context with IODMACommand, SSP CBP/CFP, and core-off for Linux-style retries.
+// No firmware is downloaded and the CL stream is never started (RUN is never set on it).
+// Every BAR0 store goes through w0(), which only accepts a fixed list of registers; rollback
+// (also automatic on client death and in stop()) stops the streams, powers core 0 down, restores
+// every snapshotted register, clears BME and frees the DMA memory, in that order.
+// The M2 (v0.3.0) behaviour with the 'M2GO' magic is unchanged.
+//
+// M2 (v0.3.0) adds ONE opt-in user-client method (4, kAudShimM2) used only by `audctl m2`. It
+// performs a fixed, whitelisted set of writes that bring DSP core 0 up to its ROM, in the Linux
+// cAVS 2.5 order (sound/soc/sof/intel/hda.c:422-440 hda_dsp_pre_fw_run, hda-loader.c:66-182
+// cl_dsp_init, hda-dsp.c core helpers). See the "M2" section below. Properties:
+//   - nothing is written at boot / start(): M2 writes need an ARM call (magic) from the same
+//     user-client connection first, and only one connection can be armed at a time;
+//   - the only writable targets are PCI config bytes 0x44 and 0x48 and BAR4 ADSPCS (0x04),
+//     HIPCIDR (0xD0), HIPCIDA (0xD4); each op has fixed values and a precondition / order check;
+//   - BAR0 stays mapped read-only; Bus Master Enable is never set; no DMA, no stream, no firmware;
+//   - every wait has a timeout; on failure the client (audctl) calls ROLLBACK, and if the armed
+//     connection closes (or the process dies) while an M2 sequence is half-done, the kext rolls
+//     back by itself (stall + reset + power down core 0, restore cfg 0x44/0x48 bits);
+//   - stop() also rolls back if the DSP was left up by M2.
+// Everything below about M1/M1b still holds for the read paths.
+//
+// Derived from XeShim. Outside the opt-in M2 method, the shim:
+//   - maps BAR0 (HDA, 16 KB) and BAR4 (DSP, 1 MB) into the kernel, read-only, uncached
+//     (M2 adds a second, writable BAR4 map, created only at the first M2 ARM);
+//   - exposes read methods: info, config dword read, MMIO dword read (BAR0/BAR4,
+//     bounds-checked, 4-byte aligned, region-gated), MSE info; plus method 4 (M2);
+//   - has NO generic write method, NO clientMemoryForType (BARs are never mapped into user
+//     space), NO DMA allocation;
+//   - at start() makes exactly ONE hardware write (M1b): if PCI COMMAND.MSE (bit 1) is
+//     0 at start, it sets that bit and nothing else (16-bit read-modify-write of config 0x04;
+//     the status half at 0x06 is RW1C and is not written). Disabled by boot-arg -audshimnomse.
+//     It never sets Bus Master Enable, IO Space, INTx Disable or any other command bit, never
+//     writes PMCSR or MSI. MMIO writes happen only inside M2 ops (see the M2 section);
+//   - on stop() it undoes its own write: if (and only if) it set MSE, it clears MSE again
+//     (same 16-bit RMW, other bits as found), after the BAR maps are released;
+//   - never resets the function (no FLR, no GCTL.CRST), never calls PMinit/joinPMtree/
+//     registerPowerDriver, never opens the provider;
+//   - refuses to start on anything whose live config dword 0 is not 0x51CA8086, and refuses
+//     to start with the boot-arg -audshimoff.
+//
+// Why MSE alone is safe: it only makes the function decode its two already-assigned BAR windows
+// (BIOS/IOPCIFamily assigned them; no overlap with any other device in the IODeviceTree). With
+// BME=0 the function cannot master DMA; MSI is disabled and MSE has no effect on INTx; the
+// controller stays in reset (GCTL.CRST is whatever firmware left) and the DSP stays powered
+// down. This is the subset of Linux pci_enable_device() (pci_enable_resources() sets
+// PCI_COMMAND_MEMORY) that SOF runs before touching the device, without pci_set_master().
+//
+// MMIO reads are still refused (kIOReturnNotReady) while MSE is clear (e.g. -audshimnomse, or
+// something else cleared it) or the function is not in D0.
+//
+// BAR4 region gating (the parts of the DSP BAR that M1 is allowed to look at):
+//   0x00000-0x00FFF  DSP general regs (ADSPCS/ADSPIC/ADSPIS ...) and IPC regs
+//                    (sound/soc/sof/intel/hda.h:294-299, 383-390)
+//   0x2C000-0x2CFFF  SoundWire shim + ALH (include/linux/soundwire/sdw_intel.h:15-16)
+//   0x30000-0x6FFFF  Cadence link n at 0x30000 + 0x10000*n (sdw_intel.h:19-20), only while
+//                    that link reports LCTL.CPA (sdw_intel.h:33-34), and NEVER the
+//                    command/response FIFO window +0x80..+0xFF: reading CDNS_IP_MCP_RESP_BASE
+//                    pops a response (drivers/soundwire/cadence_master.c:133-137).
+//   0x80000-0xFFFFF  SRAM windows (hda.h:162), only while ADSPCS.CPA0 (bit 24) is set, i.e.
+//                    DSP core 0 is powered (RESEARCH.md M1: "read 0x80000 only if CPA0 = 1").
+//   anything else    refused (kIOReturnNotPermitted).
+// BAR0 (HDA controller registers): all of 0x0000-0x3FFF; HDA registers have no read side
+// effects (status bits are RW1C, not read-to-clear).
+
+#include <IOKit/IOService.h>
+#include <IOKit/IOLib.h>
+#include <IOKit/IOUserClient.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODMACommand.h>
+#include <pexpert/pexpert.h>
+#include <kern/clock.h>
+#include <kern/task.h>
+
+static uint64_t nowUs() {
+    uint64_t t = 0, ns = 0;
+    clock_get_uptime(&t);
+    absolutetime_to_nanoseconds(t, &ns);
+    return ns / 1000;
+}
+// Long polls: busy-wait 500 us steps for the first 20 ms (Linux HDA_DSP_REG_POLL_INTERVAL_US),
+// then sleep 1 ms per step so a 2-5 s wait does not spin a CPU. Elapsed time is measured, not summed.
+static void pollStep(uint32_t elapsedUs) {
+    if (elapsedUs < 20000) IODelay(500); else IOSleep(1);
+}
+
+#define AUD_PCI_ID 0x51CA8086u   // device << 16 | vendor, as in config dword 0
+
+enum {
+    kAudShimInfo = 0,       // out: 16 x uint64 (see sInfo)
+    kAudShimCfgRead32 = 1,  // in: offset (0..0xFFC, aligned) -> out: value
+    kAudShimMmioRead32 = 2, // in: bar (0 or 4), offset -> out: value
+    kAudShimMseInfo = 3,    // out: 4 x uint64: state, cmd at start, cmd after start, cmd now (M1b)
+    kAudShimM2 = 4,         // in: op, a0, a1 -> out: 16 x uint64 (M2, see m2Op)
+    kAudShimMethodCount
+};
+
+// ---- M2 op codes (method 4). out[0] is always an M2 result code (kM2*), never an IOReturn.
+enum {
+    kM2OpState = 0,     // read-only: phase, owner, saved cfg, ipcSent
+    kM2OpPrecheck = 1,  // read-only: IDs, PM, CMD, GCTL, PPCTL, ADSPCS, cfg44/48, IPC -> fail mask
+    kM2OpArm = 2,       // a0 = kM2MagicRun or kM2MagicUndo; arms THIS connection
+    kM2OpTcsel = 3,     // cfg 0x44 &= ~0x07 only if non-zero          (hda.c:903)
+    kM2OpCgctl = 4,     // cfg 0x48 &= ~ADSPDCGE(b1)                   (hda-ctrl.c:169-170)
+    kM2OpPgctl = 5,     // cfg 0x44 |= ADSPPGD(b2)                     (hda-ctrl.c:179-180)
+    kM2OpSpa = 6,       // ADSPCS |= SPA0, poll CPA0 (50 ms)           (hda-dsp.c:295-305)
+    kM2OpIpc = 7,       // HIPCIDR = 0x81004000 (ROM_CONTROL|PURGE_FW, tag 1) (hda-loader.c:87-91)
+    kM2OpCrst = 8,      // ADSPCS &= ~CRST0, poll (50 ms)              (hda-dsp.c:176-187)
+    kM2OpCstall = 9,    // ADSPCS &= ~CSTALL0, check enabled           (hda-dsp.c:259-265)
+    kM2OpIpcDone = 10,  // poll HIPCIDA.DONE (a0 ms, <= 500), ack by writing DONE (hda-loader.c:104-123)
+    kM2OpRomPoll = 11,  // read-only: poll ROM status for state a0, a1 ms (<= 1000) (hda-loader.c:148-153)
+    kM2OpRollback = 12, // stall, reset, power down core 0, restore cfg 0x44/0x48 (hda-loader.c:178)
+    kM2OpFinish = 13,   // sequence done, leave core 0 at the ROM; disarm
+    kM2OpDisarm = 14,   // disarm without doing anything (only when nothing is half-done)
+    // ---- M2b (only with the 'M2BG' arming)
+    kM2OpBme = 15,      // a0=1: PCI cmd |= BME|INTxDisable (hda.c:891); a0=0: back to snapshot
+    kM2OpCtrlInit = 16, // hda_dsp_ctrl_init_chip essentials: GCTL.CRST 0->1 cycle (hda-ctrl.c:186-292)
+    kM2OpPpcap = 17,    // PPCTL |= GPROCEN (| PIE if a0) (hda.c:912-913)
+    kM2OpL1sen = 18,    // EM2 &= ~L1SEN (hda-ctrl.c:173-176, hda-stream.c:267-273)
+    kM2OpDmaAlloc = 19, // BDL + data pages, IODMACommand through the device's mapper
+    kM2OpIccmax = 20,   // TGL ICCMAX capture stream + LTRP GB (hda-loader.c:276-319, hda-stream.c:484-555)
+    kM2OpClPrep = 21,   // code-loader stream hw_params + SPIB (hda-stream.c:563-755, 187-214, 1312-1313)
+    kM2OpSsp = 22,      // SSP0-2 SSC1 |= CBP/CFP (hda-loader.c:34-49,84)
+    kM2OpCoreOff = 23,  // hda_dsp_core_reset_power_down(core 0) between boot attempts (hda-loader.c:178)
+    kM2OpM2bInfo = 24,  // read-only: M2b layout, flags, DMA addresses, snapshots
+    // ---- M3 (only with the 'M3GO' arming)
+    kM3OpFwLoad = 25,   // a0 = user address, a1 = length: copy the FW payload in, map it for DMA
+    kM3OpClStart = 26,  // hda_cl_trigger START (hda-loader.c:185-215), only at ROM INIT_DONE
+    kM3OpClStop = 27,   // hda_cl_trigger STOP + hda_cl_cleanup + ICCMAX cleanup + LTRP (hda-loader.c:264,305-317)
+    kM3OpFwReady = 28,  // poll HIPCTDR.BUSY a0 ms (<= 5000) (loader.c:154-156, cnl.c:154-184); no write
+    kM3OpTdAck = 29,    // cnl_ipc_host_done: HIPCTDR |= BUSY, HIPCTDA |= DONE (cnl.c:201-216)
+    kM3OpPostFwRun = 30,// hda_dsp_ctrl_clock_power_gating(true) (hda.c:471 -> hda-ctrl.c:163-184), opt-in
+    kM3OpInfo = 31,     // read-only: FW buffer summary + BDL entries a0..a0+4
+    // ---- M4 (only with the 'M4GO' arming; kM4OpState is read-only and needs no arming)
+    kM4OpState = 32,    // read-only: M4 flags, per-link steps, shim registers
+    kM4OpPowerUp = 33,  // a0 = link mask: intel_link_power_up first-link part (intel.c:392-437)
+    kM4OpShimInit = 34, // a0 = link: intel_shim_init + glue_to_master_ip (intel.c:207-234, 258-289)
+    kM4OpSoftReset = 35,// a0 = link: sdw_cdns_soft_reset (cadence_master.c:1406-1425)
+    kM4OpSyncArm = 36,  // a0 = link: intel_shim_sync_arm (intel.c:500-513), multi-link flow
+    kM4OpCdnsInit = 37, // a0 = link: sdw_cdns_init + cdns_init_clock_ctrl (cadence_master.c:1353-1491)
+    kM4OpCommit = 38,   // a0 = link: CONFIG_UPDATE, SYNCGO, wait (intel_bus_common.c:38-52)
+    kM4OpIntEnable = 39,// a0 = link: sdw_cdns_enable_interrupt(true) (cadence_master.c:1209-1270)
+    kM4OpExitReset = 40,// a0 = link: sdw_cdns_exit_reset + self-clearing check (1116-1184)
+    kM4OpStatPoll = 41, // a0 = link | dev<<8 | want<<16 | clear<<24, a1 = ms: poll SLAVE_STAT
+    kM4OpXfer = 42,     // a0 = link | count<<8 | cmd<<16 | dev<<24 | reg<<32, a1 = data: one FIFO message
+    // ---- M5 (only with the 'M5GO' arming; kM5OpState is read-only and needs no arming)
+    kM5OpState = 43,    // read-only: M5 flags, IPC counters, stream registers
+    kM5OpIpc = 44,      // a0 = user address, a1 = length: one validated IPC3 message + reply
+    kM5OpSAlloc = 45,   // a0 = user address, a1 = 65536: playback ring + BDL + page table
+    kM5OpStream = 46,   // a0 = 0 hw_params, 1 start, 2 stop, 3 hw_free
+    kM5OpRegW = 47,     // a0 = BAR4 offset | width << 32, a1 = value (SoundWire stream registers)
+    kM5OpXfer = 48,     // a0 = link | count<<8 | cmd<<16 | dev<<24 | data<<32, a1 = 32-bit register address
+    kM5OpBank = 49,     // a0 = link mask (0x6), a1 = bank (0/1): multi-link bank switch
+    kM2OpCount
+};
+enum {
+    kM2Ok = 0, kM2Timeout = 1, kM2NotArmed = 2, kM2Precond = 3, kM2BadOp = 4, kM2Verify = 5,
+    kM2Busy = 6, kM2NoMap = 7, kM2NoMem = 8, kM2DmaErr = 9,
+};
+static const uint64_t kM2MagicRun = 0x4D32474FULL;   // 'M2GO'
+static const uint64_t kM2MagicUndo = 0x554E444FULL;  // 'UNDO'
+static const uint64_t kM2bMagicRun = 0x4D324247ULL;  // 'M2BG'
+static const uint64_t kM3MagicRun = 0x4D33474FULL;   // 'M3GO'
+static const uint64_t kM4MagicRun = 0x4D34474FULL;   // 'M4GO'
+static const uint64_t kM5MagicRun = 0x4D35474FULL;   // 'M5GO'
+
+// M2b/M3 progress flags (m2bFlags)
+enum : uint32_t {
+    kFBme = 1u << 0, kFCtrl = 1u << 1, kFPpcap = 1u << 2, kFL1 = 1u << 3, kFDma = 1u << 4,
+    kFIcc = 1u << 5, kFCl = 1u << 6, kFLtrp = 1u << 7, kFSsp = 1u << 8, kFUnsol = 1u << 9,
+    kFFw = 1u << 10,      // M3: firmware buffer allocated + mapped
+    kFClRun = 1u << 11,   // M3: CL stream RUN was set
+    kFClDone = 1u << 12,  // M3: CL/ICCMAX cleanup done (FW_ENTERED path)
+    kFPost = 1u << 13,    // M3: post_fw_run gating re-enabled
+    kFFwAck = 1u << 14,   // M3: a DSP->host message (FW_READY) was acknowledged by kM3OpTdAck
+};
+
+// BAR4 layout (cAVS 2.5)
+static const uint32_t kADSPCS = 0x04;           // hda.h:295
+static const uint32_t kADSPCS_CPA0 = 1u << 24;  // hda.h:373
+static const uint32_t kSdwShim = 0x2C000;       // sdw_intel.h:15
+static const uint32_t kSdwLCTL = kSdwShim + 0x4;// sdw_intel.h:29
+static const uint32_t kSdwLink0 = 0x30000;      // sdw_intel.h:19
+static const uint32_t kSdwLinkSz = 0x10000;     // sdw_intel.h:20
+static const uint32_t kSdwLinks = 4;            // DSDT mipi-sdw-master-count = 4
+static const uint32_t kSram0 = 0x80000;         // hda.h:162
+
+// ---- M4: SoundWire (cAVS 2.5 layout, ip_offset 0: intel_init.c:68-70; registers sdw_intel.h:15-106,
+// cadence_master.c:30-200). Values derived from the live DSDT (\_SB.PC00.HDAS.IDA.SNDW, LNK0-3):
+//   intel-sdw-ip-clock 38400000 -> mclk_freq = 38400000 / 2 = 19200000 (intel_auxdevice.c:175-183)
+//   mipi-sdw-clock-frequencies-supported {4800000}, no max-clock-frequency -> max_clk_freq = 4800000
+//     (mipi_disco.c:81-112) -> curr_dr_freq = 2 * 4800000 = 9600000 (bus.c:160-161)
+//   mipi-sdw-default-frame-rate 48000, row 50, col 4; mipi-sdw-command-error-threshold 16
+//   mipi-sdw-master-count 4, intel-quirk-mask 0 on every link -> ACPI link_mask 0xF
+//     (intel-sdw-acpi.c:84-129)
+static const uint32_t kSdwSYNC = kSdwShim + 0xC;                  // sdw_intel.h:40
+static const uint32_t kSdwWAKEEN = kSdwShim + 0x190;              // sdw_intel.h:92 (16-bit)
+static const uint32_t kSdwWAKESTS = kSdwShim + 0x192;             // sdw_intel.h:97 (16-bit)
+static inline uint32_t sdwIoctl(uint32_t l) { return kSdwShim + 0x06C + 0x60 * l; }   // sdw_intel.h:80
+static inline uint32_t sdwCtmctl(uint32_t l) { return kSdwShim + 0x06E + 0x60 * l; }  // sdw_intel.h:102
+static const uint32_t kMclkHz = 38400000u / 2;                    // intel_auxdevice.c:183
+static const uint32_t kCurrDrHz = 4800000u * 2;                   // bus.c:160-161 (SDW_DOUBLE_RATE_FACTOR 2)
+static const uint32_t kFrameRate = 48000, kFrameRows = 50;
+static const uint32_t kMclkDiv = kMclkHz * 2 / kCurrDrHz - 1;     // = 3, cadence_master.c:1374-1375
+static const uint32_t kFrameCols = kCurrDrHz / kFrameRate / kFrameRows;   // = 4, cadence_master.c:1383-1384
+static const uint32_t kFrameShapeInit = (1u << 3) | 1u;           // row idx(50)=1, col idx(4)=1 (stream.c:29-34)
+static const uint32_t kSspInterval = kFrameRate / 4000;           // = 12, cadence_master.c:1395 (GSYNC 4 kHz)
+static const uint32_t kSyncPrd = 38400 / 4 - 1;                   // = 9599 (intel.c:367-381, sdw_intel.h:45)
+static_assert(kMclkDiv == 3 && kFrameCols == 4 && kSspInterval == 12 && kSyncPrd == 9599, "M4 bus constants");
+// IOCTL bits (sdw_intel.h:82-90), CTMCTL bits (104-106), SYNC bits (47-52), LCTL (32-35)
+enum : uint32_t {
+    kIoMIF = 1u << 0, kIoCO = 1u << 1, kIoCOE = 1u << 2, kIoDO = 1u << 3, kIoDOE = 1u << 4,
+    kIoBKE = 1u << 5, kIoWPDD = 1u << 6,
+    kCtmDACTQE = 1u << 0, kCtmDODS = 1u << 1, kCtmDOAIS = 3u << 3,
+    kSyncPrdMask = 0x7FFFu, kSyncCPU = 1u << 15, kSyncCmdSync = 1u << 16, kSyncCmdSyncMask = 0xFu << 16,
+    kSyncGO = 1u << 24,
+};
+// Cadence MCP registers (cadence_master.c:30-150) and bits
+enum : uint32_t {
+    kCdCONFIG = 0x00, kCdCONTROL = 0x04, kCdCMDCTRL = 0x08, kCdFSINIT = 0x14, kCdCFGUPD = 0x18,
+    kCdSSP0 = 0x20, kCdSSP1 = 0x28, kCdCLK0 = 0x30, kCdCLK1 = 0x38, kCdSTAT = 0x40, kCdINTSTAT = 0x44,
+    kCdINTMASK = 0x48, kCdSLVSTAT = 0x50, kCdSLVINT0 = 0x54, kCdSLVINT1 = 0x58, kCdSLVMSK0 = 0x5C,
+    kCdSLVMSK1 = 0x60, kCdFIFOLVL = 0x78, kCdFIFOSTAT = 0x7C, kCdCMD = 0x80,
+    kCfgBUSREL = 1u << 6, kCfgMMASTER = 1u << 7, kCfgSNIFFER = 1u << 5, kCfgCMD = 1u << 3, kCfgOP = 7u,
+    kCtlCMDRST = 1u << 7, kCtlSOFTRST = 1u << 6, kCtlSWRST = 1u << 5, kCtlHWRST = 1u << 4,
+    kCtlCLKSTOPCLR = 1u << 2, kCtlCMDACCEPT = 1u << 1, kCtlBLOCKWAKE = 1u << 0,
+    kStatCLKSTOP = 1u << 16,
+    kIntIRQ = 1u << 31, kIntSLAVEMASK = 0xFu << 12, kIntCTRLCLASH = 1u << 10, kIntDATACLASH = 1u << 9,
+    kIntPARITY = 1u << 8, kIntRXWL = 1u << 2,
+    kRespACK = 1u << 0, kRespNACK = 1u << 1,
+};
+static inline uint32_t cdnsBase(uint32_t l) { return kSdwLink0 + 0x10000 * l; }
+static const uint32_t kCdnsTxTimeoutMs = 500;   // CDNS_TX_TIMEOUT cadence_master.c:197
+// Per-link bring-up steps (m4Step[l]); every op requires the previous step.
+enum { kL0 = 0, kLShim = 1, kLSoft = 2, kLArm = 3, kLInit = 4, kLCommit = 5, kLInt = 6, kLRun = 7 };
+// M4 flags
+enum : uint32_t { kF4Power = 1u << 0, kF4SyncArmed = 1u << 1 };
+// ---- M5 constants
+// Mailboxes from FW_READY of sof-rpl.ri 2.2 (m4run/run.txt S19; ipc3_get_windows ipc3.c:739-749):
+// host_box (DOWNBOX) BAR4+0xA0000 size 0x2000, dsp_box (UPBOX) BAR4+0x81000. IPC3 messages are at most
+// SOF_IPC_MSG_MAX_SIZE = 384 bytes (header.h:134, FW CONFIG_DATA IPC_MSG_SIZE = 384).
+static const uint32_t kHostBox = 0xA0000, kIpcMax = 384, kIpcTimeoutMs = 500;   // TIMEOUT_DEFAULT_IPC_MS
+// Playback ring: PCM caps of the topology (Speaker, pcm 2): buffer 65536 bytes, periods 2..16, period
+// 192..16384 bytes -> 16 periods of 4096 bytes (48 kHz, 2 ch, S32_LE = 8 bytes/frame, ~10.7 ms/period).
+static const uint32_t kM5Buf = 65536, kM5Period = 4096, kM5Frags = kM5Buf / kM5Period;
+static const uint32_t kM5BdlOff = kM5Buf, kM5PtOff = kM5Buf + 4096, kM5Total = kM5Buf + 8192;
+static const uint32_t kM5Fmt = 0x0041;   // SDnFMT: 48 kHz (mult/div 0), BITS=32 (b6:4=4), CHAN=2-1 (hda_dsp_pcm_hw_params)
+static const uint32_t kM5Tag = 1;        // first playback stream tag (hda-stream.c stream init: index - ISS + 1)
+// M5 progress flags (m5Flags)
+enum : uint32_t {
+    kF5Ipc = 1u << 0,   // at least one IPC sent
+    kF5Dma = 1u << 1,   // playback ring allocated
+    kF5Prep = 1u << 2,  // host stream hw_params done
+    kF5Run = 1u << 3,   // host stream RUN set
+    kF5Port = 1u << 4,  // master port / PDI / shim / ALH registers written
+    kF5Amp = 1u << 5,   // RT1316 registers written (rollback mutes + PS3)
+    kF5L1 = 1u << 6,    // EM2.L1SEN cleared by the stream open (hda-stream.c _hda_dsp_stream_get)
+    kF5Bank = 1u << 7,  // a bank switch was done
+};
+// RT1316 SDCA controls used by the rollback (rt1316-sdw.h, SDW_SDCA_CTL sdw_registers.h:335-342)
+static const uint32_t kRtPde23 = 0x41001888, kRtPde27 = 0x41001908, kRtPde22 = 0x41001988;
+static const uint32_t kRtFu21MuteL = 0x41000189, kRtFu21MuteR = 0x4100018A;
+
+// M3 limits / Linux constants
+static const uint32_t kFwMaxBdl = 256;              // HDA_DSP_MAX_BDL_ENTRIES hda.h:417-418
+static const uint32_t kFwMax = 1024 * 1024;          // payload cap (256 BDLEs of 4 KiB worst case)
+static const uint32_t kBaseFwTimeoutMs = 3000;       // HDA_DSP_BASEFW_TIMEOUT_US hda.h:283
+static const uint32_t kBootTimeoutMaxMs = 5000;      // Linux default 2000 (TIMEOUT_DEFAULT_BOOT_MS core.c:65)
+static const uint32_t kStreamRunTimeoutUs = 300;     // HDA_DSP_STREAM_RUN_TIMEOUT hda.h:185
+static const uint32_t kHIPCTDR = 0xC0, kHIPCTDA = 0xC4, kHIPCTDD = 0xC8;  // hda.h:383-386 (CNL)
+static const uint32_t kCpdMagic = 0x44504324u;       // "$CPD" (CSE code partition directory)
+// DMA layout: one 5-page buffer. page 0 CL BDL, 1 ICCMAX BDL, 2-3 CL data (8 KiB), 4 ICCMAX data.
+static const uint32_t kPg = 4096, kDmaPages = 5, kClBytes = 8192, kIcBytes = 4096;
+static const uint32_t kClFmt = 0x40;     // HDA_CL_STREAM_FORMAT hda.h:767
+static const uint32_t kClTag = 1;        // first playback stream tag (hda-stream.c:1008-1012)
+static const uint8_t kLtrpGb = 95;       // HDA_LTRP_GB_VALUE_US hda-stream.c:32
+static const uint32_t kSdIntMask = 0x1C; // SOF_HDA_CL_DMA_SD_INT_MASK hda.h:110-118
+enum { kPhaseIdle = 0, kPhaseArmed = 1, kPhaseWriting = 2, kPhaseLeftUp = 3 };
+
+// Precheck failure mask bits (out[11] of kM2OpPrecheck / out[1] of a refused ARM)
+enum {
+    kPcId = 1u << 0, kPcNotD0 = 1u << 1, kPcMse = 1u << 2, kPcBme = 1u << 3, kPcCrst = 1u << 4,
+    kPcGprocen = 1u << 5, kPcCore0NotIdle = 1u << 6, kPcNoMap = 1u << 7, kPcNoPP = 1u << 8,
+    kPcCfg = 1u << 9,   // cfg 0x44/0x48 already modified (ADSPPGD=1 or ADSPDCGE=0) while core 0 idle
+    kPcNoSpib = 1u << 10,  // M2b: SPIB capability not found
+    kPcStreams = 1u << 11, // M2b: GCAP ISS/OSS unusable, or SD(iccmax)/SD(CL) not idle (RUN/SRST/BDL set)
+};
+
+// Register bits (sound/soc/sof/intel/hda.h)
+static const uint32_t kCRST0 = 1u << 0;            // hda.h:352-353
+static const uint32_t kCSTALL0 = 1u << 8;          // hda.h:359-360
+static const uint32_t kSPA0 = 1u << 16;            // hda.h:366-367
+static const uint32_t kHIPCIDR = 0xD0;             // hda.h:387
+static const uint32_t kHIPCIDA = 0xD4;             // hda.h:388
+static const uint32_t kIpcBusyDone = 1u << 31;     // hda.h:393,397
+static const uint32_t kRomCtlMsg = 0x80000000u | 0x01000000u | 0x00004000u | ((1u - 1u) << 9);
+                                                   // hda-loader.c:87-89, hda.h:276-277, tag 1
+static const uint8_t kADSPPGD = 1u << 2;           // hda.h:30 (cfg 0x44)
+static const uint8_t kADSPDCGE = 1u << 1;          // hda.h:35 (cfg 0x48)
+static const uint32_t kPollUs = 500;               // HDA_DSP_REG_POLL_INTERVAL_US hda.h:287
+static const uint32_t kResetTimeoutUs = 50000;     // HDA_DSP_RESET_TIMEOUT_US hda.h:282
+static const uint32_t kPdTimeoutUs = 50000;        // HDA_DSP_PD_TIMEOUT (ms) hda.h:281
+static const uint32_t kIpcDoneMaxMs = 500;         // HDA_DSP_INIT_TIMEOUT_US hda.h:284
+static const uint32_t kRomPollMaxMs = 1000;        // Linux uses 300 (tgl.c:149); hard cap here
+
+
+// What start() did about PCI COMMAND.MSE (reported by method 3 and as property "AudShimMSE").
+enum {
+    kMseUnknown = 0,       // start() did not get that far
+    kMseAlreadyOn = 1,     // MSE was already 1: nothing written
+    kMseEnabled = 2,       // AudShim set MSE (cmd: orig -> orig|0x2)
+    kMseSkippedBootArg = 3,// -audshimnomse: nothing written
+    kMseFailed = 4,        // wrote MSE but it did not read back as 1
+    kMseBadCmd = 5,        // command read 0xFFFF (function absent?): nothing written
+};
+
+class AudShimUserClient;
+
+class AudShim : public IOService {
+    OSDeclareDefaultStructors(AudShim);
+public:
+    IOPCIDevice *pci = nullptr;
+    IOMemoryMap *map0 = nullptr, *map4 = nullptr;
+    bool ro0 = false, ro4 = false;
+    uint8_t pmCap = 0;
+    uint32_t mseState = kMseUnknown;
+    uint16_t cmdOrig = 0, cmdAfter = 0;
+
+    // ---- M2 state (protected by m2Lock)
+    IOLock *m2Lock = nullptr;
+    IOMemoryMap *map4w = nullptr;          // writable BAR4 map, created at the first ARM only
+    AudShimUserClient *m2Owner = nullptr;  // armed connection (not retained; cleared on close)
+    uint32_t m2Phase = kPhaseIdle;
+    bool m2UndoArm = false;                // owner armed with the UNDO magic (rollback only)
+    bool cfgSaved = false;                 // cfg44Orig/cfg48Orig valid (snapshot at run ARM)
+    uint8_t cfg44Orig = 0, cfg48Orig = 0;
+    bool ipcSent = false;
+    uint32_t ppOff = 0;                    // BAR0 offset of the PP capability (0 = not found)
+
+    // ---- M2b state (protected by m2Lock)
+    IOMemoryMap *map0w = nullptr;          // writable BAR0 map, created at the first M2b ARM only
+    bool m2bMode = false;                  // armed with 'M2BG'
+    uint32_t m2bFlags = 0;                 // kF* progress flags
+    uint32_t spbOff = 0, mlOff = 0, iss = 0, oss = 0, icIdx = 0, clIdx = 0;
+    // snapshots taken at the M2b ARM (restored by rollback)
+    uint16_t cmdSnap = 0;
+    uint32_t gctlSnap = 0, ppctlSnap = 0, em2Snap = 0, spbctlSnap = 0, spibSnap = 0;
+    uint8_t ltrpSnap = 0;
+    uint32_t sspSnap[3] = {};
+    // DMA
+    IOBufferMemoryDescriptor *dmaMd = nullptr;
+    IODMACommand *dmaCmd = nullptr;
+    uint8_t *dmaVa = nullptr;
+    uint64_t dmaIova[kDmaPages] = {}, dmaPhys[kDmaPages] = {};
+    uint32_t dmaSegs = 0;
+    bool sspWriteOk = false;               // SSP SSC1 stores allowed (opt-in, see w4)
+    bool sspWritten = false;               // SSP SSC1 really written this run (rollback restores)
+    // ---- M3 state (protected by m2Lock)
+    bool m3Mode = false;                   // armed with 'M3GO' (implies m2bMode)
+    IOBufferMemoryDescriptor *fwMd = nullptr;
+    IODMACommand *fwCmd = nullptr;
+    uint8_t *fwVa = nullptr;
+    uint32_t fwSize = 0, fwCap = 0, fwSegs = 0, fwBdl = 0, fwHash = 0;
+    bool fwIdentity = false;
+    uint64_t fwSegAddr[kFwMaxBdl] = {};
+    uint32_t fwSegLen[kFwMaxBdl] = {};
+    // ---- M4 state (protected by m2Lock)
+    bool m4Mode = false;                   // armed with 'M4GO' (implies m3Mode and m2bMode)
+    uint32_t m4Flags = 0;                  // kF4*
+    uint32_t m4LinkMask = 0;               // link_mask used for LCTL.SPA (intel.c:411-416)
+    uint32_t m4ShimMask = 0;               // *shim_mask (intel.c:392, 439)
+    uint8_t m4Step[kSdwLinks] = {};        // kL* per link
+    uint32_t m4MsgCount[kSdwLinks] = {};   // cdns->msg_count (cadence_master.c:1441, 627-630)
+    // ---- M5 state (protected by m2Lock)
+    bool m5Mode = false;                   // armed with 'M5GO' (implies m4Mode/m3Mode/m2bMode)
+    uint32_t m5Flags = 0;                  // kF5*
+    uint32_t m5IpcCount = 0, m5LastCmd = 0;
+    int32_t m5LastErr = 0;
+    IOBufferMemoryDescriptor *m5Md = nullptr;
+    IODMACommand *m5Cmd = nullptr;
+    uint8_t *m5Va = nullptr;
+    uint64_t m5Iova = 0, m5Phys = 0;
+    uint32_t m5Hash = 0;
+
+    void m2Op(AudShimUserClient *c, uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o);
+    void m2ClientGone(AudShimUserClient *c);
+    uint32_t m2Precheck(uint64_t *o);
+    uint32_t r4(uint32_t off) { return raw(map4, off); }
+    uint32_t r0(uint32_t off) { return raw(map0, off); }
+    bool w4(uint32_t off, uint32_t v);
+    bool wcfg8(uint32_t off, uint8_t v);
+    uint8_t rcfg8(uint32_t off) { return pci->configRead8((IOByteCount)off); }
+    bool poll4(uint32_t off, uint32_t mask, uint32_t want, uint32_t timeoutUs, uint32_t *last, uint32_t *elapsedUs);
+    void rollback(uint64_t *o, const char *why);
+    uint32_t findPP() { return findCap(3); }
+    uint32_t findCap(uint32_t id);
+    // M2b helpers
+    bool w0(uint32_t off, uint32_t v, unsigned width, const char *what);
+    bool w0Allowed(uint32_t off, unsigned width);
+    uint32_t r0w(uint32_t off, unsigned width);
+    bool poll0(uint32_t off, uint32_t mask, uint32_t want, uint32_t timeoutUs, uint32_t stepUs, uint32_t *last, uint32_t *elapsedUs);
+    bool wcmd16(uint16_t v);
+    uint32_t sdBase(uint32_t idx) { return 0x80 + 0x20 * idx; }
+    uint32_t m2bPrecheck(uint64_t *o);
+    void m2bOp(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o);
+    void m2bRollback(uint64_t *o);
+    void dmaFree();
+    bool streamReset(uint32_t idx, uint32_t *rc);
+    // M3 helpers
+    void fwFree();
+    int fwBuildBdl(volatile uint32_t *bdl);
+    uint32_t fwChunk(uint32_t off, uint64_t *addr);
+    void m3Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o);
+    // M4 helpers
+    bool m4Allowed(uint32_t off, unsigned width);
+    bool w4h(uint32_t off, uint16_t v);
+    uint16_t r4h(uint32_t off) { return (uint16_t)((r4(off & ~3u) >> ((off & 2) * 8)) & 0xFFFF); }
+    bool m4Wait(uint32_t off, uint32_t mask, uint32_t want, uint32_t *last, uint32_t *elapsedUs);
+    bool m4LinkPowered(uint32_t l) { return (r4(kSdwLCTL) >> (8 + l)) & 1; }
+    bool cdnsConfigUpdate(uint32_t l, uint32_t *last, uint32_t *el);
+    void cdnsUpdate(uint32_t l, uint32_t reg, uint32_t mask, uint32_t val, const char *what);
+    void m4Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o);
+    void m4Rollback(uint64_t *o);
+    // M5 helpers
+    bool m5Allowed(uint32_t off, unsigned width);
+    bool m5RtRegOk(uint32_t addr, bool write);
+    bool copyIn(uint64_t uaddr, void *dst, uint32_t len);
+    bool m5IpcCheck(uint8_t *m, uint32_t len, const char **why);
+    uint32_t cdnsRun(uint32_t l, const uint32_t *w, uint32_t n, uint64_t *resp, uint32_t maxResp, uint32_t *nresp,
+                     uint32_t *is, uint32_t *fs, uint32_t tmoUs, uint32_t *el);
+    uint32_t m5Xfer(uint32_t l, uint32_t cmd, uint32_t dev, uint32_t addr, uint32_t cnt, uint32_t data,
+                    uint32_t tmoUs, uint64_t *o);
+    void m5Free();
+    void m5Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o);
+    uint32_t m5Rollback();
+
+    IOService *probe(IOService *provider, SInt32 *score) override;
+    bool start(IOService *provider) override;
+    void stop(IOService *provider) override;
+    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                           OSDictionary *properties, IOUserClient **handler) override;
+
+    IOMemoryMap *mapBar(uint8_t reg, bool *readOnly);
+    void enableMemorySpace();
+    uint32_t cfg32(uint32_t off) {
+        return pci->configRead32((IOByteCount)off);  // = extendedConfigRead32 outside IOPCIFamily
+    }
+    IOReturn mmioReady();
+    IOReturn mmioRead(unsigned bar, uint64_t off, uint32_t *val);
+private:
+    uint32_t raw(IOMemoryMap *m, uint32_t off) {
+        return *(volatile uint32_t *)(m->getVirtualAddress() + off);
+    }
+};
+
+class AudShimUserClient : public IOUserClient {
+    OSDeclareDefaultStructors(AudShimUserClient);
+    AudShim *shim = nullptr;
+    static const IOExternalMethodDispatch sMethods[kAudShimMethodCount];
+    static IOReturn sInfo(OSObject *t, void *, IOExternalMethodArguments *a);
+    static IOReturn sCfgRead(OSObject *t, void *, IOExternalMethodArguments *a);
+    static IOReturn sMmioRead(OSObject *t, void *, IOExternalMethodArguments *a);
+    static IOReturn sMseInfo(OSObject *t, void *, IOExternalMethodArguments *a);
+    static IOReturn sM2(OSObject *t, void *, IOExternalMethodArguments *a);
+public:
+    bool start(IOService *provider) override;
+    IOReturn clientClose() override;
+    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+                            IOExternalMethodDispatch *dispatch, OSObject *target,
+                            void *reference) override;
+};
+
+OSDefineMetaClassAndStructors(AudShim, IOService);
+OSDefineMetaClassAndStructors(AudShimUserClient, IOUserClient);
+
+// ---------------------------------------------------------------- AudShim
+
+IOService *AudShim::probe(IOService *provider, SInt32 *score) {
+    char dummy[8];
+    if (PE_parse_boot_argn("-audshimoff", dummy, sizeof(dummy))) return nullptr;
+    IOPCIDevice *dev = OSDynamicCast(IOPCIDevice, provider);
+    // Second line of defence behind IOPCIMatch: the live hardware ID, not the (spoofable)
+    // device-id property, must be 8086:51CA.
+    if (!dev || dev->configRead32(kIOPCIConfigVendorID) != AUD_PCI_ID) return nullptr;
+    return IOService::probe(provider, score);
+}
+
+// Map one BAR read-only + uncached. 64-bit BARs: IOPCIFamily keys the IODeviceMemory of a
+// 64-bit BAR by its low register (0x10 for BAR0/1, 0x20 for BAR4/5) and records the full
+// 64-bit address (ioreg "assigned-addresses" shows entries for 0x10 and 0x20 only), so
+// kIOPCIConfigBaseAddress0/4 are the right keys. Nothing is written to the BAR registers.
+IOMemoryMap *AudShim::mapBar(uint8_t reg, bool *readOnly) {
+    IOMemoryMap *m = pci->mapDeviceMemoryWithRegister(reg, kIOMapInhibitCache | kIOMapReadOnly);
+    *readOnly = (m != nullptr);
+    if (!m) {
+        // Fallback only if the VM layer refuses a read-only device mapping. The shim still has
+        // no store instruction to MMIO anywhere; this only loses the hardware PTE guard.
+        m = pci->mapDeviceMemoryWithRegister(reg, kIOMapInhibitCache);
+    }
+    return m;
+}
+
+// M1b: the only hardware write AudShim makes. Sets PCI COMMAND bit 1 (Memory Space Enable) and
+// nothing else, via a 16-bit RMW of config offset 0x04 (a 32-bit write would also hit the RW1C
+// status register at 0x06). Equivalent to IOPCIDevice::setMemoryEnable(true), done by hand so
+// that exactly one config write of exactly one changed bit is guaranteed.
+void AudShim::enableMemorySpace() {
+    char dummy[8];
+    cmdOrig = cmdAfter = pci->configRead16(kIOPCIConfigCommand);
+    if (cmdOrig == 0xFFFF) {
+        mseState = kMseBadCmd;
+        IOLog("AudShim: command register reads 0xffff; MSE not touched\n");
+    } else if (cmdOrig & kIOPCICommandMemorySpace) {
+        mseState = kMseAlreadyOn;
+        IOLog("AudShim: MSE already on (cmd 0x%04x); nothing written\n", cmdOrig);
+    } else if (PE_parse_boot_argn("-audshimnomse", dummy, sizeof(dummy))) {
+        mseState = kMseSkippedBootArg;
+        IOLog("AudShim: MSE off (cmd 0x%04x), left off because of -audshimnomse; MMIO reads will be refused\n", cmdOrig);
+    } else {
+        pci->configWrite16(kIOPCIConfigCommand, (uint16_t)(cmdOrig | kIOPCICommandMemorySpace));
+        cmdAfter = pci->configRead16(kIOPCIConfigCommand);
+        mseState = (cmdAfter & kIOPCICommandMemorySpace) ? kMseEnabled : kMseFailed;
+        IOLog("AudShim: MSE %s (cmd 0x%04x -> 0x%04x)\n",
+              mseState == kMseEnabled ? "enabled" : "write did NOT stick", cmdOrig, cmdAfter);
+    }
+    setProperty("AudShimMSE", mseState, 32);
+    setProperty("AudShimCmdOrig", cmdOrig, 16);
+    setProperty("AudShimCmdAfter", cmdAfter, 16);
+}
+
+bool AudShim::start(IOService *provider) {
+    if (!IOService::start(provider)) return false;
+    pci = OSDynamicCast(IOPCIDevice, provider);
+    if (!pci || pci->configRead32(kIOPCIConfigVendorID) != AUD_PCI_ID) return false;
+    m2Lock = IOLockAlloc();
+    if (!m2Lock) return false;
+
+    pci->findPCICapability(kIOPCIPowerManagementCapability, &pmCap);
+    map0 = mapBar(kIOPCIConfigBaseAddress0, &ro0);
+    map4 = mapBar(kIOPCIConfigBaseAddress4, &ro4);
+
+    uint32_t cmd = pci->configRead32(kIOPCIConfigCommand);
+    IOLog("AudShim: attached %08x subsys %08x cmd/sts %08x BAR0 %s%s len 0x%llx BAR4 %s%s len 0x%llx\n",
+          pci->configRead32(kIOPCIConfigVendorID), pci->configRead32(kIOPCIConfigSubSystemVendorID), cmd,
+          map0 ? "mapped" : "UNMAPPED", ro0 ? "(ro)" : "", map0 ? (unsigned long long)map0->getLength() : 0ULL,
+          map4 ? "mapped" : "UNMAPPED", ro4 ? "(ro)" : "", map4 ? (unsigned long long)map4->getLength() : 0ULL);
+    // Only after both maps exist (mapping itself touches no hardware). Without any map there is
+    // nothing to read, so there is no reason to make the device decode.
+    if (map0 || map4) enableMemorySpace();
+    else IOLog("AudShim: no BAR mapped; MSE not touched\n");
+
+    setProperty("IOUserClientClass", "AudShimUserClient");
+    registerService();
+    return true;
+}
+
+// Undo only our own write: if start() set MSE, clear it again (16-bit RMW, every other bit as it
+// is now). Maps are released first so nothing can read a non-decoding BAR. If MSE was already
+// on at start, or we skipped it, nothing is written.
+void AudShim::stop(IOService *provider) {
+    // M2: if core 0 was brought up by M2 and not undone, put it back (stall, reset, power
+    // down, restore cfg 0x44/0x48) while the maps still exist.
+    if (m2Lock) {
+        IOLockLock(m2Lock);
+        if (m2Phase == kPhaseWriting || m2Phase == kPhaseLeftUp) {
+            uint64_t o[16] = {};
+            rollback(o, "stop()");
+        }
+        if (m2bMode && m2bFlags) {        // even if the DSP refused to power down: BME off, free DMA
+            uint64_t o[16] = {};
+            m2bRollback(o);
+        }
+        dmaFree();
+        m2bMode = false; m3Mode = false; m4Mode = false; m5Mode = false; m5Flags = 0;
+        m2Owner = nullptr;
+        m2Phase = kPhaseIdle;
+        OSSafeReleaseNULL(map4w);
+        OSSafeReleaseNULL(map0w);
+        IOLockUnlock(m2Lock);
+    }
+    OSSafeReleaseNULL(map0);
+    OSSafeReleaseNULL(map4);
+    if (pci && mseState == kMseEnabled) {
+        uint16_t now = pci->configRead16(kIOPCIConfigCommand);
+        if (now != 0xFFFF && (now & kIOPCICommandMemorySpace)) {
+            pci->configWrite16(kIOPCIConfigCommand, (uint16_t)(now & ~kIOPCICommandMemorySpace));
+            IOLog("AudShim: stop: MSE restored to off (cmd 0x%04x -> 0x%04x)\n", now,
+                  pci->configRead16(kIOPCIConfigCommand));
+        }
+        mseState = kMseUnknown;
+    }
+    if (m2Lock) { IOLockFree(m2Lock); m2Lock = nullptr; }
+    IOService::stop(provider);
+}
+
+IOReturn AudShim::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                                OSDictionary *properties, IOUserClient **handler) {
+    if (IOUserClient::clientHasPrivilege(owningTask, kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
+        IOUserClient::clientHasPrivilege(owningTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
+    AudShimUserClient *uc = OSTypeAlloc(AudShimUserClient);
+    if (!uc) return kIOReturnNoMemory;
+    if (!uc->initWithTask(owningTask, securityID, type) || !uc->attach(this) || !uc->start(this)) {
+        uc->detach(this);
+        uc->release();
+        return kIOReturnError;
+    }
+    *handler = uc;
+    return kIOReturnSuccess;
+}
+
+// Function must decode memory (PCI command bit 1) and be in D0 (PMCSR[1:0] == 0).
+IOReturn AudShim::mmioReady() {
+    if (!(pci->configRead32(kIOPCIConfigCommand) & kIOPCICommandMemorySpace)) return kIOReturnNotReady;
+    if (pmCap && (pci->configRead32(pmCap + 4) & 3) != 0) return kIOReturnNotReady;
+    return kIOReturnSuccess;
+}
+
+IOReturn AudShim::mmioRead(unsigned bar, uint64_t off, uint32_t *val) {
+    IOMemoryMap *m = (bar == 0) ? map0 : (bar == 4) ? map4 : nullptr;
+    if (bar != 0 && bar != 4) return kIOReturnBadArgument;
+    if (!m) return kIOReturnNotFound;
+    if ((off & 3) || off + 4 > m->getLength()) return kIOReturnBadArgument;
+    IOReturn r = mmioReady();
+    if (r) return r;
+    uint32_t o = (uint32_t)off;
+
+    if (bar == 4) {
+        if (o < 0x1000 || (o >= kSdwShim && o < kSdwShim + 0x1000)) {
+            // allowed
+        } else if (o >= kSdwLink0 && o < kSdwLink0 + kSdwLinks * kSdwLinkSz) {
+            uint32_t link = (o - kSdwLink0) / kSdwLinkSz, rel = (o - kSdwLink0) % kSdwLinkSz;
+            if (rel >= 0x80 && rel < 0x100) return kIOReturnNotPermitted;  // CMD/RESP FIFO
+            if (!(raw(m, kSdwLCTL) & (1u << (8 + link)))) return kIOReturnNotReady;  // link CPA
+        } else if (o >= kSram0) {
+            if (!(raw(m, kADSPCS) & kADSPCS_CPA0)) return kIOReturnNotReady;
+        } else {
+            return kIOReturnNotPermitted;
+        }
+    }
+    *val = raw(m, o);
+    return kIOReturnSuccess;
+}
+
+// =====================================================================================  M2
+// DSP core 0 power-up + ROM handshake, no firmware, no DMA. Linux references are to
+// ~/xe/build/audio/linux-src (torvalds master). The whole Linux path for RPL-P (tgl_chip_info,
+// tgl.c:138-161: host_managed_cores_mask = init_core_mask = BIT(0), CNL IPC, rom_init_timeout
+// 300 ms) is:
+//   hda_dsp_pre_fw_run (hda.c:422-440): power down if enabled, then
+//     hda_dsp_ctrl_clock_power_gating(false) (hda-ctrl.c:163-184):
+//       cfg 0x48 &= ~ADSPDCGE (169-170); EM2 &= ~L1SEN (173-176, BAR0, NOT done here: it only
+//       matters for host DMA, which M2 does not use); cfg 0x44 |= ADSPPGD (179-180)
+//   cl_dsp_init (hda-loader.c:66-182):
+//     1 hda_dsp_core_power_up (77; hda-dsp.c:280-326): ADSPCS |= SPA0, poll CPA0 50 ms
+//       hda_ssp_set_cbp_cfp (84; SSP SSC1 writes, NOT done here: SSP is unused on this machine)
+//     2 HIPCIDR = BUSY | ROM_CONTROL | PURGE_FW | (tag-1)<<9 (87-91)
+//     3 hda_dsp_core_run (94; hda-dsp.c:248-277): CRST0 clear + poll, CSTALL0 clear, check
+//     4 poll HIPCIDA.DONE 500 ms (104-109), write DONE back (120-123)
+//     6 IPC interrupt enable (136; NOT done: we poll, interrupts stay off)
+//     7 poll ROM status (BAR4+0x80000) state == INIT_DONE (1), 300 ms (148-153)
+//     err: hda_dsp_core_reset_power_down (178; hda-dsp.c:376-415)
+// TCSEL (cfg 0x44 bits 2:0 = 0) is done once at probe (hda.c:903); it is a no-op on this
+// machine (0x44 reads 0x00) and is written here only if non-zero.
+// The step ORDER and the IPC policy are chosen by audctl; the kext enforces per-op
+// preconditions so that no op can run out of order or with the DSP in an unexpected state.
+
+static void m2Log(const char *what, uint32_t off, uint32_t before, uint32_t after) {
+    IOLog("AudShim M2: %s @0x%x 0x%08x -> 0x%08x\n", what, off, before, after);
+}
+
+// The ONLY BAR4 store in the kext. Whitelist: ADSPCS, HIPCIDR, HIPCIDA; SSP0-2 SSC1 only while
+// sspWriteOk (kM2OpSsp with a0=1, and its rollback); in M3 mode HIPCTDR/HIPCTDA (DSP->host message
+// ack, cnl.c:201-216).
+// NOTE (found while building M3): in 0.4.0 the SSP SSC1 stores were NOT in this whitelist, so the
+// M2b S10 step was refused here (IOLog "BUG: refused BAR4 write to 0x10004") and wrote nothing. The
+// successful M2b run therefore had no SSP write. 0.5.0 keeps that as the default (a0=0: record
+// only) and makes the real Linux write (hda-loader.c:34-49,84) opt-in (a0=1, audctl --ssp).
+bool AudShim::w4(uint32_t off, uint32_t v) {
+    if (!map4w) return false;
+    bool ssp = m2bMode && sspWriteOk && (off == 0x10004 || off == 0x11004 || off == 0x12004);
+    bool td = m3Mode && (off == kHIPCTDR || off == kHIPCTDA);
+    bool sdw = m4Mode && m4Allowed(off, 32);
+    bool m5 = m5Mode && m5Allowed(off, 32);
+    if (off != kADSPCS && off != kHIPCIDR && off != kHIPCIDA && !ssp && !td && !sdw && !m5) {
+        IOLog("AudShim M2: BUG: refused BAR4 write to 0x%x\n", off);
+        return false;
+    }
+    *(volatile uint32_t *)(map4w->getVirtualAddress() + off) = v;
+    return true;
+}
+
+// The ONLY config writes besides MSE. Whitelist: byte 0x44 (TCSEL/PGCTL), byte 0x48 (CGCTL).
+bool AudShim::wcfg8(uint32_t off, uint8_t v) {
+    if (off != 0x44 && off != 0x48) {
+        IOLog("AudShim M2: BUG: refused cfg write to 0x%x\n", off);
+        return false;
+    }
+    pci->configWrite8((IOByteCount)off, v);
+    return true;
+}
+
+bool AudShim::poll4(uint32_t off, uint32_t mask, uint32_t want, uint32_t timeoutUs,
+                    uint32_t *last, uint32_t *elapsedUs) {
+    uint32_t t = 0, v = r4(off);
+    while ((v & mask) != want && t < timeoutUs) {
+        IODelay(kPollUs);
+        t += kPollUs;
+        v = r4(off);
+    }
+    if (last) *last = v;
+    if (elapsedUs) *elapsedUs = t;
+    return (v & mask) == want;
+}
+
+// HDA capability chain walk (hda-ctrl.c:58-125): id 2 ML, 3 PP, 4 SPIB.
+uint32_t AudShim::findCap(uint32_t id) {
+    if (!map0) return 0;
+    uint32_t off = r0(0x14) & 0xFFFF;   // LLCH
+    for (int n = 0; off && n <= 10; n++) {
+        if ((off & 3) || off + 8 > map0->getLength()) return 0;
+        uint32_t h = r0(off);
+        if (h == 0xFFFFFFFFu) return 0;
+        if (((h >> 16) & 0xFFF) == id) return off;
+        off = h & 0xFFFF;
+    }
+    return 0;
+}
+
+// Read-only. o[1] id o[2] cmd/sts o[3] PMCSR o[4] GCTL o[5] PPCTL o[6] ADSPCS o[7] cfg44 byte
+// o[8] cfg48 byte o[9] HIPCIDR o[10] HIPCIDA o[11] fail mask o[12] PP offset o[13] HIPCTDR
+// o[14] cfg44/48 originals saved (b8 valid, [7:0] 44, [15:8]... packed: valid<<16|48<<8|44)
+uint32_t AudShim::m2Precheck(uint64_t *o) {
+    uint32_t fail = 0;
+    uint32_t id = pci->configRead32(kIOPCIConfigVendorID);
+    uint32_t cmd = pci->configRead32(kIOPCIConfigCommand);
+    uint32_t pm = pmCap ? pci->configRead32(pmCap + 4) : 0;
+    o[1] = id; o[2] = cmd; o[3] = pm;
+    if (id != AUD_PCI_ID) fail |= kPcId;
+    if (pmCap && (pm & 3)) fail |= kPcNotD0;
+    if (!(cmd & kIOPCICommandMemorySpace)) fail |= kPcMse;
+    if (cmd & kIOPCICommandBusMaster) fail |= kPcBme;
+    if (!map0 || !map4) fail |= kPcNoMap;
+    uint8_t c44 = rcfg8(0x44), c48 = rcfg8(0x48);
+    o[7] = c44; o[8] = c48;
+    o[14] = cfgSaved ? ((1u << 16) | ((uint32_t)cfg48Orig << 8) | cfg44Orig) : 0;
+    if (fail & (kPcId | kPcNotD0 | kPcMse | kPcNoMap)) { o[11] = fail; return fail; }
+    uint32_t gctl = r0(0x08);
+    o[4] = gctl;
+    if (!(gctl & 1)) fail |= kPcCrst;                 // SOF_HDA_GCTL_RESET hda.h:50
+    if (!ppOff) ppOff = findPP();
+    o[12] = ppOff;
+    if (!ppOff) fail |= kPcNoPP;
+    else {
+        uint32_t ppctl = r0(ppOff + 0x04);            // SOF_HDA_REG_PP_PPCTL hda.h:71
+        o[5] = ppctl;
+        if (!(ppctl & (1u << 30))) fail |= kPcGprocen;// SOF_HDA_PPCTL_GPROCEN hda.h:74
+    }
+    uint32_t cs = r4(kADSPCS);
+    o[6] = cs;
+    // Core 0 must be exactly as in M1: off (SPA0=CPA0=0), held in reset and stall.
+    if ((cs & (kSPA0 | kADSPCS_CPA0)) || !(cs & kCRST0) || !(cs & kCSTALL0)) fail |= kPcCore0NotIdle;
+    else if ((c44 & kADSPPGD) || !(c48 & kADSPDCGE)) fail |= kPcCfg;
+    o[9] = r4(kHIPCIDR); o[10] = r4(kHIPCIDA); o[13] = r4(0xC0);
+    o[11] = fail;
+    return fail;
+}
+
+// Stall, reset, power down core 0 (hda-dsp.c:376-415 = 209-219 + 130-167 + 328-348), then
+// restore the cfg 0x44/0x48 bits M2 changed. Idempotent: writes only what differs.
+// o[1] ADSPCS before o[2] ADSPCS after o[3] cfg44 before/after (b<<8|a) o[4] cfg48 before/after
+// o[5] rc bits: b0 CRST poll timeout, b1 CPA-off poll timeout, b2 HIPCIDA acked, b3 cfg restored
+// from defaults (no snapshot) o[6] HIPCIDR after o[7] HIPCIDA after o[8] number of writes
+void AudShim::rollback(uint64_t *o, const char *why) {
+    uint32_t rc = 0, nw = 0, v, el;
+    uint32_t cs0 = r4(kADSPCS);
+    o[1] = cs0;
+    IOLog("AudShim M2: rollback (%s), ADSPCS 0x%08x\n", why, cs0);
+    // M4: stop the SoundWire links first, while the DSP (and with it the SoundWire shim) still has
+    // power (intel_stop_bus, intel_bus_common.c:205-238; Linux removes the links before the DSP is
+    // powered down, hda.c:253-266). Result in o[15]: writes [15:0], rc bits [31:16].
+    // M5 first (host DMA stop, amps muted + PS3, master port channels off), while links and DSP are up.
+    uint32_t r5 = (m5Mode && map4w) ? m5Rollback() : 0;
+    if (m4Mode && map4w) m4Rollback(o);
+    o[15] = (o[15] & 0xFFFFFFFFull) | ((uint64_t)r5 << 32);
+    // M2b: stop host DMA before touching the DSP (Linux: hda_cl_cleanup / iccmax cleanup,
+    // hda-stream.c:1334-1348). RUN is cleared on both streams; the CL stream never ran.
+    if (m2bMode && map0w) {
+        for (int k = 0; k < 2; k++) {
+            uint32_t sd = sdBase(k ? clIdx : icIdx), ctl = r0(sd);
+            if (ctl & 0x2) {
+                w0(sd, ctl & 0x00FFFFFDu, 32, k ? "rollback CL SD RUN=0" : "rollback ICCMAX SD RUN=0"); nw++;
+                if (!poll0(sd, 0x2, 0, 2000, 10, &v, &el)) rc |= 0x10;
+            }
+        }
+        m2bFlags &= ~(kFIcc | kFClRun);
+    }
+    if (map4w) {
+        if (m2bMode && (m2bFlags & kFSsp) && (r4(kADSPCS) & kADSPCS_CPA0)) {
+            // put the SSP SSC1 registers back while the DSP still has power (they reset with it
+            // anyway); only if they were really written (see w4)
+            for (uint32_t i = 0; i < 3 && sspWritten; i++) {
+                uint32_t off = 0x10000 + i * 0x1000 + 0x4, b = r4(off);
+                if (b != sspSnap[i]) {
+                    sspWriteOk = true; w4(off, sspSnap[i]); sspWriteOk = false; nw++;
+                    m2Log("rollback SSP SSC1", off, b, r4(off));
+                }
+            }
+            m2bFlags &= ~kFSsp;
+        }
+        sspWritten = false;
+        // A ROM reply that was never acknowledged: ack it like Linux (hda-loader.c:120-123).
+        uint32_t ida = r4(kHIPCIDA);
+        if (ipcSent && (ida & kIpcBusyDone) && (cs0 & kADSPCS_CPA0)) {
+            w4(kHIPCIDA, ida | kIpcBusyDone); nw++; rc |= 4;
+            m2Log("rollback ack HIPCIDA", kHIPCIDA, ida, r4(kHIPCIDA));
+        }
+        // M3: a DSP->host message (FW_READY or later) that was never acknowledged: ack it the cnl
+        // way (cnl.c:201-216) so the firmware is not left mid-IPC when its core is stopped.
+        if (m3Mode && (r4(kADSPCS) & kADSPCS_CPA0)) {
+            uint32_t tdr = r4(kHIPCTDR);
+            if (tdr & kIpcBusyDone) {
+                w4(kHIPCTDR, tdr | kIpcBusyDone);
+                uint32_t tda = r4(kHIPCTDA);
+                w4(kHIPCTDA, tda | kIpcBusyDone); nw += 2; rc |= 0x200;
+                m2Log("rollback ack HIPCTDR", kHIPCTDR, tdr, r4(kHIPCTDR));
+            }
+        }
+        // hda_dsp_core_reset_power_down(mask) (hda-dsp.c:376-415) for core 0 plus any core whose
+        // SPA bit is set (only core 0 is host-managed on TGL/RPL, tgl.c:142; the others are never
+        // set by AudShim, this just makes sure nothing stays requested).
+        uint32_t cs = r4(kADSPCS);
+        uint32_t m = 1u | ((cs >> 16) & 0xFu);
+        if ((cs & (m << 8)) != (m << 8)) {           // stall (hda-dsp.c:212-215)
+            w4(kADSPCS, cs | (m << 8)); nw++;
+            m2Log("rollback CSTALL=1", kADSPCS, cs, r4(kADSPCS));
+        }
+        cs = r4(kADSPCS);
+        if ((cs & m) != m) {                         // reset enter + poll (hda-dsp.c:136-147)
+            w4(kADSPCS, cs | m); nw++;
+            if (!poll4(kADSPCS, m, m, kResetTimeoutUs, &v, &el)) rc |= 1;
+            m2Log("rollback CRST=1", kADSPCS, cs, v);
+        }
+        cs = r4(kADSPCS);
+        if ((cs & (m << 16)) || (cs & kADSPCS_CPA0)) {   // power down + poll (hda-dsp.c:334-341)
+            w4(kADSPCS, cs & ~(m << 16)); nw++;
+            if (!poll4(kADSPCS, m << 24, 0, kPdTimeoutUs, &v, &el)) rc |= 2;
+            m2Log("rollback SPA=0", kADSPCS, cs, v);
+        }
+    }
+    // cfg: restore the bits M2 may have changed (0x44 [2:0], 0x48 b1) to the snapshot; with no
+    // snapshot, to the Linux "gating enabled" state = M1 state (hda-ctrl.c:163-184 enable=true,
+    // called from hda.c:471): ADSPDCGE=1, ADSPPGD=0.
+    uint8_t b44 = rcfg8(0x44), b48 = rcfg8(0x48), n44, n48;
+    if (cfgSaved) {
+        n44 = (uint8_t)((b44 & ~0x07) | (cfg44Orig & 0x07));
+        n48 = (uint8_t)((b48 & ~kADSPDCGE) | (cfg48Orig & kADSPDCGE));
+    } else {
+        n44 = (uint8_t)(b44 & ~kADSPPGD);
+        n48 = (uint8_t)(b48 | kADSPDCGE);
+        rc |= 8;
+    }
+    // Only restore gating once core 0 is really off; otherwise leave power gating disabled.
+    if (!(r4(kADSPCS) & kADSPCS_CPA0)) {
+        if (n44 != b44) { wcfg8(0x44, n44); nw++; m2Log("rollback cfg44", 0x44, b44, rcfg8(0x44)); }
+        if (n48 != b48) { wcfg8(0x48, n48); nw++; m2Log("rollback cfg48", 0x48, b48, rcfg8(0x48)); }
+        cfgSaved = false;
+    }
+    o[2] = r4(kADSPCS);
+    o[3] = ((uint32_t)b44 << 8) | rcfg8(0x44);
+    o[4] = ((uint32_t)b48 << 8) | rcfg8(0x48);
+    o[6] = r4(kHIPCIDR);
+    o[7] = r4(kHIPCIDA);
+    bool m2bLeft = false;
+    if (m2bMode) {
+        o[5] = rc; o[8] = nw;
+        if (!(r4(kADSPCS) & kADSPCS_CPA0)) m2bRollback(o);   // fills o[9..14], adds to o[5]/o[8]
+        else o[5] |= 0x20;                                    // DSP still powered: BAR0/BME/DMA kept
+        rc = (uint32_t)o[5]; nw = (uint32_t)o[8];
+        m2bLeft = (m2bFlags != 0);
+    }
+    o[5] = rc;
+    o[8] = nw;
+    ipcSent = false;
+    m2Phase = ((r4(kADSPCS) & kADSPCS_CPA0) || m2bLeft) ? kPhaseWriting : kPhaseIdle;  // still up -> keep "writing"
+    if (m2Phase == kPhaseIdle) { m2bMode = false; m3Mode = false; m4Mode = false; m5Mode = false; m5Flags = 0; }
+    IOLog("AudShim M2: rollback done, ADSPCS 0x%08x cfg44 0x%02x cfg48 0x%02x rc 0x%x\n",
+          (uint32_t)o[2], rcfg8(0x44), rcfg8(0x48), rc);
+}
+
+// Called from the user client's clientClose (also on process death). Half-done sequence ->
+// automatic rollback. A completed sequence (FINISH, core 0 left at the ROM) is kept.
+void AudShim::m2ClientGone(AudShimUserClient *c) {
+    if (!m2Lock) return;
+    IOLockLock(m2Lock);
+    if (m2Owner == c) {
+        if (m2Phase == kPhaseWriting) {
+            uint64_t o[16] = {};
+            rollback(o, "armed client closed mid-sequence");
+        }
+        m2Owner = nullptr;
+        m2UndoArm = false;
+        if (m2Phase == kPhaseArmed) m2Phase = kPhaseIdle;
+    }
+    IOLockUnlock(m2Lock);
+}
+
+void AudShim::m2Op(AudShimUserClient *c, uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
+    for (int i = 0; i < 16; i++) o[i] = 0;
+    if (op >= kM2OpCount) { o[0] = kM2BadOp; return; }
+    IOLockLock(m2Lock);
+    uint32_t v = 0, el = 0, cs, b;
+
+    // ---- read-only ops (no arming needed)
+    if (op == kM2OpState) {
+        o[1] = m2Phase; o[2] = (m2Owner == c) ? 1 : (m2Owner ? 2 : 0); o[3] = m2UndoArm;
+        o[4] = cfgSaved ? ((1u << 16) | ((uint32_t)cfg48Orig << 8) | cfg44Orig) : 0;
+        o[5] = ipcSent; o[6] = map4w != nullptr; o[7] = (m2bMode ? 1u : 0u) | (m3Mode ? 2u : 0u) | (m4Mode ? 4u : 0u) | (m5Mode ? 8u : 0u);
+        o[8] = m2bFlags;
+        goto out;
+    }
+    if (op == kM4OpState) { m4Op(op, a0, a1, o); goto out; }
+    if (op == kM5OpState) { m5Op(op, a0, a1, o); goto out; }
+    if (op == kM2OpPrecheck) { uint32_t f = m2Precheck(o); if (a0 == 1) f |= m2bPrecheck(o); o[11] = f; goto out; }
+    if (op == kM2OpM2bInfo || op == kM3OpInfo) { m2bOp(op, a0, a1, o); goto out; }
+    if (op == kM2OpRomPoll) {
+        // Poll BAR4+0x80000 (HDA_DSP_SRAM_REG_ROM_STATUS hda.h:170) until state[23:0] == a0
+        // (FSR_TO_STATE_CODE hda.h:195,199) or a1 ms (cap 1000 ms; 3000 ms for a0 = FW_ENTERED,
+        // HDA_DSP_BASEFW_TIMEOUT_US hda.h:283). Records up to 4 distinct values.
+        // o[1] final status o[2] ROM error (+4, hda.h:171) o[3] elapsed us o[4] reached
+        // o[5] n transitions, o[6..13] = (value, t_us) pairs, o[14] HIPCTDR at the end,
+        // o[15] flags: b0 stopped early because HIPCTDR.BUSY (FW already talking, a0 = 5 only),
+        // b1 core 0 lost power during the poll
+        if (!map4 || mmioReady() || !(r4(kADSPCS) & kADSPCS_CPA0)) { o[0] = kM2Precond; o[1] = r4(kADSPCS); goto out; }
+        uint32_t cap = (a0 == 5) ? kBaseFwTimeoutMs : kRomPollMaxMs;
+        uint32_t ms = (uint32_t)(a1 > cap ? cap : a1), t = 0, n = 0, fl = 0;
+        uint64_t t0 = nowUs();
+        uint32_t s = r4(kSram0), prev = s;
+        o[6] = s; o[7] = 0; n = 1;
+        while ((s & 0xFFFFFF) != (uint32_t)a0 && t < ms * 1000) {
+            pollStep(t);
+            t = (uint32_t)(nowUs() - t0);
+            if (!(r4(kADSPCS) & kADSPCS_CPA0)) { fl |= 2; break; }   // core lost power: stop reading SRAM
+            s = r4(kSram0);
+            if (s != prev && n < 4) { o[6 + 2 * n] = s; o[7 + 2 * n] = t; n++; }
+            prev = s;
+            if (a0 == 5 && (r4(kHIPCTDR) & kIpcBusyDone) && (s & 0xFFFFFF) != 5) { fl |= 1; break; }
+        }
+        o[1] = s; o[2] = (r4(kADSPCS) & kADSPCS_CPA0) ? r4(kSram0 + 4) : 0xFFFFFFFFu;
+        o[3] = t; o[4] = (s & 0xFFFFFF) == (uint32_t)a0; o[5] = n; o[14] = r4(kHIPCTDR); o[15] = fl;
+        o[0] = o[4] ? kM2Ok : kM2Timeout;
+        goto out;
+    }
+
+    // ---- ARM / DISARM
+    if (op == kM2OpArm) {
+        if (m2Owner && m2Owner != c) { o[0] = kM2Busy; goto out; }
+        if (a0 != kM2MagicRun && a0 != kM2MagicUndo && a0 != kM2bMagicRun && a0 != kM3MagicRun && a0 != kM4MagicRun &&
+            a0 != kM5MagicRun) { o[0] = kM2BadOp; goto out; }
+        bool run = (a0 == kM2MagicRun || a0 == kM2bMagicRun || a0 == kM3MagicRun || a0 == kM4MagicRun || a0 == kM5MagicRun);
+        bool isB = (a0 == kM2bMagicRun || a0 == kM3MagicRun || a0 == kM4MagicRun || a0 == kM5MagicRun);
+        uint32_t f = m2Precheck(o);
+        if (isB) f |= m2bPrecheck(o);
+        o[11] = f;
+        uint32_t hard = kPcId | kPcNotD0 | kPcMse | kPcNoMap;
+        if (run) hard |= kPcBme | kPcCrst | kPcGprocen | kPcNoPP | kPcCore0NotIdle | kPcCfg;
+        if (isB) hard |= kPcNoSpib | kPcStreams;
+        // UNDO: BME may legitimately be on (an M2b run left up); it is restored by rollback.
+        if (run && m2Phase != kPhaseIdle) { o[0] = kM2Precond; o[15] = m2Phase; goto out; }
+        if (f & hard) { o[0] = kM2Precond; goto out; }
+        if (!map4w) map4w = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress4, kIOMapInhibitCache);
+        if (!map4w) { o[0] = kM2NoMap; goto out; }
+        if (isB) {
+            if (!map0w) map0w = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
+            if (!map0w) { o[0] = kM2NoMap; goto out; }
+            // Snapshots of everything M2b may change (restored by rollback).
+            cmdSnap = pci->configRead16(kIOPCIConfigCommand);
+            gctlSnap = r0(0x08); ppctlSnap = r0(ppOff + 0x04); em2Snap = r0(0x1030);
+            ltrpSnap = (uint8_t)(r0(0x1048) & 0xFF);
+            spbctlSnap = r0(spbOff + 0x04); spibSnap = r0(spbOff + 0x08 + 0x08 * clIdx);
+            m2bFlags = 0;
+            IOLog("AudShim M2b: snapshot cmd 0x%04x GCTL 0x%08x PPCTL 0x%08x EM2 0x%08x LTRP 0x%02x SPBFCCTL 0x%08x "
+                  "SPIB%u 0x%08x ISS %u OSS %u iccmax SD%u CL SD%u\n", cmdSnap, gctlSnap, ppctlSnap, em2Snap,
+                  ltrpSnap, spbctlSnap, clIdx, spibSnap, iss, oss, icIdx, clIdx);
+        }
+        if (run) {
+            cfg44Orig = rcfg8(0x44); cfg48Orig = rcfg8(0x48); cfgSaved = true;
+            ipcSent = false;
+            m2Phase = kPhaseArmed;
+            m2bMode = isB; m3Mode = (a0 == kM3MagicRun || a0 == kM4MagicRun || a0 == kM5MagicRun); sspWritten = false;
+            m4Mode = (a0 == kM4MagicRun || a0 == kM5MagicRun); m4Flags = 0; m4LinkMask = 0; m4ShimMask = 0;
+            m5Mode = (a0 == kM5MagicRun); m5Flags = 0; m5IpcCount = 0; m5LastCmd = 0; m5LastErr = 0;
+            for (uint32_t l = 0; l < kSdwLinks; l++) { m4Step[l] = kL0; m4MsgCount[l] = 0; }
+        }
+        m2Owner = c;
+        m2UndoArm = (a0 == kM2MagicUndo);
+        IOLog("AudShim M2: armed (%s) by pid-connection %p, ADSPCS 0x%08x cfg44 0x%02x cfg48 0x%02x\n",
+              m2UndoArm ? "undo" : "run", c, r4(kADSPCS), rcfg8(0x44), rcfg8(0x48));
+        o[0] = kM2Ok;
+        goto out;
+    }
+    if (m2Owner != c) { o[0] = kM2NotArmed; goto out; }
+    if (op == kM2OpDisarm) {
+        if (m2Phase == kPhaseWriting) { o[0] = kM2Precond; goto out; }
+        m2Owner = nullptr; m2UndoArm = false;
+        if (m2Phase == kPhaseArmed) m2Phase = kPhaseIdle;
+        o[0] = kM2Ok; goto out;
+    }
+    if (op == kM2OpRollback) {
+        rollback(o, m2UndoArm ? "audctl m2 --undo" : "audctl m2 failure path");
+        o[0] = (o[5] & 3) ? kM2Timeout : kM2Ok;
+        if (m2Phase == kPhaseIdle) { m2Owner = nullptr; m2UndoArm = false; }
+        goto out;
+    }
+    if (m2UndoArm) { o[0] = kM2NotArmed; goto out; }   // UNDO arming allows rollback only
+    if (mmioReady()) { o[0] = kM2Precond; goto out; }
+    if (op >= kM2OpBme && op <= kM2OpCoreOff) {
+        if (!m2bMode) { o[0] = kM2Precond; goto out; }  // M2b ops need the 'M2BG' (or 'M3GO') arming
+        m2bOp(op, a0, a1, o);
+        goto out;
+    }
+    if (op >= kM3OpFwLoad && op <= kM3OpPostFwRun) {
+        if (!m3Mode || !m2bMode) { o[0] = kM2Precond; goto out; }  // M3 ops need the 'M3GO' (or 'M4GO') arming
+        m3Op(op, a0, a1, o);
+        goto out;
+    }
+    if (op >= kM4OpPowerUp && op <= kM4OpXfer) {
+        if (!m4Mode || !m3Mode || !m2bMode) { o[0] = kM2Precond; goto out; }  // M4 ops need the 'M4GO' arming
+        m4Op(op, a0, a1, o);
+        goto out;
+    }
+    if (op >= kM5OpIpc && op <= kM5OpBank) {
+        if (!m5Mode || !m4Mode || !m3Mode || !m2bMode) { o[0] = kM2Precond; goto out; }  // M5 ops need 'M5GO'
+        m5Op(op, a0, a1, o);
+        goto out;
+    }
+
+    cs = r4(kADSPCS);
+    // M2b: core 0 may only be powered / given the ROM message once the CL stream exists.
+    if (m2bMode && (op == kM2OpSpa || op == kM2OpIpc) && !(m2bFlags & kFCl)) {
+        o[0] = kM2Precond; o[1] = cs; o[15] = m2bFlags; goto out;
+    }
+    switch (op) {
+    case kM2OpTcsel:   // hda.c:903 snd_sof_pci_update_bits(sdev, PCI_TCSEL, 0x07, 0)
+    case kM2OpCgctl:   // hda-ctrl.c:169-170 PCI_CGCTL &= ~ADSPDCGE
+    case kM2OpPgctl: { // hda-ctrl.c:179-180 PCI_PGCTL |= ADSPPGD
+        if (m2Phase != kPhaseArmed && m2Phase != kPhaseWriting) { o[0] = kM2Precond; break; }
+        if (cs & (kSPA0 | kADSPCS_CPA0)) { o[0] = kM2Precond; o[1] = cs; break; }  // before power-up only
+        uint32_t off = (op == kM2OpCgctl) ? 0x48 : 0x44;
+        uint8_t bb = rcfg8(off), nb = bb;
+        if (op == kM2OpTcsel) nb = (uint8_t)(bb & ~0x07);
+        else if (op == kM2OpCgctl) nb = (uint8_t)(bb & ~kADSPDCGE);
+        else nb = (uint8_t)(bb | kADSPPGD);
+        o[1] = bb;
+        if (nb != bb) {
+            m2Phase = kPhaseWriting;
+            wcfg8(off, nb);
+            o[3] = 1;   // written
+        }
+        o[2] = rcfg8(off);
+        if (nb != bb) m2Log(op == kM2OpTcsel ? "cfg44 TCSEL=0" : op == kM2OpCgctl ? "cfg48 ADSPDCGE=0" : "cfg44 ADSPPGD=1",
+                            off, bb, (uint32_t)o[2]);
+        o[0] = (o[2] == nb) ? kM2Ok : kM2Verify;
+        break;
+    }
+    case kM2OpSpa: {   // hda-dsp.c:295-305
+        uint8_t c44 = rcfg8(0x44), c48 = rcfg8(0x48);
+        // Linux disables DSP clock + power gating before power-up (hda.c:439).
+        if (m2Phase == kPhaseIdle || m2Phase == kPhaseLeftUp || !(c44 & kADSPPGD) || (c48 & kADSPDCGE) ||
+            (cs & (kSPA0 | kADSPCS_CPA0)) || !(cs & kCRST0) || !(cs & kCSTALL0)) {
+            o[0] = kM2Precond; o[1] = cs; break;
+        }
+        m2Phase = kPhaseWriting;
+        o[1] = cs;
+        w4(kADSPCS, cs | kSPA0);
+        bool ok = poll4(kADSPCS, kADSPCS_CPA0, kADSPCS_CPA0, kResetTimeoutUs, &v, &el);
+        o[2] = v; o[3] = el;
+        m2Log("ADSPCS SPA0=1", kADSPCS, cs, v);
+        o[0] = ok ? kM2Ok : kM2Timeout;
+        break;
+    }
+    case kM2OpIpc: {   // hda-loader.c:87-91
+        if (m2Phase != kPhaseWriting || !(cs & kADSPCS_CPA0) || ipcSent) { o[0] = kM2Precond; o[1] = cs; break; }
+        b = r4(kHIPCIDR);
+        o[1] = b;
+        w4(kHIPCIDR, kRomCtlMsg);
+        ipcSent = true;
+        o[2] = r4(kHIPCIDR); o[4] = r4(kHIPCIDA); o[5] = kRomCtlMsg;
+        m2Log("HIPCIDR ROM_CONTROL", kHIPCIDR, b, (uint32_t)o[2]);
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM2OpCrst: {  // hda-dsp.c:176-187 (reset leave)
+        if (m2Phase != kPhaseWriting || !(cs & kADSPCS_CPA0) || !(cs & kCSTALL0) || !(cs & kCRST0)) {
+            o[0] = kM2Precond; o[1] = cs; break;
+        }
+        o[1] = cs;
+        w4(kADSPCS, cs & ~kCRST0);
+        bool ok = poll4(kADSPCS, kCRST0, 0, kResetTimeoutUs, &v, &el);
+        o[2] = v; o[3] = el;
+        m2Log("ADSPCS CRST0=0", kADSPCS, cs, v);
+        o[0] = ok ? kM2Ok : kM2Timeout;
+        break;
+    }
+    case kM2OpCstall: { // hda-dsp.c:259-265 (unstall, then hda_dsp_core_is_enabled 222-246)
+        if (m2Phase != kPhaseWriting || !(cs & kADSPCS_CPA0) || (cs & kCRST0) || !(cs & kCSTALL0)) {
+            o[0] = kM2Precond; o[1] = cs; break;
+        }
+        o[1] = cs;
+        w4(kADSPCS, cs & ~kCSTALL0);
+        v = r4(kADSPCS);
+        o[2] = v;
+        m2Log("ADSPCS CSTALL0=0", kADSPCS, cs, v);
+        bool en = (v & kADSPCS_CPA0) && (v & kSPA0) && !(v & kCRST0) && !(v & kCSTALL0);
+        o[0] = en ? kM2Ok : kM2Verify;
+        break;
+    }
+    case kM2OpIpcDone: { // hda-loader.c:104-123
+        if (m2Phase != kPhaseWriting || !ipcSent || !(cs & kADSPCS_CPA0)) { o[0] = kM2Precond; o[1] = cs; break; }
+        uint32_t ms = (uint32_t)(a0 > kIpcDoneMaxMs ? kIpcDoneMaxMs : a0);
+        bool ok = poll4(kHIPCIDA, kIpcBusyDone, kIpcBusyDone, ms * 1000, &v, &el);
+        o[1] = v; o[3] = el; o[4] = r4(kHIPCIDR);
+        if (ok) {
+            // snd_sof_dsp_update_bits_forced(ipc_ack, DONE, DONE): write (v & ~DONE) | DONE = v
+            w4(kHIPCIDA, v | kIpcBusyDone);
+            o[2] = r4(kHIPCIDA);
+            m2Log("HIPCIDA ack DONE", kHIPCIDA, v, (uint32_t)o[2]);
+        } else {
+            o[2] = v;
+        }
+        o[5] = r4(kHIPCIDR);
+        o[0] = ok ? kM2Ok : kM2Timeout;
+        break;
+    }
+    case kM2OpFinish: {
+        if (m2Phase != kPhaseWriting || !(cs & kADSPCS_CPA0)) { o[0] = kM2Precond; o[1] = cs; break; }
+        m2Phase = kPhaseLeftUp;
+        m2Owner = nullptr;
+        o[1] = cs;
+        IOLog("AudShim M2: finished, core 0 left at the ROM (ADSPCS 0x%08x); undo with audctl m2 --undo\n", cs);
+        o[0] = kM2Ok;
+        break;
+    }
+    default:
+        o[0] = kM2BadOp;
+    }
+out:
+    IOLockUnlock(m2Lock);
+}
+
+// =====================================================================================  M2b
+// The Linux prerequisites that M2 (0.3.0) skipped, as separate ops (audctl picks the order, the
+// kext enforces preconditions). Linux path for RPL-P on the first boot (references are to
+// ~/xe/build/audio/linux-src):
+//   hda_dsp_probe (hda.c:803-955): pci_set_master (891), TCSEL=0 (903), hda_init_caps ->
+//     hda_dsp_ctrl_init_chip (hda.c:635 -> hda-ctrl.c:186-292), PPCTL GPROCEN+PIE (912-913)
+//   hda_dsp_pre_fw_run (hda.c:422-440): ADSPDCGE=0, EM2.L1SEN=0, ADSPPGD=1
+//   tgl run = hda_dsp_cl_boot_firmware_iccmax (tgl.c:129, hda-loader.c:276-319):
+//     ICCMAX capture stream prepared AND started (hda-stream.c:484-555, LTRP GB=95)
+//     hda_dsp_cl_boot_firmware (hda-loader.c:332-457): CL playback stream hw_params + SPIB
+//     (hda-stream.c:563-755, 187-214), then up to 3 x cl_dsp_init (hda-loader.c:66-182)
+// Deliberate deviations (documented in NOTES.md): no INTCTL/ADSPIC/HIPCCTL interrupt enables
+// (we poll; INTx is disabled during the run), no position buffer (DPLBASE), no codec/CORB/RIRB,
+// no firmware payload in the CL buffer and the CL stream is never started.
+
+static void m2bLog(const char *what, uint32_t off, uint32_t before, uint32_t after) {
+    IOLog("AudShim M2b: %s @0x%x 0x%08x -> 0x%08x\n", what, off, before, after);
+}
+
+uint32_t AudShim::r0w(uint32_t off, unsigned width) {
+    uint32_t d = r0(off & ~3u), sh = (off & 3) * 8;
+    if (width == 8) return (d >> sh) & 0xFF;
+    if (width == 16) return (d >> sh) & 0xFFFF;
+    return d;
+}
+
+// The ONLY BAR0 stores in the kext. Fixed list; everything else is refused.
+bool AudShim::w0Allowed(uint32_t off, unsigned width) {
+    if (!ppOff || !spbOff || !iss || !oss) return false;
+    uint32_t sdIc = sdBase(icIdx), sdCl = sdBase(clIdx);
+    bool inIc = off >= sdIc && off < sdIc + 0x20, inCl = off >= sdCl && off < sdCl + 0x20;
+    uint32_t rel = inIc ? off - sdIc : inCl ? off - sdCl : 0xFFFF;
+    switch (width) {
+    case 32:
+        if (off == 0x08 || off == ppOff + 0x04 || off == spbOff + 0x04 ||
+            off == spbOff + 0x08 + 0x08 * clIdx || off == 0x1030) return true;   // GCTL PPCTL SPBFCCTL SPIB EM2
+        return rel == 0x00 || rel == 0x08 || rel == 0x18 || rel == 0x1C;          // SD CTL CBL BDLPL BDLPU
+    case 16:
+        if (off == 0x0E) return true;                                            // WAKESTS/STATESTS
+        return rel == 0x0C || rel == 0x12;                                       // SD LVI, FORMAT
+    case 8:
+        if (off == 0x1048) return true;                                          // LTRP (GB byte)
+        if (off >= 0x80 && off < 0x80 + 0x20 * (iss + oss) && ((off - 0x80) & 0x1F) == 3) return true; // SD STS
+        return false;
+    }
+    return false;
+}
+
+bool AudShim::w0(uint32_t off, uint32_t v, unsigned width, const char *what) {
+    if (!map0w || !w0Allowed(off, width)) {
+        IOLog("AudShim M2b: BUG: refused BAR0 write%u to 0x%x (%s)\n", width, off, what);
+        return false;
+    }
+    uint32_t b = r0w(off, width);
+    volatile uint8_t *p = (volatile uint8_t *)(map0w->getVirtualAddress() + off);
+    if (width == 32) *(volatile uint32_t *)p = v;
+    else if (width == 16) *(volatile uint16_t *)p = (uint16_t)v;
+    else *p = (uint8_t)v;
+    m2bLog(what, off, b, r0w(off, width));
+    return true;
+}
+
+bool AudShim::poll0(uint32_t off, uint32_t mask, uint32_t want, uint32_t timeoutUs, uint32_t stepUs,
+                    uint32_t *last, uint32_t *elapsedUs) {
+    uint32_t t = 0, v = r0(off);
+    while ((v & mask) != want && t < timeoutUs) { IODelay(stepUs); t += stepUs; v = r0(off); }
+    if (last) *last = v;
+    if (elapsedUs) *elapsedUs = t;
+    return (v & mask) == want;
+}
+
+// PCI COMMAND: only bit 2 (BME) and bit 10 (INTx Disable) may change. 16-bit RMW (status at 0x06
+// is RW1C and is never written).
+bool AudShim::wcmd16(uint16_t v) {
+    uint16_t cur = pci->configRead16(kIOPCIConfigCommand);
+    if (cur == 0xFFFF || ((cur ^ v) & ~0x0404)) {
+        IOLog("AudShim M2b: BUG: refused command write 0x%04x (cur 0x%04x)\n", v, cur);
+        return false;
+    }
+    pci->configWrite16(kIOPCIConfigCommand, v);
+    uint16_t now = pci->configRead16(kIOPCIConfigCommand);
+    m2bLog("PCI COMMAND", 0x04, cur, now);
+    return now == v;
+}
+
+// Stream reset (hda-stream.c:358-395): SRST=1, wait, SRST=0, wait.
+bool AudShim::streamReset(uint32_t idx, uint32_t *rc) {
+    uint32_t sd = sdBase(idx), v, el;
+    w0(sd, (r0(sd) & 0x00FFFFFFu) | 1u, 32, "SD SRST=1");
+    bool ok1 = poll0(sd, 1, 1, 3000, 1, &v, &el);
+    w0(sd, r0(sd) & 0x00FFFFFEu, 32, "SD SRST=0");
+    IODelay(3);
+    bool ok2 = poll0(sd, 1, 0, 3000, 1, &v, &el);
+    if (!(ok1 && ok2) && rc) *rc |= 0x40;
+    return ok1 && ok2;
+}
+
+// M2b pre-checks (read-only). Locates SPIB/ML, derives the stream layout from GCAP like
+// hda_dsp_stream_init (hda-stream.c:915-1012): capture SD0..ISS-1 (tags 1..), playback after.
+// ICCMAX = first capture (SD0, tag 1), CL = first playback (SD[ISS], tag 1).
+uint32_t AudShim::m2bPrecheck(uint64_t *o) {
+    uint32_t fail = 0;
+    if (!map0) return kPcNoMap;
+    if (!spbOff) spbOff = findCap(4);
+    if (!mlOff) mlOff = findCap(2);
+    if (!ppOff) ppOff = findPP();
+    uint32_t gcap = r0(0x00) & 0xFFFF;
+    iss = (gcap >> 8) & 0xF; oss = (gcap >> 12) & 0xF;
+    icIdx = 0; clIdx = iss;
+    if (!spbOff) fail |= kPcNoSpib;
+    if (!iss || !oss || iss + oss > 30) fail |= kPcStreams;   // HDA allows up to 30 SDs (ISS 7 + OSS 9 = 16 here)
+    else {
+        for (int k = 0; k < 2; k++) {
+            uint32_t sd = sdBase(k ? clIdx : icIdx);
+            uint32_t ctl = r0(sd);
+            if ((ctl & 0x3) || r0(sd + 0x18) || r0(sd + 0x1C)) fail |= kPcStreams;   // RUN/SRST/BDL
+        }
+    }
+    o[15] = spbOff | (iss << 16) | (oss << 20) | ((uint64_t)mlOff << 32);
+    return fail;
+}
+
+void AudShim::fwFree() {
+    if (fwCmd) { fwCmd->clearMemoryDescriptor(); fwCmd->release(); fwCmd = nullptr; }
+    if (fwMd) { fwMd->complete(); fwMd->release(); fwMd = nullptr; IOLog("AudShim M3: firmware DMA buffer freed\n"); }
+    fwVa = nullptr; fwSize = fwCap = fwSegs = fwBdl = 0;
+    m2bFlags &= ~kFFw;
+}
+
+void AudShim::dmaFree() {
+    fwFree();
+    m5Free();
+    if (dmaCmd) { dmaCmd->clearMemoryDescriptor(); dmaCmd->release(); dmaCmd = nullptr; }  // completes
+    if (dmaMd) { dmaMd->complete(); dmaMd->release(); dmaMd = nullptr; IOLog("AudShim M2b: DMA buffer freed\n"); }
+    dmaVa = nullptr;
+    m2bFlags &= ~kFDma;
+}
+
+// Second half of the rollback, only once core 0 is off (or from stop()). Order: SPIB, stream
+// registers, PPCTL, LTRP, EM2, GCTL.UNSOL, BME/INTx, DMA free.
+// o[9] PPCTL after o[10] EM2 after o[11] LTRP byte after o[12] PCI cmd after o[13] SD(CL) CTL after
+// o[14] SPBFCCTL after; adds to o[5] (rc) and o[8] (writes).
+void AudShim::m2bRollback(uint64_t *o) {
+    uint32_t rc = (uint32_t)o[5], nw = (uint32_t)o[8];
+    if (map0w && ppOff && spbOff) {
+        if (r0(spbOff + 0x08 + 0x08 * clIdx) != spibSnap) {          // hda-stream.c:201-203
+            w0(spbOff + 0x08 + 0x08 * clIdx, spibSnap, 32, "rollback SPIB(CL)"); nw++;
+        }
+        if (r0(spbOff + 0x04) != spbctlSnap) { w0(spbOff + 0x04, spbctlSnap, 32, "rollback SPBFCCTL"); nw++; }
+        for (int k = 0; k < 2; k++) {
+            uint32_t idx = k ? clIdx : icIdx, sd = sdBase(idx);
+            bool touched = k ? (m2bFlags & kFCl) || r0(sd + 0x18) || r0(sd + 0x08)
+                             : (m2bFlags & (kFIcc | kFLtrp)) || r0(sd + 0x18) || r0(sd + 0x08);
+            if (!touched) continue;
+            uint32_t ctl = r0(sd);
+            if (ctl & 0x2) { w0(sd, ctl & 0x00FFFFFDu, 32, "rollback SD RUN=0"); nw++; IODelay(100); }
+            streamReset(idx, &rc); nw += 2;
+            // Back to the M1 values (all zero) explicitly, whatever SRST left.
+            if (r0(sd + 0x18)) { w0(sd + 0x18, 0, 32, "rollback SD BDLPL"); nw++; }
+            if (r0(sd + 0x1C)) { w0(sd + 0x1C, 0, 32, "rollback SD BDLPU"); nw++; }
+            if (r0(sd + 0x08)) { w0(sd + 0x08, 0, 32, "rollback SD CBL"); nw++; }
+            if (r0w(sd + 0x0C, 16)) { w0(sd + 0x0C, 0, 16, "rollback SD LVI"); nw++; }
+            if (r0w(sd + 0x12, 16)) { w0(sd + 0x12, 0, 16, "rollback SD FMT"); nw++; }
+            ctl = r0(sd);
+            if (ctl & 0x00F0001Cu) { w0(sd, ctl & 0x000FFFE3u, 32, "rollback SD tag/int-enable"); nw++; }
+            w0(sd + 3, kSdIntMask, 8, "rollback SD STS clear"); nw++;
+        }
+        if (r0(ppOff + 0x04) != ppctlSnap) { w0(ppOff + 0x04, ppctlSnap, 32, "rollback PPCTL"); nw++; }
+        if ((r0(0x1048) & 0xFF) != ltrpSnap) { w0(0x1048, ltrpSnap, 8, "rollback LTRP GB byte"); nw++; }
+        uint32_t em2 = r0(0x1030);
+        if ((em2 ^ em2Snap) & (1u << 13)) {
+            w0(0x1030, (em2 & ~(1u << 13)) | (em2Snap & (1u << 13)), 32, "rollback EM2.L1SEN"); nw++;
+        }
+        uint32_t g = r0(0x08);
+        if ((g & 1) && ((g ^ gctlSnap) & (1u << 8))) {
+            w0(0x08, (g & ~(1u << 8)) | (gctlSnap & (1u << 8)), 32, "rollback GCTL.UNSOL"); nw++;
+        }
+        if (r0(ppOff + 0x04) != ppctlSnap || (r0(0x1048) & 0xFF) != ltrpSnap) rc |= 0x100;
+    }
+    // BME/INTx back to the snapshot, only after the DMA engines are stopped (above).
+    uint16_t cmd = pci->configRead16(kIOPCIConfigCommand);
+    uint16_t want = (uint16_t)((cmd & ~0x0404) | (cmdSnap & 0x0404));
+    if (cmd != 0xFFFF && cmd != want) { if (!wcmd16(want)) rc |= 0x80; nw++; }
+    dmaFree();
+    m2bFlags = 0;
+    o[9] = ppOff ? r0(ppOff + 0x04) : 0; o[10] = r0(0x1030); o[11] = r0(0x1048) & 0xFF;
+    o[12] = pci->configRead16(kIOPCIConfigCommand); o[13] = r0(sdBase(clIdx)); o[14] = spbOff ? r0(spbOff + 0x04) : 0;
+    o[5] = rc; o[8] = nw;
+    IOLog("AudShim M2b: rollback part 2 done: PPCTL 0x%08x EM2 0x%08x LTRP 0x%02x cmd 0x%04x rc 0x%x\n",
+          (uint32_t)o[9], (uint32_t)o[10], (uint32_t)o[11], (uint32_t)o[12], rc);
+}
+
+void AudShim::m2bOp(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
+    (void)a1;
+    uint32_t cs = r4(kADSPCS), v = 0, el = 0;
+    bool coreOff = !(cs & (kSPA0 | kADSPCS_CPA0));
+    switch (op) {
+    case kM2OpM2bInfo: {   // read-only
+        if (a0 == 1) {     // DMA addresses
+            for (uint32_t i = 0; i < kDmaPages; i++) { o[1 + i] = dmaIova[i]; o[6 + i] = dmaPhys[i]; }
+            o[11] = dmaSegs; o[12] = m2bFlags; o[13] = dmaVa != nullptr;
+        } else if (a0 == 2) { // snapshots
+            o[1] = cmdSnap; o[2] = gctlSnap; o[3] = ppctlSnap; o[4] = em2Snap; o[5] = ltrpSnap;
+            o[6] = spbctlSnap; o[7] = spibSnap; o[8] = sspSnap[0]; o[9] = sspSnap[1]; o[10] = sspSnap[2];
+            o[11] = m2bMode; o[12] = m2bFlags;
+        } else {           // live registers
+            if (!map0 || mmioReady()) { o[0] = kM2Precond; break; }
+            uint64_t t[16] = {};
+            m2bPrecheck(t);
+            uint32_t sdI = sdBase(icIdx), sdC = sdBase(clIdx);
+            o[1] = m2bFlags; o[2] = r0(0x00); o[3] = iss | (oss << 8) | (icIdx << 16) | (clIdx << 24);
+            o[4] = spbOff | (ppOff << 16) | ((uint64_t)mlOff << 32); o[5] = pci->configRead16(kIOPCIConfigCommand);
+            o[6] = r0(sdI) | ((uint64_t)r0(sdI + 0x08) << 32); o[7] = r0(sdC) | ((uint64_t)r0(sdC + 0x08) << 32);
+            o[8] = r0(sdI + 0x18) | ((uint64_t)r0(sdI + 0x1C) << 32);
+            o[9] = r0(sdC + 0x0C) | ((uint64_t)r0(sdC + 0x10) << 32);   // LVI|FIFOW , FIFOS|FMT
+            o[10] = r0(sdC + 0x18) | ((uint64_t)r0(sdC + 0x1C) << 32);
+            o[11] = ppOff ? r0(ppOff + 0x04) : 0; o[12] = spbOff ? r0(spbOff + 0x04) : 0;
+            o[13] = spbOff ? r0(spbOff + 0x08 + 0x08 * clIdx) : 0; o[14] = r0(0x1030) | ((uint64_t)r0(0x08) << 32);
+            o[15] = r0(0x1048) | ((uint64_t)r0(sdI + 0x04) << 32);   // LTRP dword, ICCMAX LPIB
+        }
+        o[0] = o[0] ? o[0] : kM2Ok;
+        break;
+    }
+    case kM3OpInfo: {   // read-only: o[1] size o[2] segs o[3] BDLEs o[4] FNV-1a o[5] b0 identity b1 loaded
+                        // b2 m3Mode; o[6..15] = 5 x (BDLE addr, len | ioc << 32) starting at entry a0
+        o[1] = fwSize; o[2] = fwSegs; o[3] = fwBdl; o[4] = fwHash;
+        o[5] = (fwIdentity ? 1 : 0) | (fwMd ? 2 : 0) | (m3Mode ? 4 : 0);
+        if (dmaVa && fwBdl) {
+            volatile uint32_t *bdl = (volatile uint32_t *)(dmaVa + 0 * kPg);
+            for (uint32_t k = 0; k < 5 && a0 + k < fwBdl; k++) {
+                uint32_t e = (uint32_t)a0 + k;
+                o[6 + 2 * k] = bdl[e * 4] | ((uint64_t)bdl[e * 4 + 1] << 32);
+                o[7 + 2 * k] = bdl[e * 4 + 2] | ((uint64_t)bdl[e * 4 + 3] << 32);
+            }
+        }
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM2OpBme: {   // hda.c:891 pci_set_master; INTx Disable so no interrupt can reach the shared IRQ
+        uint16_t cmd = pci->configRead16(kIOPCIConfigCommand);
+        o[1] = cmd;
+        if (a0 == 1) {
+            m2Phase = kPhaseWriting;
+            bool ok = wcmd16((uint16_t)(cmd | 0x0404));
+            if (ok) m2bFlags |= kFBme;
+            o[0] = ok ? kM2Ok : kM2Verify;
+        } else {
+            if (map0w && (r0(sdBase(icIdx)) & 2)) { o[0] = kM2Precond; break; }   // ICCMAX still running
+            bool ok = wcmd16((uint16_t)((cmd & ~0x0404) | (cmdSnap & 0x0404)));
+            if (ok) m2bFlags &= ~kFBme;
+            o[0] = ok ? kM2Ok : kM2Verify;
+        }
+        o[2] = pci->configRead16(kIOPCIConfigCommand);
+        break;
+    }
+    case kM2OpCtrlInit: {   // hda-ctrl.c:186-292 (minus codec/RIRB/interrupt/posbuf parts)
+        if ((m2bFlags & (kFCtrl | kFIcc | kFCl)) || !coreOff) { o[0] = kM2Precond; o[1] = cs; break; }
+        m2Phase = kPhaseWriting; m2bFlags |= kFCtrl;
+        o[1] = r0(0x08); o[2] = r0(ppOff + 0x04);
+        uint8_t c48 = rcfg8(0x48);
+        if (c48 & 0x40) { wcfg8(0x48, (uint8_t)(c48 & ~0x40)); m2bLog("cfg48 MISCBDCGE=0", 0x48, c48, rcfg8(0x48)); }  // 209
+        if (r0(0x08) & 1) w0(0x0E, 0xFF, 16, "WAKESTS clear (SOF_HDA_WAKESTS_INT_MASK)");                       // 211-215
+        w0(0x08, r0(0x08) & ~1u, 32, "GCTL.CRST=0 (enter controller reset)");                                    // 218
+        bool ok1 = poll0(0x08, 1, 0, 100000, 500, &v, &el); o[3] = el;
+        IODelay(1000);                                                                                          // 224
+        w0(0x08, r0(0x08) | 1u, 32, "GCTL.CRST=1 (exit controller reset)");                                      // 227
+        bool ok2 = poll0(0x08, 1, 1, 100000, 500, &v, &el); o[4] = el;
+        IODelay(1200);                                                                                          // 232
+        if (ok2) { w0(0x08, r0(0x08) | (1u << 8), 32, "GCTL.UNSOL=1"); m2bFlags |= kFUnsol; }                    // 235
+        o[7] = r0w(0x0E, 16);                     // STATESTS after reset (bit 2 = iDisp codec)
+        if (ok2) {
+            for (uint32_t n = 0; n < iss + oss; n++) {                                                         // 250-256
+                uint32_t sts = r0w(sdBase(n) + 3, 8);
+                if (sts & kSdIntMask) w0(sdBase(n) + 3, kSdIntMask, 8, "SD STS clear");
+            }
+            if (o[7]) w0(0x0E, (uint32_t)o[7], 16, "WAKESTS clear (codec mask)");                              // 259-260
+        }
+        uint8_t n48 = rcfg8(0x48);
+        if ((n48 ^ c48) & 0x40) { wcfg8(0x48, (uint8_t)((n48 & ~0x40) | (c48 & 0x40))); m2bLog("cfg48 MISCBDCGE restore", 0x48, n48, rcfg8(0x48)); } // 286
+        o[5] = r0(0x08); o[6] = r0(ppOff + 0x04); o[8] = r0(0x1030); o[9] = r0(0x1048); o[10] = r4(kADSPCS);
+        o[11] = mlOff ? r0(mlOff + 0x40 + 0x04) : 0; o[12] = mlOff ? r0(mlOff + 0x80 + 0x04) : 0;
+        o[13] = r0(spbOff + 0x04); o[14] = r0(sdBase(clIdx));
+        o[0] = (ok1 && ok2) ? kM2Ok : kM2Timeout;
+        break;
+    }
+    case kM2OpPpcap: {   // hda.c:912-913 (GPROCEN, PIE)
+        if (!coreOff) { o[0] = kM2Precond; o[1] = cs; break; }
+        m2Phase = kPhaseWriting;
+        uint32_t b = r0(ppOff + 0x04), n = b | (1u << 30) | ((a0 & 1) ? (1u << 31) : 0);
+        o[1] = b;
+        if (n != b) w0(ppOff + 0x04, n, 32, (a0 & 1) ? "PPCTL GPROCEN|PIE" : "PPCTL GPROCEN");
+        o[2] = r0(ppOff + 0x04);
+        m2bFlags |= kFPpcap;
+        o[0] = ((uint32_t)o[2] & n) == n ? kM2Ok : kM2Verify;
+        break;
+    }
+    case kM2OpL1sen: {   // hda-ctrl.c:173-176 (pre_fw_run) and hda-stream.c:267-273 (stream get)
+        if (!coreOff) { o[0] = kM2Precond; o[1] = cs; break; }
+        m2Phase = kPhaseWriting;
+        uint32_t b = r0(0x1030);
+        o[1] = b;
+        if (b & (1u << 13)) w0(0x1030, b & ~(1u << 13), 32, "EM2.L1SEN=0");
+        o[2] = r0(0x1030);
+        m2bFlags |= kFL1;
+        o[0] = ((uint32_t)o[2] & (1u << 13)) ? kM2Verify : kM2Ok;
+        break;
+    }
+    case kM2OpDmaAlloc: {
+        if (m2bFlags & kFDma) { o[0] = kM2Precond; break; }
+        m2Phase = kPhaseWriting;
+        dmaMd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+                    kIODirectionInOut | kIOMemoryPhysicallyContiguous, kDmaPages * kPg, 0xFFFFFFFFFFFFF000ULL);
+        if (!dmaMd) { o[0] = kM2NoMem; break; }
+        IOReturn r = dmaMd->prepare();
+        if (r) { o[0] = kM2DmaErr; o[1] = (uint32_t)r; dmaMd->release(); dmaMd = nullptr; break; }
+        dmaVa = (uint8_t *)dmaMd->getBytesNoCopy();
+        if (!dmaVa) { o[0] = kM2DmaErr; dmaFree(); break; }
+        bzero(dmaVa, kDmaPages * kPg);
+        for (uint32_t i = 0; i < kDmaPages; i++) {
+            IOByteCount len = 0;
+            dmaPhys[i] = dmaMd->getPhysicalSegment(i * kPg, &len, kIOMemoryMapperNone);
+        }
+        // Device addresses through the PCI device's own VT-d context: passing the IOService as the
+        // "mapper" makes IODMACommand map in that device's IOMMU space (VT-d is on on this machine,
+        // DisableIoMapper=false). LatSOF used mapper=NULL and got bus==phys, i.e. no mapping.
+        dmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, kPg, IODMACommand::kMapped,
+                                                 0, 128, (IOMapper *)pci, nullptr);
+        if (!dmaCmd) { o[0] = kM2DmaErr; dmaFree(); break; }
+        r = dmaCmd->setMemoryDescriptor(dmaMd, false);
+        if (!r) r = dmaCmd->prepare();
+        if (r) { o[0] = kM2DmaErr; o[1] = (uint32_t)r; dmaFree(); break; }
+        m2bFlags |= kFDma;   // from here dmaFree() undoes everything
+        UInt64 off = 0, segAddr[16] = {}, segLen[16] = {};
+        uint32_t ns = 0;
+        while (off < kDmaPages * kPg && ns < 16) {
+            IODMACommand::Segment64 seg; UInt32 n = 1;
+            r = dmaCmd->gen64IOVMSegments(&off, &seg, &n);
+            if (r || n != 1) break;
+            segAddr[ns] = seg.fIOVMAddr; segLen[ns] = seg.fLength; ns++;
+        }
+        dmaSegs = ns;
+        UInt64 pos = 0; bool good = (off == kDmaPages * kPg);
+        for (uint32_t s = 0; s < ns && good; s++) {
+            if ((segAddr[s] & (kPg - 1)) || (segLen[s] % kPg)) { good = false; break; }
+            for (UInt64 q = 0; q < segLen[s] && pos / kPg < kDmaPages; q += kPg, pos += kPg)
+                dmaIova[pos / kPg] = segAddr[s] + q;
+        }
+        if (!good || pos != kDmaPages * kPg) { o[0] = kM2DmaErr; o[1] = (uint32_t)r; o[2] = ns; o[3] = off; dmaFree(); break; }
+        bool identity = true;
+        for (uint32_t i = 0; i < kDmaPages; i++) {
+            o[1 + i] = dmaIova[i]; o[6 + i] = dmaPhys[i];
+            if (dmaIova[i] != dmaPhys[i]) identity = false;
+        }
+        o[11] = ns; o[12] = identity;
+        IOLog("AudShim M2b: DMA %u pages, %u segs, iova[0] 0x%llx phys[0] 0x%llx%s\n", kDmaPages, ns,
+              dmaIova[0], dmaPhys[0], identity ? " (IDENTITY: not remapped by VT-d!)" : " (remapped)");
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM2OpIccmax: {   // hda_dsp_iccmax_stream_hw_params, hda-stream.c:484-555
+        if (!(m2bFlags & kFDma) || !(m2bFlags & kFBme) || (m2bFlags & kFIcc) || !coreOff ||
+            !(r0(ppOff + 0x04) & (1u << 30))) { o[0] = kM2Precond; o[1] = cs; o[15] = m2bFlags; break; }
+        m2Phase = kPhaseWriting;
+        uint32_t sd = sdBase(icIdx);
+        w0(sd + 0x18, 0, 32, "ICCMAX BDLPL=0"); w0(sd + 0x1C, 0, 32, "ICCMAX BDLPU=0");          // 513-518
+        volatile uint32_t *bdl = (volatile uint32_t *)(dmaVa + 1 * kPg);                          // 522 (2 x 2 KiB)
+        for (uint32_t e = 0; e < 2; e++) {
+            uint64_t a = dmaIova[4] + e * (kIcBytes / 2);
+            bdl[e * 4 + 0] = (uint32_t)a; bdl[e * 4 + 1] = (uint32_t)(a >> 32);
+            bdl[e * 4 + 2] = kIcBytes / 2; bdl[e * 4 + 3] = 1;
+        }
+        __sync_synchronize();
+        w0(sd + 0x18, (uint32_t)dmaIova[1], 32, "ICCMAX BDLPL");                                  // 529-534
+        w0(sd + 0x1C, (uint32_t)(dmaIova[1] >> 32), 32, "ICCMAX BDLPU");
+        w0(sd + 0x08, kIcBytes, 32, "ICCMAX CBL");                                                // 537-539
+        w0(sd + 0x0C, 1, 16, "ICCMAX LVI");                                                       // 542-544
+        w0(ppOff + 0x04, r0(ppOff + 0x04) | (1u << icIdx), 32, "PPCTL PROCEN(ICCMAX)");           // 547-548
+        uint8_t lt = (uint8_t)(r0(0x1048) & 0xFF);                                                // 551-552:
+        w0(0x1048, (uint8_t)((lt & ~0x3F) | kLtrpGb), 8, "LTRP GB=95 (Linux update8 semantics)"); //  (reg&~0x3F)|95
+        m2bFlags |= kFLtrp;
+        w0(sd, (r0(sd) & 0x00FFFFFFu) | 0x2, 32, "ICCMAX SD RUN=1");                              // 555-556
+        m2bFlags |= kFIcc;
+        IODelay(100);
+        o[1] = r0(sd); o[2] = r0(sd + 0x04); o[3] = r0(sd + 0x08); o[4] = r0(ppOff + 0x04); o[5] = r0(0x1048);
+        o[6] = r0(sd + 0x18) | ((uint64_t)r0(sd + 0x1C) << 32); o[7] = r0(sd + 0x0C);
+        o[0] = (o[1] & 2) ? kM2Ok : kM2Verify;
+        break;
+    }
+    case kM2OpClPrep: {   // hda_dsp_stream_hw_params hda-stream.c:563-755 + SPIB 187-214
+        // a0 = 1 (M3): the BDL describes the firmware buffer (kM3OpFwLoad), CBL = SPIB = payload size
+        bool fw = (a0 == 1);
+        if (!(m2bFlags & kFDma) || (m2bFlags & kFCl) || !coreOff || !(r0(ppOff + 0x04) & (1u << 30)) ||
+            (fw && (!m3Mode || !(m2bFlags & kFFw) || !fwSize))) {
+            o[0] = kM2Precond; o[1] = cs; o[15] = m2bFlags; break;
+        }
+        uint32_t clBytes = fw ? fwSize : kClBytes, nBdl = 2;
+        if (fw) {
+            // Build the BDL first (in memory only) so a bad layout is refused before any register write.
+            int n = fwBuildBdl((volatile uint32_t *)(dmaVa + 0 * kPg));
+            if (n < 2) { bzero(dmaVa, kPg); o[0] = kM2Verify; o[10] = (uint64_t)(int64_t)n; break; }
+            nBdl = (uint32_t)n; fwBdl = nBdl;
+        }
+        m2Phase = kPhaseWriting;
+        m2bFlags |= kFCl;   // from here rollback cleans the CL stream
+        uint32_t sd = sdBase(clIdx), rc = 0;
+        bool ok = true;
+        w0(ppOff + 0x04, r0(ppOff + 0x04) | (1u << clIdx), 32, "PPCTL PROCEN(CL) decouple");     // 591-593
+        w0(sd, r0(sd) & 0x00FFFFE1u, 32, "CL SD clear int-enable/RUN");                           // 596-598
+        ok &= poll0(sd, 2, 0, 3000, 10, &v, &el);                                                 // 600-604
+        w0(sd + 3, kSdIntMask, 8, "CL SD STS clear");                                             // 619-622
+        ok &= streamReset(clIdx, &rc);                                                            // 625
+        w0(sd + 0x18, 0, 32, "CL BDLPL=0"); w0(sd + 0x1C, 0, 32, "CL BDLPU=0");                   // 633-638
+        w0(sd, r0(sd) & 0x00FFFFE1u, 32, "CL SD clear int-enable/RUN");                           // 641-643
+        ok &= poll0(sd, 2, 0, 3000, 10, &v, &el);
+        w0(sd + 3, kSdIntMask, 8, "CL SD STS clear");                                             // 661-664
+        if (!fw) {
+            volatile uint32_t *bdl = (volatile uint32_t *)(dmaVa + 0 * kPg);                      // 668: 2 x 4 KiB
+            for (uint32_t e = 0; e < 2; e++) {
+                uint64_t a = dmaIova[2 + e];
+                bdl[e * 4 + 0] = (uint32_t)a; bdl[e * 4 + 1] = (uint32_t)(a >> 32);
+                bdl[e * 4 + 2] = kPg; bdl[e * 4 + 3] = 1;
+            }
+        }                                                                                         // fw: built above
+        __sync_synchronize();
+        w0(sd, (r0(sd) & 0x000FFFFFu) | (kClTag << 20), 32, "CL SD stream tag=1");               // 675-678
+        w0(sd + 0x08, clBytes, 32, fw ? "CL CBL=firmware size" : "CL CBL");                       // 681-683
+        w0(sd + 0x12, kClFmt, 16, "CL FORMAT=0x40");                                              // 703-706
+        w0(sd + 0x0C, nBdl - 1, 16, "CL LVI=frags-1");                                            // 714-716
+        w0(sd + 0x18, (uint32_t)dmaIova[0], 32, "CL BDLPL");                                      // 719-724
+        w0(sd + 0x1C, (uint32_t)(dmaIova[0] >> 32), 32, "CL BDLPU");
+        w0(sd, (r0(sd) & 0x00FFFFFFu) | kSdIntMask, 32, "CL SD int-enable bits");                 // 738-740
+        o[8] = r0w(sd + 0x10, 16);                                                                // FIFOS 743-749
+        w0(spbOff + 0x04, r0(spbOff + 0x04) | (1u << clIdx), 32, "SPBFCCTL enable(CL)");          // 206-208
+        w0(spbOff + 0x08 + 0x08 * clIdx, clBytes, 32, "SPIB(CL)=size");                           // 211-212
+        o[1] = r0(sd); o[2] = r0(sd + 0x08); o[3] = r0(sd + 0x0C); o[4] = r0(sd + 0x10);
+        o[5] = r0(sd + 0x18) | ((uint64_t)r0(sd + 0x1C) << 32); o[6] = r0(ppOff + 0x04);
+        o[7] = r0(spbOff + 0x04) | ((uint64_t)r0(spbOff + 0x08 + 0x08 * clIdx) << 32);
+        o[9] = rc; o[10] = nBdl; o[11] = clBytes;
+        bool verify = ((o[1] >> 20) & 0xF) == kClTag && !(o[1] & 3) && o[2] == clBytes &&
+                      ((o[4] >> 16) & 0xFFFF) == kClFmt && (o[3] & 0xFFFF) == nBdl - 1 &&
+                      (uint32_t)(o[7] >> 32) == clBytes;
+        o[0] = !ok ? kM2Timeout : verify ? kM2Ok : kM2Verify;
+        break;
+    }
+    case kM2OpSsp: {   // hda_ssp_set_cbp_cfp hda-loader.c:34-49 (CNL_SSP_BASE_OFFSET 0x10000, 3 SSPs)
+        if (!(cs & kADSPCS_CPA0) || !(cs & kCRST0) || (m2bFlags & kFSsp) || ipcSent) { o[0] = kM2Precond; o[1] = cs; break; }
+        for (uint32_t i = 0; i < 3; i++) {
+            uint32_t off = 0x10000 + i * 0x1000 + 0x4;
+            sspSnap[i] = r4(off);
+        }
+        m2bFlags |= kFSsp;
+        bool real = (a0 == 1);
+        for (uint32_t i = 0; i < 3; i++) {
+            uint32_t off = 0x10000 + i * 0x1000 + 0x4, b = sspSnap[i];
+            if (real) {
+                sspWriteOk = true; w4(off, b | 0x03000000u); sspWriteOk = false; sspWritten = true;
+                m2Log("SSP SSC1 |= CBP_CFP", off, b, r4(off));
+            }
+            o[1 + i] = b; o[4 + i] = r4(off);
+        }
+        o[7] = real;
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM2OpCoreOff: {   // hda_dsp_core_reset_power_down(core 0), hda-dsp.c:376-415
+        if (!(cs & (kSPA0 | kADSPCS_CPA0))) { o[0] = kM2Precond; o[1] = cs; break; }
+        o[1] = cs;
+        uint32_t ida = r4(kHIPCIDA);
+        if (ipcSent && (ida & kIpcBusyDone)) w4(kHIPCIDA, ida | kIpcBusyDone);
+        uint32_t c = r4(kADSPCS);
+        w4(kADSPCS, c | kCSTALL0); m2Log("core-off CSTALL0=1", kADSPCS, c, r4(kADSPCS));
+        c = r4(kADSPCS);
+        w4(kADSPCS, c | kCRST0);
+        bool ok1 = poll4(kADSPCS, kCRST0, kCRST0, kResetTimeoutUs, &v, &el);
+        m2Log("core-off CRST0=1", kADSPCS, c, v);
+        c = r4(kADSPCS);
+        w4(kADSPCS, c & ~kSPA0);
+        bool ok2 = poll4(kADSPCS, kADSPCS_CPA0, 0, kPdTimeoutUs, &v, &el);
+        m2Log("core-off SPA0=0", kADSPCS, c, v);
+        ipcSent = false;
+        m2bFlags &= ~kFSsp;   // SSP registers lose their value with the DSP power
+        o[2] = r4(kADSPCS); o[3] = r4(kHIPCIDR); o[4] = r4(kHIPCIDA);
+        o[0] = (ok1 && ok2) ? kM2Ok : kM2Timeout;
+        break;
+    }
+    default:
+        o[0] = kM2BadOp;
+    }
+}
+
+// =====================================================================================  M3
+// Firmware download over the code-loader DMA and the first message from the firmware. Linux path
+// (RPL-P, IPC3, first boot), continuing after cl_dsp_init returned INIT_DONE:
+//   hda_dsp_cl_boot_firmware (hda-loader.c:340-483): the CL stream was prepared with
+//     size = fw->size - payload_offset (375-379) and the payload copied in (391-395);
+//   hda_cl_copy_fw (228-274): hda_cl_trigger START (237 -> 185-215: INTCTL SIE, CTL |= RUN|IOCE|
+//     FEIE|DEIE), poll ROM status == FW_ENTERED for HDA_DSP_BASEFW_TIMEOUT_US (245-249),
+//     hda_cl_trigger STOP (264 -> hda-stream.c:397-482: CTL &= ~(RUN|INT), poll RUN=0 300 us,
+//     STS = INT_MASK, INTCTL SIE off);
+//   hda_cl_cleanup (461 -> hda-stream.c:1333-1375): SPIB=0 + SPBFCCTL bit off, stream put,
+//     BDLPL/BDLPU = 0, CTL = 0;
+//   iccmax cleanup (305-306 -> same function, capture: CTL &= ~RUN, put -> EM2.L1SEN=1 because no
+//     L1-incompatible stream remains, hda-stream.c:314-326), LTRP GB restored (316-317);
+//   snd_sof_run_firmware (loader.c:150-178): wait boot_timeout (2000 ms) for FW_READY, which
+//     arrives as HIPCTDR.BUSY (cnl.c:154); sof_ipc3_rx_msg reads the header from dsp_box =
+//     HDA_DSP_MBOX_UPLINK_OFFSET 0x81000 (hda.c:916, hda-ipc.c:404-408, ipc3.c:1049-1075), and
+//     ipc3_fw_ready (ipc3.c:817-858) reads struct sof_ipc_fw_ready there + the ext data after it;
+//     cnl_ipc_host_done (cnl.c:184 -> 201-216) acks;
+//   post_fw_run (hda.c:443-472): SoundWire startup (not done here) + clock/power gating back on.
+// Deviations: INTCTL SIE is not touched (INTx is disabled and nothing is interrupt driven); the
+// fw_ready mailbox read and the version/ABI check are done by audctl; no SoundWire startup.
+
+// Contiguous bytes of the firmware buffer starting at off (snd_sgbuf_get_chunk_size semantics).
+uint32_t AudShim::fwChunk(uint32_t off, uint64_t *addr) {
+    uint32_t start = 0;
+    for (uint32_t k = 0; k < fwSegs; k++) {
+        if (off < start + fwSegLen[k]) {
+            *addr = fwSegAddr[k] + (off - start);
+            return start + fwSegLen[k] - off;
+        }
+        start += fwSegLen[k];
+    }
+    *addr = 0;
+    return 0;
+}
+
+// hda_dsp_stream_setup_bdl + hda_setup_bdle (hda-stream.c:64-185) for the code loader:
+// period_bytes = 0 -> one period of bufsize, or two halves if the buffer is one contiguous chunk
+// (HDA needs LVI >= 1); one BDLE per contiguous chunk; IOC only on the last BDLE of a full period
+// (tgl: no_ipc_position = 1, no_period_wakeup = 0); bus->align_bdle_4k is not set for SOF.
+// Returns the number of BDLEs, or < 0 on error (-1 too many entries, -2 hole/misalignment).
+int AudShim::fwBuildBdl(volatile uint32_t *bdl) {
+    uint32_t size = fwSize;
+    uint64_t a;
+    uint32_t chunk0 = fwChunk(0, &a);
+    uint32_t period = size;
+    if (chunk0 >= size) period = size / 2;                                       // 136-146
+    if (!period) return -2;
+    uint32_t periods = size / period, remain = size % period;                     // 148-153
+    if (remain) periods++;
+    uint32_t off = 0, n = 0;
+    for (uint32_t i = 0; i < periods; i++) {                                      // 168-181
+        bool last = (i == periods - 1) && remain;
+        uint32_t left = last ? remain : period;
+        uint32_t ioc = last ? 0 : 1;
+        while (left > 0) {                                                        // 72-101
+            if (n >= kFwMaxBdl) return -1;
+            uint32_t chunk = fwChunk(off, &a);
+            if (!chunk || (a & 0x7F)) return -2;   // BDLE address must be 128-byte aligned (HDA spec)
+            if (chunk > left) chunk = left;
+            bdl[n * 4 + 0] = (uint32_t)a;
+            bdl[n * 4 + 1] = (uint32_t)(a >> 32);
+            bdl[n * 4 + 2] = chunk;
+            left -= chunk;
+            bdl[n * 4 + 3] = (left || !ioc) ? 0 : 1;
+            n++;
+            off += chunk;
+        }
+    }
+    return (int)n;
+}
+
+void AudShim::m3Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
+    uint32_t cs = r4(kADSPCS), v = 0, el = 0;
+    bool coreOff = !(cs & (kSPA0 | kADSPCS_CPA0));
+    bool cpa0 = (cs & kADSPCS_CPA0) != 0;
+    switch (op) {
+    case kM3OpFwLoad: {
+        // a0 = user virtual address of the payload in the calling (armed) process, a1 = its length.
+        // Linux equivalent: snd_dma_alloc_pages(SNDRV_DMA_TYPE_DEV_SG) (hda-stream.c:1282) + memcpy
+        // (hda-loader.c:391-395).
+        uint32_t len = (uint32_t)a1;
+        if (!(m2bFlags & kFDma) || (m2bFlags & (kFFw | kFCl)) || !coreOff || a1 > kFwMax || len < kPg ||
+            (len & 3) || !a0) {
+            o[0] = kM2Precond; o[1] = cs; o[2] = a1; o[15] = m2bFlags; break;
+        }
+        m2Phase = kPhaseWriting;
+        fwCap = (len + kPg - 1) & ~(kPg - 1);
+        // Page-aligned, below 4 GiB (BDL entries are written 64-bit, but < 4 GiB keeps every
+        // address valid whatever GCAP.64OK says), NOT physically contiguous.
+        fwMd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut, fwCap,
+                                                                0x00000000FFFFF000ULL);
+        if (!fwMd) { o[0] = kM2NoMem; fwCap = 0; break; }
+        IOReturn r = fwMd->prepare();
+        if (r) { o[0] = kM2DmaErr; o[1] = (uint32_t)r; fwMd->release(); fwMd = nullptr; fwCap = 0; break; }
+        m2bFlags |= kFFw;   // from here fwFree() undoes everything
+        fwVa = (uint8_t *)fwMd->getBytesNoCopy();
+        if (!fwVa) { o[0] = kM2DmaErr; o[1] = 1; fwFree(); break; }
+        bzero(fwVa, fwCap);
+        // copy from the caller's address space
+        IOMemoryDescriptor *um = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)a0, len,
+                                                                     kIODirectionOut, current_task());
+        IOByteCount got = 0;
+        if (!um) { o[0] = kM2DmaErr; o[1] = 2; fwFree(); break; }
+        r = um->prepare(kIODirectionOut);
+        if (!r) { got = um->readBytes(0, fwVa, len); um->complete(kIODirectionOut); }
+        um->release();
+        if (r || got != len) { o[0] = kM2DmaErr; o[1] = r ? (uint32_t)r : 3; o[2] = got; fwFree(); break; }
+        uint32_t first = *(uint32_t *)fwVa;
+        if (first != kCpdMagic) {   // the payload after the SOF extended manifest is the CSE "$CPD" image
+            o[0] = kM2Verify; o[1] = first; fwFree(); break;
+        }
+        uint32_t h = 2166136261u;   // FNV-1a 32 over the copied payload (audctl compares)
+        for (uint32_t i = 0; i < len; i++) { h ^= fwVa[i]; h *= 16777619u; }
+        fwHash = h; fwSize = len;
+        // Device addresses through the PCI device's mapper, as in kM2OpDmaAlloc; no segment size
+        // limit (one BDLE per contiguous chunk, like Linux SG buffers).
+        fwCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped,
+                                                0, 128, (IOMapper *)pci, nullptr);
+        if (!fwCmd) { o[0] = kM2DmaErr; o[1] = 4; fwFree(); break; }
+        r = fwCmd->setMemoryDescriptor(fwMd, false);
+        if (!r) r = fwCmd->prepare();
+        if (r) { o[0] = kM2DmaErr; o[1] = (uint32_t)r; fwFree(); break; }
+        UInt64 off = 0;
+        uint32_t ns = 0, minL = 0xFFFFFFFFu, maxL = 0;
+        bool ident = true;
+        while (off < fwCap && ns < kFwMaxBdl) {
+            IODMACommand::Segment64 seg; UInt32 n = 1;
+            UInt64 segOff = off;
+            r = fwCmd->gen64IOVMSegments(&off, &seg, &n);
+            if (r || n != 1 || !seg.fLength) break;
+            fwSegAddr[ns] = seg.fIOVMAddr; fwSegLen[ns] = (uint32_t)seg.fLength;
+            IOByteCount pl = 0;
+            if (fwMd->getPhysicalSegment(segOff, &pl, kIOMemoryMapperNone) != seg.fIOVMAddr) ident = false;
+            if (fwSegLen[ns] < minL) minL = fwSegLen[ns];
+            if (fwSegLen[ns] > maxL) maxL = fwSegLen[ns];
+            ns++;
+        }
+        fwSegs = ns; fwIdentity = ident;
+        if (off != fwCap) { o[0] = kM2DmaErr; o[1] = (uint32_t)r; o[2] = ns; o[3] = off; fwFree(); break; }
+        o[1] = len; o[2] = ns; o[3] = fwSegAddr[0]; o[4] = fwMd->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+        o[5] = ident; o[6] = fwHash; o[7] = first; o[8] = fwCap; o[9] = maxL; o[10] = minL;
+        IOLog("AudShim M3: firmware payload %u bytes copied (FNV-1a 0x%08x), %u DMA segment(s) [%u..%u bytes], "
+              "seg0 0x%llx%s\n", len, fwHash, ns, minL, maxL, fwSegAddr[0], ident ? " (IOVA == phys)" : " (remapped)");
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM3OpClStart: {   // hda_cl_trigger START, hda-loader.c:194-211
+        uint32_t rs = cpa0 ? r4(kSram0) : 0xFFFFFFFFu;
+        if (!(m2bFlags & kFFw) || !(m2bFlags & kFCl) || !fwBdl || (m2bFlags & (kFClRun | kFClDone)) ||
+            !cpa0 || !ipcSent || (rs & 0xFFFFFF) != 1 || (r4(kHIPCIDR) & kIpcBusyDone)) {
+            o[0] = kM2Precond; o[1] = cs; o[5] = rs; o[15] = m2bFlags; break;
+        }
+        uint32_t sd = sdBase(clIdx), b = r0(sd);
+        o[1] = b; o[5] = rs; o[6] = r0(sd + 0x04);
+        // (INTCTL |= SIE(CL), hda-loader.c:199-201, deliberately not written: no interrupts used)
+        w0(sd, (b & 0x00FFFFFFu) | 0x2u | kSdIntMask, 32, "CL SD RUN=1|IOCE|FEIE|DEIE (hda_cl_trigger START)");
+        m2bFlags |= kFClRun;   // rollback stops it whatever happens next
+        bool ok = poll0(sd, 2, 2, kStreamRunTimeoutUs, 10, &v, &el);
+        o[2] = r0(sd); o[3] = el; o[4] = r0(sd + 0x04);
+        o[0] = ok ? kM2Ok : kM2Timeout;
+        break;
+    }
+    case kM3OpClStop: {   // hda_cl_trigger STOP + hda_cl_cleanup + iccmax cleanup + LTRP
+        if (!(m2bFlags & kFClRun)) { o[0] = kM2Precond; o[15] = m2bFlags; break; }
+        uint32_t sd = sdBase(clIdx), rc = 0;
+        o[2] = r0(sd + 0x04);                     // LPIB when stopping (bytes the DMA has read)
+        o[10] = r0w(sd + 3, 8);                   // SD STS before the clear (BCIS/FIFOE/DESE)
+        // hda_dsp_stream_trigger STOP (hda-stream.c:463-480)
+        w0(sd, r0(sd) & 0x00FFFFE1u, 32, "CL SD RUN=0, int-enable off (hda_cl_trigger STOP)");
+        bool stopped = poll0(sd, 2, 0, kStreamRunTimeoutUs, 10, &v, &el);
+        if (stopped) {
+            w0(sd + 3, kSdIntMask, 8, "CL SD STS clear");
+            m2bFlags &= ~kFClRun;
+        } else rc |= 1;
+        o[1] = r0(sd);
+        // hda_data_stream_cleanup(is_iccmax=false) (hda-stream.c:1333-1375)
+        w0(spbOff + 0x08 + 0x08 * clIdx, 0, 32, "SPIB(CL)=0 (spib_config disable)");          // 201-203
+        w0(spbOff + 0x04, r0(spbOff + 0x04) & ~(1u << clIdx), 32, "SPBFCCTL disable(CL)");     // 206-208
+        w0(sd + 0x18, 0, 32, "CL BDLPL=0"); w0(sd + 0x1C, 0, 32, "CL BDLPU=0");                // 1355-1358
+        w0(sd, 0, 32, "CL SD CTL=0");                                                           // 1360
+        o[3] = r0(spbOff + 0x04); o[4] = r0(spbOff + 0x08 + 0x08 * clIdx); o[5] = r0(sd);
+        // iccmax cleanup (hda-loader.c:305-306 -> hda-stream.c:1345-1360, capture direction)
+        if (m2bFlags & kFIcc) {
+            uint32_t si = sdBase(icIdx);
+            w0(si, r0(si) & 0x00FFFFFDu, 32, "ICCMAX SD RUN=0 (cleanup)");                     // 1345-1347
+            if (!poll0(si, 2, 0, kStreamRunTimeoutUs, 10, &v, &el)) rc |= 2;   // read-only wait (log)
+            if (m2bFlags & kFL1) {   // stream put: last L1-incompatible stream closed (hda-stream.c:320-326)
+                uint32_t em2 = r0(0x1030);
+                if (!(em2 & (1u << 13))) w0(0x1030, em2 | (1u << 13), 32, "EM2.L1SEN=1 (stream put)");
+            }
+            w0(si + 0x18, 0, 32, "ICCMAX BDLPL=0"); w0(si + 0x1C, 0, 32, "ICCMAX BDLPU=0");
+            w0(si, 0, 32, "ICCMAX SD CTL=0");
+            m2bFlags &= ~kFIcc;
+            o[6] = r0(si);
+        }
+        if (m2bFlags & kFLtrp) {   // snd_sof_dsp_update8(LTRP, GB_MASK 0x3f, original_gb) hda-loader.c:316-317
+            uint8_t lt = (uint8_t)(r0(0x1048) & 0xFF);
+            uint8_t nl = (uint8_t)((lt & ~0x3F) | (ltrpSnap & 0x3F));
+            if (nl != lt) w0(0x1048, nl, 8, "LTRP GB restore (Linux update8: bits 5:0 only)");
+            // kFLtrp stays set: the full rollback restores the exact BIOS byte later
+        }
+        o[7] = r0(0x1030); o[8] = r0(0x1048); o[9] = rc;
+        // The firmware buffer is no longer referenced by any BDL once the CL stream is stopped and
+        // its BDL pointer cleared; free it now (Linux keeps it for IMR/D3 re-boots, not needed here).
+        if (stopped) { fwFree(); o[11] = 1; }
+        m2bFlags |= kFClDone;
+        o[0] = stopped ? (rc ? kM2Verify : kM2Ok) : kM2Timeout;
+        break;
+    }
+    case kM3OpFwReady: {   // read-only poll for the first DSP->host message
+        if (!cpa0) { o[0] = kM2Precond; o[1] = cs; break; }
+        uint32_t ms = (uint32_t)(a0 > kBootTimeoutMaxMs ? kBootTimeoutMaxMs : a0), t = 0, fl = 0;
+        uint64_t t0 = nowUs();
+        v = r4(kHIPCTDR);
+        while (!(v & kIpcBusyDone) && t < ms * 1000) {
+            pollStep(t);
+            t = (uint32_t)(nowUs() - t0);
+            if (!(r4(kADSPCS) & kADSPCS_CPA0)) { fl |= 2; break; }
+            v = r4(kHIPCTDR);
+        }
+        bool p = (r4(kADSPCS) & kADSPCS_CPA0) != 0;
+        o[1] = v; o[2] = r4(kHIPCTDD); o[3] = t; o[4] = r4(kHIPCTDA); o[5] = r4(kHIPCIDR); o[6] = r4(kHIPCIDA);
+        o[7] = p ? r4(kSram0) : 0xFFFFFFFFu; o[8] = p ? r4(kSram0 + 4) : 0xFFFFFFFFu; o[9] = r4(kADSPCS);
+        o[10] = r4(0x0C); o[11] = fl;
+        if (v & kIpcBusyDone)
+            IOLog("AudShim M3: DSP->host message after %u us: HIPCTDR 0x%08x HIPCTDD 0x%08x\n", t, v, (uint32_t)o[2]);
+        o[0] = (v & kIpcBusyDone) ? kM2Ok : kM2Timeout;
+        break;
+    }
+    case kM3OpTdAck: {   // cnl_ipc_host_done, cnl.c:201-216 (update_bits_forced = read, OR, write)
+        uint32_t tdr = r4(kHIPCTDR);
+        if (!cpa0 || !(tdr & kIpcBusyDone)) { o[0] = kM2Precond; o[1] = tdr; break; }
+        w4(kHIPCTDR, tdr | kIpcBusyDone);
+        m2Log("HIPCTDR |= BUSY (clear, cnl_ipc_host_done)", kHIPCTDR, tdr, r4(kHIPCTDR));
+        uint32_t tda = r4(kHIPCTDA);
+        w4(kHIPCTDA, tda | kIpcBusyDone);
+        m2Log("HIPCTDA |= DONE (cnl_ipc_host_done)", kHIPCTDA, tda, r4(kHIPCTDA));
+        o[1] = tdr; o[2] = r4(kHIPCTDR); o[3] = tda; o[4] = r4(kHIPCTDA);
+        m2bFlags |= kFFwAck;
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM3OpPostFwRun: {   // hda_dsp_ctrl_clock_power_gating(enable=true), hda-ctrl.c:163-184
+        if (!cpa0 || !(m2bFlags & kFClDone) || (m2bFlags & kFPost)) { o[0] = kM2Precond; o[1] = cs; break; }
+        uint8_t c48 = rcfg8(0x48), c44 = rcfg8(0x44);
+        if (!(c48 & kADSPDCGE)) { wcfg8(0x48, (uint8_t)(c48 | kADSPDCGE)); m2Log("post_fw_run cfg48 ADSPDCGE=1", 0x48, c48, rcfg8(0x48)); }
+        uint32_t em2 = r0(0x1030);
+        if (!(em2 & (1u << 13))) w0(0x1030, em2 | (1u << 13), 32, "post_fw_run EM2.L1SEN=1");
+        if (c44 & kADSPPGD) { wcfg8(0x44, (uint8_t)(c44 & ~kADSPPGD)); m2Log("post_fw_run cfg44 ADSPPGD=0", 0x44, c44, rcfg8(0x44)); }
+        m2bFlags |= kFPost;
+        o[1] = ((uint32_t)c48 << 8) | rcfg8(0x48); o[2] = r0(0x1030); o[3] = ((uint32_t)c44 << 8) | rcfg8(0x44);
+        o[4] = r4(kADSPCS);
+        o[0] = kM2Ok;
+        break;
+    }
+    default:
+        o[0] = kM2BadOp;
+    }
+    (void)a1;
+}
+
+// =====================================================================================  M4
+// SoundWire link power-up, Cadence master start and enumeration support. Linux path on the first
+// boot of RPL-P (references to ~/xe/build/audio/linux-src):
+//   hda_dsp_post_fw_run (hda.c:443-472) -> hda_sdw_startup (hda.c:231-250): LCAP.LCOUNT >= ACPI count
+//   (hda-dsp.c:1262-1283) -> sdw_intel_startup -> for each link in link_mask (0xF here):
+//   intel_link_startup (intel_auxdevice.c:383-487): multi_link = true (md_flags 0, 402-414),
+//     sdw_intel_link_power_up = intel_link_power_up (intel.c:337-449): first link only: SYNC =
+//       SYNCPRD 9599 | SYNCCPU, LCTL |= SPA(link_mask), wait CPA(link_mask), wait SYNCCPU = 0; then
+//       intel_shim_init(link) (intel.c:258-289);
+//     sdw_intel_register_dai (reads PCMSCAP/PCMSyCHC only);
+//     sdw_intel_start_bus = intel_start_bus (intel_bus_common.c:12-73).
+//   No IPC is sent before or during this (loader.c:150-171; the first host IPCs come later).
+// Deviations: no ADSPIC2.SNDW enable (hda_sdw_int_enable, hda.c:468): the Cadence interrupt masks are
+// programmed exactly as Linux does but nothing is delivered; responses and slave status are polled.
+
+static void m4Log(const char *what, uint32_t off, uint32_t before, uint32_t after) {
+    IOLog("AudShim M4: %s @0x%x 0x%08x -> 0x%08x\n", what, off, before, after);
+}
+
+// The M4 store whitelist (checked by w4 for 32-bit and w4h for 16-bit stores).
+bool AudShim::m4Allowed(uint32_t off, unsigned width) {
+    if (width == 32) {
+        if (off == kSdwLCTL || off == kSdwSYNC) return true;
+        if (off < kSdwLink0 || off >= kSdwLink0 + kSdwLinks * kSdwLinkSz || (off & 3)) return false;
+        uint32_t l = (off - kSdwLink0) / kSdwLinkSz, rel = (off - kSdwLink0) % kSdwLinkSz;
+        if (!m4LinkPowered(l)) return false;   // never write a power-gated Cadence IP
+        switch (rel) {
+        case kCdCONFIG: case kCdCONTROL: case kCdFSINIT: case kCdCFGUPD: case kCdSSP0: case kCdSSP1:
+        case kCdCLK0: case kCdCLK1: case kCdINTSTAT: case kCdINTMASK: case kCdSLVINT0: case kCdSLVINT1:
+        case kCdSLVMSK0: case kCdSLVMSK1: case kCdFIFOLVL:
+            return true;
+        }
+        return rel >= kCdCMD && rel < kCdCMD + 8 * 4;   // command FIFO, 8 words (CDNS_MCP_CMD_LEN)
+    }
+    if (width == 16) {
+        if (off == kSdwWAKEEN || off == kSdwWAKESTS) return true;
+        for (uint32_t l = 0; l < kSdwLinks; l++)
+            if (off == sdwIoctl(l) || off == sdwCtmctl(l)) return true;
+    }
+    return false;
+}
+
+bool AudShim::w4h(uint32_t off, uint16_t v) {
+    if (!map4w || !m4Mode || (!m4Allowed(off, 16) && !(m5Mode && m5Allowed(off, 16)))) {
+        IOLog("AudShim M4: BUG: refused BAR4 write16 to 0x%x\n", off);
+        return false;
+    }
+    *(volatile uint16_t *)(map4w->getVirtualAddress() + off) = v;
+    return true;
+}
+
+// intel_wait_bit / cdns_set_wait (intel.c:23-38, cadence_master.c:241-257): 10 reads, sleeping
+// usleep_range(50, 100) between them. We use the upper bound, 100 us.
+bool AudShim::m4Wait(uint32_t off, uint32_t mask, uint32_t want, uint32_t *last, uint32_t *elapsedUs) {
+    uint32_t v = 0, t = 0;
+    for (int i = 0; i < 10; i++) {
+        v = r4(off);
+        if ((v & mask) == want) break;
+        if (i == 9) break;
+        IODelay(100); t += 100;
+    }
+    if (last) *last = v;
+    if (elapsedUs) *elapsedUs = t;
+    return (v & mask) == want;
+}
+
+// cdns_updatel (cadence_master.c:225-233), logged
+void AudShim::cdnsUpdate(uint32_t l, uint32_t reg, uint32_t mask, uint32_t val, const char *what) {
+    uint32_t off = cdnsBase(l) + reg, b = r4(off);
+    w4(off, (b & ~mask) | val);
+    m4Log(what, off, b, r4(off));
+}
+
+// cdns_config_update (cadence_master.c:271-290): refuse in clock-stop, write CONFIG_UPDATE, wait for
+// the bit to self-clear (cdns_clear_bit 259-265).
+bool AudShim::cdnsConfigUpdate(uint32_t l, uint32_t *last, uint32_t *el) {
+    uint32_t b = cdnsBase(l);
+    if (r4(b + kCdSTAT) & kStatCLKSTOP) { if (last) *last = r4(b + kCdSTAT); if (el) *el = 0; return false; }
+    w4(b + kCdCFGUPD, 1);
+    bool ok = m4Wait(b + kCdCFGUPD, 1, 0, last, el);
+    m4Log(ok ? "CONFIG_UPDATE=1, self-cleared" : "CONFIG_UPDATE=1, NOT cleared", b + kCdCFGUPD, 1, r4(b + kCdCFGUPD));
+    return ok;
+}
+
+// intel_stop_bus(clock_stop = false) for every link that was started, in link order like
+// sdw_intel_exit/intel_link_remove, then the last-link LCTL power down (intel.c:451-498) and
+// intel_shim_wake(false) (intel.c:302-326). Only touches registers while the DSP core (and so the
+// shim) is powered. o[15] = writes | rc << 16; rc b0 CPA did not drop, b1 DSP unpowered: skipped.
+void AudShim::m4Rollback(uint64_t *o) {
+    uint32_t nw = 0, rc = 0, v, el;
+    if (!m4ShimMask && !(m4Flags & kF4Power)) { o[15] = 0; return; }
+    if (!(r4(kADSPCS) & kADSPCS_CPA0)) {
+        rc |= 2;   // shim already unpowered together with the DSP: nothing left to stop
+    } else {
+        IOLog("AudShim M4: rollback SoundWire: shim_mask 0x%x LCTL 0x%08x SYNC 0x%08x\n", m4ShimMask,
+              r4(kSdwLCTL), r4(kSdwSYNC));
+        for (uint32_t l = 0; l < kSdwLinks; l++) {
+            if (!(m4ShimMask & (1u << l))) continue;
+            uint32_t b = cdnsBase(l);
+            if (m4LinkPowered(l) && m4Step[l] >= kLShim) {
+                // sdw_cdns_enable_interrupt(false) (cadence_master.c:1209-1270): masks to 0
+                if (r4(b + kCdSLVMSK0)) { w4(b + kCdSLVMSK0, 0); nw++; }
+                if (r4(b + kCdSLVMSK1)) { w4(b + kCdSLVMSK1, 0); nw++; }
+                if (r4(b + kCdINTMASK)) { uint32_t m = r4(b + kCdINTMASK); w4(b + kCdINTMASK, 0); nw++;
+                                          m4Log("rollback INTMASK=0", b + kCdINTMASK, m, r4(b + kCdINTMASK)); }
+            }
+            // intel_shim_master_ip_to_glue (intel.c:237-255)
+            if (m4LinkPowered(l)) {
+                uint16_t io = r4h(sdwIoctl(l)), n = (uint16_t)(io | kIoBKE | kIoCOE);
+                w4h(sdwIoctl(l), n); IODelay(15); nw++;
+                n = (uint16_t)(n & ~kIoMIF);
+                w4h(sdwIoctl(l), n); IODelay(15); nw++;
+                m4Log("rollback IOCTL master IP -> glue (BKE|COE, MIF=0)", sdwIoctl(l), io, r4h(sdwIoctl(l)));
+            }
+            m4ShimMask &= ~(1u << l);
+            m4Step[l] = kL0;
+        }
+        // last link: LCTL &= ~SPA(link_mask), wait CPA(link_mask) = 0 (intel.c:471-492)
+        uint32_t lc = r4(kSdwLCTL), mask = m4LinkMask ? m4LinkMask : ((lc & 0xF) | ((lc >> 8) & 0xF));
+        if (lc & ((mask & 0xF) | ((mask & 0xF) << 8))) {
+            w4(kSdwLCTL, lc & ~(mask & 0xF)); nw++;
+            if (!m4Wait(kSdwLCTL, (mask & 0xF) << 8, 0, &v, &el)) {
+                // allow the PCH more time than Linux before declaring failure (bounded: 50 ms)
+                uint32_t t = 0;
+                while (((v = r4(kSdwLCTL)) & ((mask & 0xF) << 8)) && t < 50000) { IODelay(500); t += 500; }
+                if (v & ((mask & 0xF) << 8)) rc |= 1;
+            }
+            m4Log("rollback LCTL SPA=0 (link power down)", kSdwLCTL, lc, r4(kSdwLCTL));
+        }
+        // intel_shim_wake(false) per link: WAKEEN &= ~bit, WAKESTS |= bit (w1c) (intel.c:316-323)
+        uint16_t we = r4h(kSdwWAKEEN), ws = r4h(kSdwWAKESTS);
+        w4h(kSdwWAKEEN, (uint16_t)(we & ~(mask & 0xF))); nw++;
+        w4h(kSdwWAKESTS, (uint16_t)(ws | (mask & 0xF))); nw++;
+        m4Log("rollback WAKEEN/WAKESTS", kSdwWAKEEN, (uint32_t)we | ((uint32_t)ws << 16), r4(kSdwWAKEEN));
+    }
+    m4Flags = 0; m4ShimMask = 0; m4LinkMask = 0;
+    for (uint32_t l = 0; l < kSdwLinks; l++) m4Step[l] = kL0;
+    o[15] = nw | (rc << 16);
+    IOLog("AudShim M4: rollback SoundWire done, %u write(s), rc 0x%x, LCTL 0x%08x\n", nw, rc,
+          (r4(kADSPCS) & kADSPCS_CPA0) ? r4(kSdwLCTL) : 0);
+}
+
+void AudShim::m4Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
+    uint32_t cs = r4(kADSPCS), v = 0, el = 0;
+    bool cpa0 = (cs & kADSPCS_CPA0) != 0;
+    uint32_t l = (uint32_t)(a0 & 0xFF);
+    if (op != kM4OpState && op != kM4OpPowerUp && l >= kSdwLinks) { o[0] = kM2BadOp; return; }
+    uint32_t b = cdnsBase(l < kSdwLinks ? l : 0);
+    // Every write op: DSP core 0 powered, firmware booted (CL cleanup done) and FW_READY acked.
+    if (op != kM4OpState && (!cpa0 || !(m2bFlags & kFClDone) || !(m2bFlags & kFFwAck))) {
+        o[0] = kM2Precond; o[1] = cs; o[15] = m2bFlags; return;
+    }
+    switch (op) {
+    case kM4OpState: {   // read-only
+        o[1] = m4Flags | ((uint64_t)m4LinkMask << 8) | ((uint64_t)m4ShimMask << 16) | ((uint64_t)(m4Mode ? 1 : 0) << 24);
+        o[2] = (uint32_t)m4Step[0] | ((uint32_t)m4Step[1] << 8) | ((uint32_t)m4Step[2] << 16) | ((uint32_t)m4Step[3] << 24);
+        o[3] = m4MsgCount[0] | ((uint64_t)m4MsgCount[1] << 16) | ((uint64_t)m4MsgCount[2] << 32) | ((uint64_t)m4MsgCount[3] << 48);
+        if (cpa0 && !mmioReady()) {
+            o[4] = r4(kSdwShim); o[5] = r4(kSdwLCTL); o[6] = r4(kSdwSYNC); o[7] = r4(kSdwWAKEEN);
+            for (uint32_t k = 0; k < kSdwLinks; k++) o[8 + k] = r4(sdwIoctl(k));   // IOCTL | CTMCTL << 16
+        } else {
+            o[4] = o[5] = o[6] = o[7] = 0xFFFFFFFFu;
+        }
+        o[12] = cpa0;
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM4OpPowerUp: {
+        // hda_sdw_check_lcount_common (hda-dsp.c:1262-1283): LCAP.LCOUNT >= ACPI master-count (4)
+        uint32_t lcap = r4(kSdwShim), lc = r4(kSdwLCTL), mask = (uint32_t)(a0 & 0xF);
+        o[1] = lcap; o[2] = lc; o[3] = r4(kSdwSYNC);
+        if ((lcap & 7) < kSdwLinks || !mask || (m4Flags & kF4Power) || m4ShimMask || (lc & 0xF0F)) {
+            o[0] = kM2Precond; break;
+        }
+        m4LinkMask = mask;
+        m4Flags |= kF4Power;
+        // set SyncPRD period + SyncCPU (intel.c:399-405)
+        uint32_t sy = r4(kSdwSYNC), ns = (sy & ~kSyncPrdMask) | kSyncPrd | kSyncCPU;
+        w4(kSdwSYNC, ns);
+        m4Log("SYNC SYNCPRD=9599|SYNCCPU (intel.c:400-405)", kSdwSYNC, sy, r4(kSdwSYNC));
+        // LCTL |= SPA(link_mask), wait CPA(link_mask) (intel.c:407-420)
+        lc = r4(kSdwLCTL);
+        w4(kSdwLCTL, lc | mask);
+        bool ok1 = m4Wait(kSdwLCTL, mask << 8, mask << 8, &v, &el);
+        o[4] = v; o[5] = el;
+        m4Log("LCTL SPA(link_mask) (intel.c:414-416)", kSdwLCTL, lc, v);
+        // SyncCPU will change once link is active (intel.c:422-429)
+        bool ok2 = false;
+        if (ok1) ok2 = m4Wait(kSdwSYNC, kSyncCPU, 0, &v, &el);
+        o[6] = r4(kSdwSYNC); o[7] = el;
+        // update link clock if needed (intel.c:431-436): only with LCAP.MLCS (0 on cAVS 2.5)
+        if (ok1 && ok2 && (lcap & (1u << 8))) {
+            uint32_t x = r4(kSdwLCTL);
+            w4(kSdwLCTL, (x & ~(7u << 27)) | (0u << 27));   // XTAL for 38.4 MHz (intel.c:379-380)
+            m4Log("LCTL MLCS=XTAL (intel.c:432-436)", kSdwLCTL, x, r4(kSdwLCTL));
+        }
+        o[8] = r4(kSdwLCTL); o[9] = r4(kSdwShim);
+        for (uint32_t k = 0; k < kSdwLinks; k++)   // CTLSCAP | PCMSCAP << 16 (intel.c:551-567, reads only)
+            o[10 + k] = (r4(kSdwShim + 0x10 + 0x60 * k) & 0xFFFF) | ((r4(kSdwShim + 0x20 + 0x60 * k) & 0xFFFF) << 16);
+        o[0] = !ok1 ? kM2Timeout : !ok2 ? kM2Verify : kM2Ok;
+        break;
+    }
+    case kM4OpShimInit: {   // intel_shim_init (intel.c:258-289) incl. glue_to_master_ip (207-234)
+        if (!(m4Flags & kF4Power) || !(m4LinkMask & (1u << l)) || !m4LinkPowered(l) || m4Step[l] != kL0) {
+            o[0] = kM2Precond; o[1] = r4(kSdwLCTL); o[2] = m4Step[l]; break;
+        }
+        m4ShimMask |= 1u << l;          // intel.c:439 (from here rollback handles this link)
+        uint32_t io0 = r4h(sdwIoctl(l)), ct0 = r4h(sdwCtmctl(l));
+        o[1] = io0 | (ct0 << 16);
+        uint16_t io = 0;
+        io |= kIoBKE;  w4h(sdwIoctl(l), io); IODelay(15);     // 265-267
+        io |= kIoWPDD; w4h(sdwIoctl(l), io); IODelay(15);     // 269-271
+        io |= kIoDO;   w4h(sdwIoctl(l), io); IODelay(15);     // 273-275
+        io |= kIoDOE;  w4h(sdwIoctl(l), io); IODelay(15);     // 277-279
+        o[2] = r4h(sdwIoctl(l));
+        // intel_shim_glue_to_master_ip (intel.c:207-234): read back, then DOE, DO off, MIF on, BKE|COE off
+        io = r4h(sdwIoctl(l));
+        io &= ~kIoDOE; w4h(sdwIoctl(l), io); IODelay(15);
+        io &= ~kIoDO;  w4h(sdwIoctl(l), io); IODelay(15);
+        io |= kIoMIF;  w4h(sdwIoctl(l), io); IODelay(15);
+        io &= ~(kIoBKE | kIoCOE); w4h(sdwIoctl(l), io); IODelay(15);
+        o[3] = r4h(sdwIoctl(l));
+        m4Log("IOCTL shim init + glue->master IP (intel.c:265-281, 214-231)", sdwIoctl(l), io0, (uint32_t)o[3]);
+        // CTMCTL: DOAIS = 1, DACTQE, DODS (intel.c:283-288)
+        uint16_t act = r4h(sdwCtmctl(l));
+        act = (uint16_t)((act & ~kCtmDOAIS) | (1u << 3) | kCtmDACTQE | kCtmDODS);
+        w4h(sdwCtmctl(l), act); IODelay(15);
+        o[4] = r4h(sdwCtmctl(l));
+        m4Log("CTMCTL DOAIS=1|DACTQE|DODS (intel.c:283-288)", sdwCtmctl(l), ct0, (uint32_t)o[4]);
+        m4Step[l] = kLShim;
+        bool ok = ((o[3] & 0x7F) == (kIoMIF | kIoWPDD)) && ((o[4] & 0x1B) == (0x08 | kCtmDACTQE | kCtmDODS));
+        o[0] = ok ? kM2Ok : kM2Verify;
+        break;
+    }
+    case kM4OpSoftReset: {   // sdw_cdns_soft_reset (cadence_master.c:1406-1425)
+        if (m4Step[l] != kLShim || !m4LinkPowered(l)) { o[0] = kM2Precond; o[2] = m4Step[l]; break; }
+        o[1] = r4(b + kCdCONTROL); o[5] = r4(b + kCdSTAT); o[6] = r4(b + kCdCONFIG);
+        cdnsUpdate(l, kCdCONTROL, kCtlSOFTRST, kCtlSOFTRST, "MCP_CONTROL |= SOFT_RST (1410-1411)");
+        bool ok1 = cdnsConfigUpdate(l, &v, &el); o[2] = v; o[3] = el;
+        bool ok2 = ok1 && m4Wait(b + kCdCONTROL, kCtlSOFTRST, 0, &v, &el);
+        o[4] = r4(b + kCdCONTROL); o[7] = el;
+        m4Step[l] = kLSoft;
+        o[0] = !ok1 ? kM2Timeout : !ok2 ? kM2Verify : kM2Ok;
+        break;
+    }
+    case kM4OpSyncArm: {   // intel_shim_sync_arm (intel.c:500-513), multi_link (intel_bus_common.c:29-30)
+        if (m4Step[l] != kLSoft) { o[0] = kM2Precond; o[2] = m4Step[l]; break; }
+        uint32_t sy = r4(kSdwSYNC);
+        w4(kSdwSYNC, sy | (kSyncCmdSync << l));
+        o[1] = sy; o[2] = r4(kSdwSYNC);
+        m4Log("SYNC |= CMDSYNC(link) (intel.c:508-510)", kSdwSYNC, sy, (uint32_t)o[2]);
+        m4Flags |= kF4SyncArmed;
+        m4Step[l] = kLArm;
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM4OpCdnsInit: {   // sdw_cdns_init (cadence_master.c:1431-1491)
+        if (m4Step[l] != kLArm) { o[0] = kM2Precond; o[2] = m4Step[l]; break; }
+        // cdns_init_clock_ctrl (1353-1400)
+        cdnsUpdate(l, kCdCLK0, 0xFF, kMclkDiv, "CLK_CTRL0 MCLKD=3 (1377-1378)");
+        cdnsUpdate(l, kCdCLK1, 0xFF, kMclkDiv, "CLK_CTRL1 MCLKD=3 (1379-1380)");
+        { uint32_t x = r4(b + kCdFSINIT); w4(b + kCdFSINIT, kFrameShapeInit);
+          m4Log("FRAME_SHAPE_INIT rows 50 cols 4 (1390-1392)", b + kCdFSINIT, x, r4(b + kCdFSINIT)); }
+        { uint32_t x = r4(b + kCdSSP0); w4(b + kCdSSP0, kSspInterval);
+          m4Log("SSP_CTRL0 = 12 (1395-1396)", b + kCdSSP0, x, r4(b + kCdSSP0)); }
+        { uint32_t x = r4(b + kCdSSP1); w4(b + kCdSSP1, kSspInterval);
+          m4Log("SSP_CTRL1 = 12 (1397)", b + kCdSSP1, x, r4(b + kCdSSP1)); }
+        // sdw_cdns_check_self_clearing_bits(initial_delay false, 0) (1116-1165): reads only
+        uint32_t ctl = r4(b + kCdCONTROL);
+        o[1] = ctl; o[2] = r4(b + kCdCFGUPD);
+        // msg_count = FIFOLEVEL (1441)
+        m4MsgCount[l] = r4(b + kCdFIFOLVL);
+        o[3] = m4MsgCount[l];
+        cdnsUpdate(l, kCdCONTROL, kCtlCMDRST, kCtlCMDRST, "MCP_CONTROL |= CMD_RST (flush FIFOs, 1444-1445)");
+        cdnsUpdate(l, kCdCONTROL, kCtlCMDACCEPT, kCtlCMDACCEPT, "IP_MCP_CONTROL |= CMD_ACCEPT (1448-1449)");
+        cdnsUpdate(l, kCdCONTROL, kCtlBLOCKWAKE, 0, "IP_MCP_CONTROL BLOCK_WAKEUP=0 (1452-1454)");
+        { uint32_t x = r4(b + kCdCONFIG); w4(b + kCdCONFIG, x & ~kCfgBUSREL);       // 1457-1462
+          m4Log("MCP_CONFIG BUS_REL=0 (1457-1462)", b + kCdCONFIG, x, r4(b + kCdCONFIG)); }
+        { uint32_t x = r4(b + kCdCONFIG), n = x;                                   // 1465-1484
+          n &= ~kCfgOP; n |= 0; n &= ~kCfgCMD; n &= ~kCfgSNIFFER; n |= kCfgMMASTER;
+          w4(b + kCdCONFIG, n);
+          m4Log("IP_MCP_CONFIG OP=NORMAL CMD=0 SNIFFER=0 MMASTER=1 (1465-1484)", b + kCdCONFIG, x, r4(b + kCdCONFIG)); }
+        o[4] = r4(b + kCdCLK0); o[5] = r4(b + kCdCLK1); o[6] = r4(b + kCdFSINIT); o[7] = r4(b + kCdSSP0);
+        o[8] = r4(b + kCdSSP1); o[9] = r4(b + kCdCONTROL); o[10] = r4(b + kCdCONFIG);
+        m4Step[l] = kLInit;
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM4OpCommit: {   // sdw_cdns_config_update + sdw_intel_sync_go + set_wait (intel_bus_common.c:38-52)
+        if (m4Step[l] != kLInit) { o[0] = kM2Precond; o[2] = m4Step[l]; break; }
+        o[1] = r4(b + kCdSTAT);
+        w4(b + kCdCFGUPD, 1);                                   // cadence_master.c:292-296 (no wait)
+        o[2] = r4(b + kCdCFGUPD);
+        m4Log("CONFIG_UPDATE=1 (held by CMDSYNC) (cadence_master.c:295)", b + kCdCFGUPD, 0, (uint32_t)o[2]);
+        uint32_t sy = r4(kSdwSYNC);
+        w4(kSdwSYNC, sy | kSyncGO);                             // intel.c:515-531
+        o[3] = sy; o[4] = r4(kSdwSYNC);
+        m4Log("SYNC |= SYNCGO (intel.c:528-530)", kSdwSYNC, sy, (uint32_t)o[4]);
+        m4Flags &= ~kF4SyncArmed;
+        bool ok = m4Wait(b + kCdCFGUPD, 1, 0, &v, &el);         // cadence_master.c:303-310
+        o[5] = v; o[6] = el; o[7] = r4(kSdwSYNC); o[8] = r4(b + kCdCONTROL); o[9] = r4(b + kCdCONFIG);
+        m4Step[l] = kLCommit;
+        o[0] = ok ? kM2Ok : kM2Timeout;
+        break;
+    }
+    case kM4OpIntEnable: {   // sdw_cdns_enable_interrupt(true) (cadence_master.c:1209-1270)
+        if (m4Step[l] != kLCommit) { o[0] = kM2Precond; o[2] = m4Step[l]; break; }
+        uint32_t s0 = r4(b + kCdSLVINT0); w4(b + kCdSLVINT0, s0);    // 1246-1249 (w1c)
+        uint32_t s1 = r4(b + kCdSLVINT1); w4(b + kCdSLVINT1, s1);
+        o[1] = s0; o[2] = s1;
+        w4(b + kCdSLVMSK0, 0xFFFFFFFFu);                             // 1265-1266
+        w4(b + kCdSLVMSK1, 0xFFFFu);
+        uint32_t mask = kIntSLAVEMASK | kIntCTRLCLASH | kIntDATACLASH | kIntPARITY | kIntRXWL | kIntIRQ;  // 1221-1241
+        uint32_t im = r4(b + kCdINTMASK);
+        w4(b + kCdINTMASK, mask);                                    // 1267
+        m4Log("INTMASK = SLAVE|CLASH|PARITY|RX_WL|IRQ (1221-1267; not delivered: ADSPIC2.SNDW off)", b + kCdINTMASK, im, r4(b + kCdINTMASK));
+        o[3] = r4(b + kCdSLVMSK0); o[4] = r4(b + kCdSLVMSK1); o[5] = r4(b + kCdINTMASK); o[6] = r4(b + kCdINTSTAT);
+        o[7] = r4(0x14);   // ADSPIS2 (hda.h:299): SNDW bit 5 may assert; never enabled
+        m4Step[l] = kLInt;
+        o[0] = (o[5] == mask) ? kM2Ok : kM2Verify;
+        break;
+    }
+    case kM4OpExitReset: {   // sdw_cdns_exit_reset (1172-1184) + check_self_clearing_bits (1116-1165, 10 x 1 ms)
+        if (m4Step[l] != kLInt) { o[0] = kM2Precond; o[2] = m4Step[l]; break; }
+        cdnsUpdate(l, kCdCONTROL, kCtlHWRST, kCtlHWRST, "MCP_CONTROL |= HW_RST (bus reset, 1177-1179)");
+        bool ok = cdnsConfigUpdate(l, &v, &el);
+        o[1] = v; o[2] = el;
+        m4Step[l] = kLRun;
+        IOSleep(1);                                              // initial_delay usleep_range(1000, 1500)
+        uint32_t ctl = r4(b + kCdCONTROL), it = 0;
+        o[3] = ctl; o[4] = r4(b + kCdCFGUPD);
+        while ((ctl & kCtlHWRST) && it < 10) { IOSleep(1); it++; ctl = r4(b + kCdCONTROL); }   // INTEL_MASTER_RESET_ITERATIONS
+        o[5] = ctl; o[6] = it;
+        o[7] = r4(b + kCdSTAT); o[8] = r4(b + kCdSLVSTAT); o[9] = r4(b + kCdINTSTAT); o[10] = r4(b + kCdFIFOSTAT);
+        o[11] = r4(b + kCdSLVINT0); o[12] = r4(b + kCdSLVINT1);
+        // b0 SW_RST b1 CMD_RST b2 SOFT_RST b3 CLK_STOP_CLR b4 CONFIG_UPDATE b5 HW_RST still set
+        uint32_t bad = ((o[3] & kCtlSWRST) ? 1 : 0) | ((o[3] & kCtlCMDRST) ? 2 : 0) | ((o[3] & kCtlSOFTRST) ? 4 : 0) |
+                       ((o[3] & kCtlCLKSTOPCLR) ? 8 : 0) | ((o[4] & 1) ? 16 : 0) | ((ctl & kCtlHWRST) ? 32 : 0);
+        o[13] = bad;
+        IOLog("AudShim M4: link %u exit reset: CONTROL 0x%08x after %u ms, SLAVE_STAT 0x%08x, MCP_STAT 0x%08x\n",
+              l, ctl, it + 1, (uint32_t)o[8], (uint32_t)o[7]);
+        o[0] = !ok ? kM2Timeout : bad ? kM2Verify : kM2Ok;
+        break;
+    }
+    case kM4OpStatPoll: {
+        // Read-only poll of MCP_SLAVE_STAT (PING status, 2 bits per device, cadence_master.c:815-819) until
+        // device `dev` reads `want` or a1 ms (cap 2000) pass. With clear (a0 b24) the slave interrupt
+        // status is then acknowledged the way cdns_update_slave_status_work does (1047-1060, w1c).
+        if (m4Step[l] != kLRun || !m4LinkPowered(l)) { o[0] = kM2Precond; o[2] = m4Step[l]; break; }
+        uint32_t dev = (uint32_t)((a0 >> 8) & 0xF), want = (uint32_t)((a0 >> 16) & 3), clr = (uint32_t)((a0 >> 24) & 1);
+        uint32_t ms = (uint32_t)(a1 > 2000 ? 2000 : a1), t = 0;
+        uint64_t t0 = nowUs();
+        v = r4(b + kCdSLVSTAT);
+        while (((v >> (2 * dev)) & 3) != want && t < ms * 1000) {
+            if (t < 2000) IODelay(20); else IOSleep(1);
+            t = (uint32_t)(nowUs() - t0);
+            if (!m4LinkPowered(l)) break;
+            v = r4(b + kCdSLVSTAT);
+        }
+        o[1] = v; o[2] = t; o[3] = r4(b + kCdINTSTAT); o[4] = r4(b + kCdSLVINT0); o[5] = r4(b + kCdSLVINT1);
+        o[6] = r4(b + kCdSTAT); o[7] = r4(b + kCdCONTROL);
+        if (clr) {
+            w4(b + kCdINTSTAT, kIntSLAVEMASK);
+            if (o[4]) w4(b + kCdSLVINT0, (uint32_t)o[4]);
+            if (o[5]) w4(b + kCdSLVINT1, (uint32_t)o[5]);
+        }
+        o[0] = (((v >> (2 * dev)) & 3) == want) ? kM2Ok : kM2Timeout;
+        break;
+    }
+    case kM4OpXfer: {
+        // One message through the command FIFO, polled: _cdns_xfer_msg (cadence_master.c:627-675) +
+        // cdns_read_response (602-625) + the RX_WL part of sdw_cdns_irq (920-944). Only SCP enumeration
+        // accesses are accepted: read SCP_DevId_0..5 (0x50-0x55) of any device 0..11, or write
+        // SCP_DevNumber (0x46) of device 0 with a value 1..11 (bus.c:827-912, 752-795).
+        // a0: [7:0] link [15:8] count (1..8) [23:16] cmd (2 read, 3 write) [27:24] dev [47:32] reg; a1 data.
+        // o[1] 0 OK, 1 IGNORED (no ACK), 2 NACK, 3 TIMEOUT; o[2] responses read; o[3..12] responses;
+        // o[13] INTSTAT at completion; o[14] elapsed us; o[15] FIFOSTAT at completion.
+        if (m4Step[l] != kLRun || !m4LinkPowered(l)) { o[0] = kM2Precond; o[2] = m4Step[l]; break; }
+        uint32_t cnt = (uint32_t)((a0 >> 8) & 0xFF), cmd = (uint32_t)((a0 >> 16) & 0xFF);
+        uint32_t dev = (uint32_t)((a0 >> 24) & 0xF), reg = (uint32_t)((a0 >> 32) & 0xFFFF), dat = (uint32_t)(a1 & 0xFF);
+        bool rd = (cmd == 2 && cnt >= 1 && cnt <= 6 && dev <= 11 && reg >= 0x50 && reg + cnt <= 0x56);
+        bool wr = (cmd == 3 && cnt == 1 && dev == 0 && reg == 0x46 && dat >= 1 && dat <= 11);
+        if (!rd && !wr) { o[0] = kM2BadOp; IOLog("AudShim M4: refused FIFO message cmd %u dev %u reg 0x%x cnt %u\n", cmd, dev, reg, cnt); break; }
+        if (m4MsgCount[l] != cnt) {                                   // 627-631
+            uint32_t x = r4(b + kCdFIFOLVL); w4(b + kCdFIFOLVL, cnt); m4MsgCount[l] = cnt;
+            m4Log("FIFOLEVEL = count (RX watermark, 628-629)", b + kCdFIFOLVL, x, r4(b + kCdFIFOLVL));
+        }
+        uint64_t t0 = nowUs();
+        for (uint32_t i = 0; i < cnt; i++) {                           // 636-647
+            uint32_t w = ((dev & 0xF) << 24) | ((cmd & 7) << 28) | (((reg + i) & 0xFFFF) << 8);
+            if (wr) w |= dat;
+            w4(b + kCdCMD + 4 * i, w);
+        }
+        IOLog("AudShim M4: link %u FIFO %s dev %u reg 0x%x x%u%s\n", l, rd ? "READ" : "WRITE", dev, reg, cnt,
+              wr ? " (SCP_DevNumber)" : "");
+        // wait_for_completion_timeout(tx_complete, 500 ms) (652-655) -> poll RX_WL / FIFOSTAT
+        uint32_t t = 0, is = 0, fs = 0;
+        bool got = false;
+        while (t < kCdnsTxTimeoutMs * 1000) {
+            is = r4(b + kCdINTSTAT); fs = r4(b + kCdFIFOSTAT);
+            if ((is & kIntRXWL) || (fs & 0x3F) >= cnt) { got = true; break; }
+            if (t < 2000) IODelay(10); else IOSleep(1);
+            t = (uint32_t)(nowUs() - t0);
+            if (!m4LinkPowered(l)) break;
+        }
+        o[14] = (uint32_t)(nowUs() - t0);
+        // cdns_read_response (602-625): RX_FIFO_AVAIL entries (<= CDNS_MCP_CMD_LEN + 2), all from CMD_BASE + 4*i
+        fs = r4(b + kCdFIFOSTAT);
+        uint32_t n = fs & 0x3F;
+        if (n > 10) n = 10;
+        for (uint32_t i = 0; i < n; i++) o[3 + i] = r4(b + kCdCMD + 4 * i);
+        o[2] = n; o[13] = is; o[15] = fs;
+        if (!got) {   // 656-664: timeout, the RX FIFO was drained above; INTSTAT not touched
+            o[1] = 3;
+            IOLog("AudShim M4: link %u FIFO message TIMED OUT (%u us), INTSTAT 0x%08x FIFOSTAT 0x%08x\n", l, (uint32_t)o[14], is, fs);
+            o[0] = kM2Ok;
+            break;
+        }
+        w4(b + kCdINTSTAT, kIntRXWL);                                  // sdw_cdns_irq 932 (w1c RX_WL)
+        // cdns_fill_msg_resp (564-600)
+        bool noack = false, nack = false;
+        for (uint32_t i = 0; i < cnt; i++) {
+            uint32_t r = (i < n) ? (uint32_t)o[3 + i] : 0;
+            if (!(r & kRespACK)) noack = true;
+            if (r & kRespNACK) nack = true;
+        }
+        o[1] = nack ? 2 : noack ? 1 : 0;
+        o[0] = kM2Ok;
+        break;
+    }
+    default:
+        o[0] = kM2BadOp;
+    }
+}
+
+// =====================================================================================  M5
+// Speaker playback primitives. The Linux sequence (topology widget set up, SoundWire stream
+// prepare/enable, RT1316 init and power, host DMA, PCM params/trigger, and the reverse) is driven by
+// audctl; see the header comment and ~/xe/build/audio/m5/NOTES.md. Linux references are to
+// ~/xe/build/audio/linux-src (torvalds master) and ~/xe/build/audio/sof-src (SOF stable-v2.2).
+
+static void m5Log(const char *what, uint32_t off, uint32_t before, uint32_t after) {
+    IOLog("AudShim M5: %s @0x%x 0x%08x -> 0x%08x\n", what, off, before, after);
+}
+
+// The M5 BAR4 store whitelist (on top of m4Allowed). Only links 1 and 2 (the RT1316 links), only PDI 2
+// (the "SDW1 Pin2"/"SDW2 Pin2" cpu DAIs of the speaker BE link: topology ALH 258 = 1<<8|2, 514 = 2<<8|2).
+bool AudShim::m5Allowed(uint32_t off, unsigned width) {
+    for (uint32_t l = 1; l <= 2; l++) {
+        if (width == 16 && off == kSdwShim + 0x022 + 0x60 * l + 2 * 2) return true;   // PCMSyCHM(l, 2) sdw_intel.h:68
+        if (width == 32 && off == kSdwShim + 0x800 + 4 * (l * 16 + 2 + 3 + 2)) return true; // ALH STRMZCFG(id) sdw_intel.h:109
+        if (width != 32 || (off & 3)) continue;
+        uint32_t b = cdnsBase(l);
+        if (off < b || off >= b + kSdwLinkSz || !m4LinkPowered(l)) continue;
+        uint32_t rel = off - b;
+        if (rel >= 0x200 && rel <= 0x22C) return true;   // CDNS_DPN_B0/B1_* of port 2 (cadence_master.c:152-166)
+        if (rel == 0x230 || rel == 0x1120) return true;  // CDNS_PORTCTRL + 2*0x80, CDNS_PDI_CONFIG(2) (183-195)
+        if (rel == kCdCLK0 || rel == kCdCLK1) return true;   // cdns_bus_conf (1494-1519)
+    }
+    return false;
+}
+
+// RT1316 registers M5 may touch (rt1316-sdw.c:21-129 reg defaults + blind writes, sdw_registers.h SCP/DPN,
+// SDCA function 4 = FUNC_NUM_SMART_AMP). Reads: the same set plus SCP_DevId. Everything else is refused.
+bool AudShim::m5RtRegOk(uint32_t a, bool write) {
+    if (!write && a >= 0x50 && a <= 0x55) return true;                     // SCP_DevId_0..5
+    if (a == 0x40 || a == 0x41 || a == 0x4D || a == 0x62 || a == 0x72) return true; // SCP_INT1/INTMASK1/BUS_CLOCK_BASE/SCALE_B0/B1
+    if (!write && (a == 0x44 || a == 0x60 || a == 0x70)) return true;      // SCP_CTRL/STAT, FrameCtrl (writes: M5_BANK only)
+    if (a >= 0x100 && a <= 0x13F) return true;                             // DP1 (SDW_DPN_* with n = 1)
+    if ((a >= 0x2200 && a <= 0x22FF) || (a >= 0x2F00 && a <= 0x2FFF) || (a >= 0x3000 && a <= 0x32FF)) return true;
+    if ((a >= 0xC000 && a <= 0xC7FF) || (a >= 0xCF00 && a <= 0xCF03) || (a >= 0xD000 && a <= 0xD1FF)) return true;
+    if ((a & 0xFFC00000u) == 0x41000000u) return true;                    // SDW_SDCA_CTL(4, ...)
+    return false;
+}
+
+bool AudShim::copyIn(uint64_t uaddr, void *dst, uint32_t len) {
+    if (!uaddr || !len) return false;
+    IOMemoryDescriptor *um = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, len, kIODirectionOut,
+                                                                 current_task());
+    if (!um) return false;
+    IOByteCount got = 0;
+    IOReturn r = um->prepare(kIODirectionOut);
+    if (!r) { got = um->readBytes(0, dst, len); um->complete(kIODirectionOut); }
+    um->release();
+    return !r && got == len;
+}
+
+// IPC3 allowlist (sof header.h:43-134). Exact sizes from the Linux structs (checked with the Linux headers:
+// comp 28, comp_config 36, host 76, volume 84, process 100, dai 80, buffer 44, pipe_new 48, free/ready/stream
+// 12, connect 16, dai_config 216, pcm_params 108, ctrl_data 92). PCM_PARAMS is patched with the kext's own
+// buffer description so that no host physical address is taken from user space.
+bool AudShim::m5IpcCheck(uint8_t *m, uint32_t len, const char **why) {
+    uint32_t size = *(uint32_t *)(m + 0), cmd = *(uint32_t *)(m + 4);
+    uint32_t glb = cmd & 0xF0000000u, typ = cmd & 0x0FFF0000u;
+    *why = "size field != length";
+    if (size != len || len < 8 || len > kIpcMax) return false;
+    *why = "command not in the M5 allowlist";
+    if (cmd & 0xFFFF) return false;
+    switch (glb) {
+    case 0x30000000u:   // SOF_IPC_GLB_TPLG_MSG
+        switch (typ) {
+        case 0x00010000u: {   // COMP_NEW
+            if (len < 28 + 36) return false;
+            uint32_t ctype = *(uint32_t *)(m + 12);
+            *why = "COMP_NEW of a component type the speaker path does not use";
+            if (ctype != 1 && ctype != 2 && ctype != 5 && ctype != 7 && ctype != 18) return false;  // HOST DAI VOLUME MUX DEMUX
+            if (ctype == 2) { *why = "COMP_NEW dai is not ALH"; if (len < 80 || *(uint32_t *)(m + 72) != 4) return false; }
+            return true;
+        }
+        case 0x00020000u: case 0x00110000u: case 0x00130000u: case 0x00210000u: return len == 12;  // COMP/PIPE/BUFFER free, PIPE_COMPLETE
+        case 0x00030000u: return len == 16;   // COMP_CONNECT
+        case 0x00100000u: return len == 48;   // PIPE_NEW
+        case 0x00200000u: return len == 44;   // BUFFER_NEW
+        }
+        return false;
+    case 0x80000000u: {  // SOF_IPC_GLB_DAI_MSG
+        if (typ != 0x00010000u || len != 216) return false;   // DAI_CONFIG
+        uint32_t t = *(uint32_t *)(m + 8), idx = *(uint32_t *)(m + 12);
+        *why = "DAI_CONFIG for something else than ALH 0x100/0x200";
+        return t == 4 && (idx == 0x100 || idx == 0x200);
+    }
+    case 0x60000000u:   // SOF_IPC_GLB_STREAM_MSG
+        if (typ == 0x00030000u || typ == 0x00040000u || typ == 0x00050000u) {   // PCM_FREE TRIG_START TRIG_STOP
+            if (len != 12) return false;
+            if (typ == 0x00040000u) { *why = "TRIG_START before the host stream is prepared"; return (m5Flags & kF5Prep) != 0; }
+            return true;
+        }
+        if (typ == 0x00010000u) {   // PCM_PARAMS
+            *why = "PCM_PARAMS: wrong size / not playback / ext data / no ring allocated";
+            if (len != 108 || !(m5Flags & kF5Dma) || *(uint32_t *)(m + 56) != 0 || *(uint16_t *)(m + 88) != 0) return false;
+            uint32_t pt = (uint32_t)(m5Iova + kM5PtOff);
+            if ((m5Iova + kM5PtOff) >> 32) { *why = "page table above 4 GiB"; return false; }
+            *(uint32_t *)(m + 32) = pt;                // params.buffer.phy_addr = page table (ipc3-pcm.c:63)
+            *(uint32_t *)(m + 36) = kM5Buf / 4096;     // params.buffer.pages
+            *(uint32_t *)(m + 40) = kM5Buf;            // params.buffer.size
+            *(uint16_t *)(m + 72) = (uint16_t)kM5Tag;  // params.stream_tag (ipc3-pcm.c:104)
+            return true;
+        }
+        return false;
+    case 0x50000000u:   // SOF_IPC_GLB_COMP_MSG: SET_VALUE / GET_VALUE / SET_DATA (ipc3-control.c:14-120)
+        if (typ != 0x00010000u && typ != 0x00020000u && typ != 0x00030000u) return false;
+        return len >= 92;
+    }
+    return false;
+}
+
+// One command-FIFO transaction of n words on link l (_cdns_xfer_msg + cdns_read_response + the RX_WL part
+// of sdw_cdns_irq, cadence_master.c:602-675, 920-944), polled. Returns 0 got the responses, 3 timeout.
+uint32_t AudShim::cdnsRun(uint32_t l, const uint32_t *w, uint32_t n, uint64_t *resp, uint32_t maxResp,
+                          uint32_t *nresp, uint32_t *is, uint32_t *fs, uint32_t tmoUs, uint32_t *el) {
+    uint32_t b = cdnsBase(l);
+    if (m4MsgCount[l] != n) {                                     // 627-631
+        w4(b + kCdFIFOLVL, n); m4MsgCount[l] = n;
+    }
+    // A stale RX_WL (e.g. left by an earlier timed-out message) must not end the wait early; Linux clears it
+    // in the interrupt handler, we clear it here before issuing the commands (w1c).
+    if (r4(b + kCdINTSTAT) & kIntRXWL) w4(b + kCdINTSTAT, kIntRXWL);
+    uint64_t t0 = nowUs();
+    for (uint32_t i = 0; i < n; i++) w4(b + kCdCMD + 4 * i, w[i]);
+    uint32_t t = 0, got = 0;
+    while (t < tmoUs) {
+        *is = r4(b + kCdINTSTAT); *fs = r4(b + kCdFIFOSTAT);
+        if ((*is & kIntRXWL) || (*fs & 0x3F) >= n) { got = 1; break; }
+        if (t < 2000) IODelay(10); else IOSleep(1);
+        t = (uint32_t)(nowUs() - t0);
+        if (!m4LinkPowered(l)) break;
+    }
+    *el = (uint32_t)(nowUs() - t0);
+    *fs = r4(b + kCdFIFOSTAT);
+    uint32_t k = *fs & 0x3F;
+    if (k > 10) k = 10;
+    for (uint32_t i = 0; i < k; i++) { uint32_t v = r4(b + kCdCMD + 4 * i); if (i < maxResp) resp[i] = v; }
+    *nresp = k;
+    if (got) w4(b + kCdINTSTAT, kIntRXWL);                         // sdw_cdns_irq 932 (w1c)
+    return got ? 0 : 3;
+}
+
+// One RT1316 access (sdw_transfer -> cdns_xfer_msg with paging, bus.c:361-406, cadence_master.c:677-790).
+// o[1] 0 OK / 1 IGNORED / 2 NACK / 3 TIMEOUT; o[2] responses; o[3..8] responses; o[9] page responses
+// (lo|hi<<32, 0 if no paging); o[10] reg16|page1<<16|page2<<24 used; o[13] INTSTAT o[14] elapsed o[15] FIFOSTAT.
+uint32_t AudShim::m5Xfer(uint32_t l, uint32_t cmd, uint32_t dev, uint32_t addr, uint32_t cnt, uint32_t data,
+                         uint32_t tmoUs, uint64_t *o) {
+    uint32_t is = 0, fs = 0, el = 0, n = 0, reg = addr & 0xFFFF, p1 = 0, p2 = 0;
+    uint64_t r[10] = {};
+    bool page = addr >= 0x8000;
+    if (page) {
+        p1 = (addr >> 23) & 0xFF; p2 = (addr >> 15) & 0xFF; reg = (addr & 0x7FFF) | 0x8000;   // SDW_SCP_ADDRPAGE1/2_MASK
+        uint32_t w[2] = { (dev << 24) | (3u << 28) | (0x48u << 8) | p1, (dev << 24) | (3u << 28) | (0x49u << 8) | p2 };
+        uint32_t rc = cdnsRun(l, w, 2, r, 10, &n, &is, &fs, tmoUs, &el);   // CDNS_SCP_RX_FIFOLEVEL = 2
+        o[9] = r[0] | (r[1] << 32);
+        if (rc) { o[1] = 3; o[13] = is; o[14] = el; o[15] = fs; return 3; }
+        if (!(r[0] & kRespACK) || !(r[1] & kRespACK)) {               // 713-731: "Program SCP Ack not received"
+            o[1] = ((r[0] | r[1]) & kRespNACK) ? 2 : 1; o[13] = is; o[14] = el; o[15] = fs; return (uint32_t)o[1];
+        }
+    }
+    o[10] = reg | (p1 << 16) | (p2 << 24) | ((uint64_t)page << 32);
+    uint32_t w[8];
+    for (uint32_t i = 0; i < cnt; i++)
+        w[i] = (dev << 24) | ((cmd & 7) << 28) | (((reg + i) & 0xFFFF) << 8) | (cmd == 3 ? (data & 0xFF) : 0);
+    uint32_t rc = cdnsRun(l, w, cnt, r, 10, &n, &is, &fs, tmoUs, &el);
+    o[2] = n; o[13] = is; o[14] = el; o[15] = fs;
+    for (uint32_t i = 0; i < 6 && i < n; i++) o[3 + i] = r[i];
+    if (rc) { o[1] = 3; return 3; }
+    bool noack = false, nack = false;                                // cdns_fill_msg_resp (564-600)
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint64_t v = (i < n) ? r[i] : 0;
+        if (!(v & kRespACK)) noack = true;
+        if (v & kRespNACK) nack = true;
+    }
+    o[1] = nack ? 2 : noack ? 1 : 0;
+    return (uint32_t)o[1];
+}
+
+void AudShim::m5Free() {
+    if (m5Cmd) { m5Cmd->clearMemoryDescriptor(); m5Cmd->release(); m5Cmd = nullptr; }
+    if (m5Md) { m5Md->complete(); m5Md->release(); m5Md = nullptr; IOLog("AudShim M5: playback ring freed\n"); }
+    m5Va = nullptr; m5Iova = m5Phys = 0;
+    m5Flags &= ~(kF5Dma | kF5Prep | kF5Run);
+}
+
+// First part of the rollback, while the DSP and the links are still up. Returns writes | rc << 16:
+// rc b0 host DMA did not stop, b1 an amp write failed, b2 DSP unpowered (nothing to do).
+uint32_t AudShim::m5Rollback() {
+    uint32_t nw = 0, rc = 0, v, el;
+    if (!m5Flags) return 0;
+    IOLog("AudShim M5: rollback, flags 0x%x\n", m5Flags);
+    // 1. host DMA (hda_dsp_stream_trigger STOP, hda-stream.c:445-470)
+    if (map0w && clIdx) {
+        uint32_t sd = sdBase(clIdx), ctl = r0(sd);
+        if (ctl & 2) {
+            w0(sd, ctl & 0x00FFFFE1u, 32, "M5 rollback: playback SD RUN=0, int-enable off"); nw++;
+            if (!poll0(sd, 2, 0, 3000, 10, &v, &el)) rc |= 1;
+            w0(sd + 3, kSdIntMask, 8, "M5 rollback: SD STS clear"); nw++;
+        }
+        m5Flags &= ~kF5Run;
+    }
+    if (!(r4(kADSPCS) & kADSPCS_CPA0)) { rc |= 4; m5Flags &= (kF5Dma | kF5L1); return nw | (rc << 16); }
+    // 2. amps: mute FU21 L/R, PDE23/27/22 -> PS3 (rt1316_classd_event PRE_PMD + UCM DisableSequence)
+    if (m5Flags & kF5Amp) {
+        static const uint32_t regs[5] = { kRtFu21MuteL, kRtFu21MuteR, kRtPde23, kRtPde27, kRtPde22 };
+        static const uint32_t vals[5] = { 1, 1, 3, 3, 3 };
+        for (uint32_t l = 1; l <= 2; l++) {
+            if (m4Step[l] != kLRun || !m4LinkPowered(l)) continue;
+            for (int k = 0; k < 5; k++) {
+                uint64_t o[16] = {};
+                if (m5Xfer(l, 3, 1, regs[k], 1, vals[k], 50000, o)) rc |= 2;
+                nw++;
+            }
+            IOLog("AudShim M5: rollback link %u amp muted + PDE PS3 (%s)\n", l, (rc & 2) ? "with errors" : "ok");
+        }
+        m5Flags &= ~kF5Amp;
+    }
+    // 3. master port 2 channels off in both banks (cdns_port_enable, cadence_master.c:1650-1665)
+    if (m5Flags & kF5Port) {
+        for (uint32_t l = 1; l <= 2; l++) {
+            if (!m4LinkPowered(l)) continue;
+            uint32_t b = cdnsBase(l);
+            if (r4(b + 0x204)) { w4(b + 0x204, 0); nw++; }
+            if (r4(b + 0x21C)) { w4(b + 0x21C, 0); nw++; }
+        }
+        m5Flags &= ~kF5Port;
+    }
+    m5Flags &= (kF5Dma | kF5L1);   // the ring is freed by dmaFree() after the stream registers are reset
+    IOLog("AudShim M5: rollback part 1 done, %u write(s), rc 0x%x\n", nw, rc);
+    return nw | (rc << 16);
+}
+
+void AudShim::m5Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
+    uint32_t cs = r4(kADSPCS), v = 0, el = 0;
+    bool cpa0 = (cs & kADSPCS_CPA0) != 0;
+    uint32_t sd = clIdx ? sdBase(clIdx) : 0;
+    if (op == kM5OpState) {   // read-only
+        o[1] = m5Flags | ((uint64_t)(m5Mode ? 1 : 0) << 16);
+        o[2] = m5IpcCount | ((uint64_t)(uint32_t)m5LastErr << 32);
+        o[3] = m5LastCmd;
+        if (map0 && sd && !mmioReady()) {
+            o[4] = r0(sd); o[5] = r0(sd + 0x04); o[6] = r0(sd + 0x08);
+            o[7] = r0(sd + 0x18) | ((uint64_t)r0(sd + 0x1C) << 32);
+            o[10] = r0(0x1030); o[11] = ppOff ? r0(ppOff + 0x04) : 0;
+            o[15] = r0(sd + 0x0C) | ((uint64_t)r0(sd + 0x10) << 32);   // LVI|FIFOW, FIFOS|FMT
+        }
+        o[8] = m5Iova; o[9] = m5Phys;
+        if (cpa0 && !mmioReady()) {
+            o[12] = r4(kHIPCIDR) | ((uint64_t)r4(kHIPCIDA) << 32); o[13] = r4(kHIPCTDR);
+            for (uint32_t l = 1; l <= 2; l++)
+                if (m4LinkPowered(l)) o[14] |= (uint64_t)r4(cdnsBase(l) + kCdSTAT) << (32 * (l - 1));
+        }
+        o[0] = kM2Ok;
+        return;
+    }
+    if (!cpa0 || !(m2bFlags & kFClDone) || !(m2bFlags & kFFwAck) || !map0w || !clIdx) {
+        o[0] = kM2Precond; o[1] = cs; o[15] = m2bFlags; return;
+    }
+    switch (op) {
+    case kM5OpIpc: {
+        // cnl_ipc_send_msg (cnl.c:308-312) + ipc3_wait_tx_done (ipc3.c:289-330) + cnl_ipc_dsp_done (cnl.c:221-237)
+        uint8_t m[kIpcMax];
+        uint32_t len = (uint32_t)a1;
+        if (len < 8 || len > kIpcMax || (len & 3)) { o[0] = kM2BadOp; break; }
+        if (!copyIn(a0, m, len)) { o[0] = kM2DmaErr; break; }
+        const char *why = "";
+        uint32_t cmd = *(uint32_t *)(m + 4);
+        if (!m5IpcCheck(m, len, &why)) {
+            o[0] = kM2BadOp; o[1] = cmd; o[2] = len;
+            IOLog("AudShim M5: refused IPC cmd 0x%08x size %u: %s\n", cmd, len, why);
+            break;
+        }
+        uint32_t idr = r4(kHIPCIDR), ida = r4(kHIPCIDA);
+        if ((idr & kIpcBusyDone) || (ida & kIpcBusyDone)) { o[0] = kM2Busy; o[1] = idr; o[2] = ida; break; }
+        volatile uint32_t *box = (volatile uint32_t *)(map4w->getVirtualAddress() + kHostBox);
+        for (uint32_t i = 0; i < len / 4; i++) box[i] = ((uint32_t *)m)[i];   // sof_mailbox_write
+        __sync_synchronize();
+        w4(kHIPCIDR, kIpcBusyDone);                                           // HIPCIDR = BUSY
+        m5Flags |= kF5Ipc; m5IpcCount++; m5LastCmd = cmd;
+        uint64_t t0 = nowUs();
+        uint32_t t = 0;
+        v = r4(kHIPCIDA);
+        while (!(v & kIpcBusyDone) && t < kIpcTimeoutMs * 1000) {
+            if (t < 2000) IODelay(10); else IOSleep(1);
+            t = (uint32_t)(nowUs() - t0);
+            if (!(r4(kADSPCS) & kADSPCS_CPA0)) break;
+            v = r4(kHIPCIDA);
+        }
+        el = (uint32_t)(nowUs() - t0);
+        o[3] = el | ((uint64_t)r4(kHIPCTDR) << 32);
+        if (!(v & kIpcBusyDone)) {
+            o[0] = kM2Timeout; o[1] = r4(kHIPCIDR); o[2] = v;
+            IOLog("AudShim M5: IPC 0x%08x TIMED OUT after %u us (HIPCIDR 0x%08x HIPCIDA 0x%08x)\n", cmd, el, (uint32_t)o[1], v);
+            break;
+        }
+        // reply in the host box (sof_ipc3_get_reply ipc3.c:234-287): sof_ipc_reply {hdr.size, hdr.cmd, error}
+        uint32_t rsz = box[0], rcmd = box[1];
+        int32_t err = (int32_t)box[2];
+        uint32_t n = rsz > 96 ? 96 : rsz;
+        if (n < 12) n = 12;
+        for (uint32_t i = 0; i < n / 8 && i < 12; i++) o[4 + i] = box[2 * i] | ((uint64_t)box[2 * i + 1] << 32);
+        w4(kHIPCIDA, v | kIpcBusyDone);                                       // cnl_ipc_dsp_done: DONE w1c
+        o[1] = rcmd; o[2] = rsz | ((uint64_t)(uint32_t)err << 32);
+        m5LastErr = err;
+        if (err < 0) IOLog("AudShim M5: IPC 0x%08x reply error %d\n", cmd, err);
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM5OpSAlloc: {
+        if ((m5Flags & kF5Dma) || a1 != kM5Buf || !a0) { o[0] = kM2Precond; o[15] = m5Flags; break; }
+        // snd_dma_alloc_pages for the PCM buffer: one contiguous, page-aligned, < 4 GiB block holding the ring
+        // (64 KiB), the BDL (4 KiB, hda_dsp_stream_setup_bdl) and the SOF page table (4 KiB)
+        m5Md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+                                                                kM5Total, 0x00000000FFFFF000ULL);
+        if (!m5Md) { o[0] = kM2NoMem; break; }
+        IOReturn r = m5Md->prepare();
+        if (r) { m5Md->release(); m5Md = nullptr; o[0] = kM2DmaErr; o[1] = (uint32_t)r; break; }
+        m5Flags |= kF5Dma;   // from here m5Free() undoes everything
+        m5Va = (uint8_t *)m5Md->getBytesNoCopy();
+        if (!m5Va) { m5Free(); o[0] = kM2DmaErr; break; }
+        bzero(m5Va, kM5Total);
+        if (!copyIn(a0, m5Va, kM5Buf)) { m5Free(); o[0] = kM2DmaErr; o[1] = 2; break; }
+        m5Cmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped,
+                                                0, 128, (IOMapper *)pci, nullptr);
+        if (!m5Cmd) { m5Free(); o[0] = kM2DmaErr; o[1] = 3; break; }
+        r = m5Cmd->setMemoryDescriptor(m5Md, false);
+        if (!r) r = m5Cmd->prepare();
+        if (r) { m5Free(); o[0] = kM2DmaErr; o[1] = (uint32_t)r; break; }
+        UInt64 off = 0; IODMACommand::Segment64 seg; UInt32 ns = 1;
+        r = m5Cmd->gen64IOVMSegments(&off, &seg, &ns);
+        if (r || ns != 1 || seg.fLength != kM5Total || (seg.fIOVMAddr & 0xFFF) || ((seg.fIOVMAddr + kM5Total) >> 32)) {
+            o[0] = kM2DmaErr; o[1] = (uint32_t)r; o[2] = ns; o[3] = seg.fLength; o[4] = seg.fIOVMAddr; m5Free(); break;
+        }
+        m5Iova = seg.fIOVMAddr;
+        m5Phys = m5Md->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+        // BDL: one BDLE per period, IOC=1 (hda_dsp_stream_setup_bdl hda-stream.c:112-185, no_period_wakeup 0)
+        volatile uint32_t *bdl = (volatile uint32_t *)(m5Va + kM5BdlOff);
+        for (uint32_t e = 0; e < kM5Frags; e++) {
+            uint64_t a = m5Iova + e * kM5Period;
+            bdl[e * 4 + 0] = (uint32_t)a; bdl[e * 4 + 1] = (uint32_t)(a >> 32);
+            bdl[e * 4 + 2] = kM5Period; bdl[e * 4 + 3] = 1;
+        }
+        // SOF compressed page table, 20-bit PFNs packed 2.5 bytes each (sof-utils.c snd_sof_create_page_table)
+        uint8_t *pt = m5Va + kM5PtOff;
+        for (uint32_t i = 0; i < kM5Buf / 4096; i++) {
+            uint32_t idx = ((i << 2) + i) >> 1, pfn = (uint32_t)((m5Iova + i * 4096) >> 12), x;
+            uint8_t *p = pt + idx;
+            if (i & 1) x = (p[0] & 0xF) | (pfn << 4); else x = pfn;
+            p[0] = (uint8_t)x; p[1] = (uint8_t)(x >> 8); p[2] = (uint8_t)(x >> 16); p[3] = (uint8_t)(x >> 24);
+        }
+        __sync_synchronize();
+        uint32_t h = 2166136261u;
+        for (uint32_t i = 0; i < kM5Buf; i++) { h ^= m5Va[i]; h *= 16777619u; }
+        m5Hash = h;
+        o[1] = m5Iova; o[2] = m5Phys; o[3] = (m5Iova == m5Phys); o[4] = h; o[5] = m5Iova + kM5BdlOff; o[6] = m5Iova + kM5PtOff;
+        o[7] = (uint64_t)pt[0] | ((uint64_t)pt[1] << 8) | ((uint64_t)pt[2] << 16) | ((uint64_t)pt[3] << 24) | ((uint64_t)pt[4] << 32) | ((uint64_t)pt[5] << 40);
+        IOLog("AudShim M5: playback ring %u bytes at IOVA 0x%llx (phys 0x%llx), BDL %u x %u, page table at 0x%llx, FNV-1a 0x%08x\n",
+              kM5Buf, m5Iova, m5Phys, kM5Frags, kM5Period, m5Iova + kM5PtOff, h);
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM5OpStream: {
+        uint32_t idx = clIdx, rc = 0;
+        if (a0 == 0) {   // _hda_dsp_stream_get L1 rule + hda_dsp_stream_hw_params (hda-stream.c:563-755) + SPIB off
+            if (!(m5Flags & kF5Dma) || (m5Flags & (kF5Prep | kF5Run)) || (r0(sd) & 2)) { o[0] = kM2Precond; o[15] = m5Flags; break; }
+            uint32_t em2 = r0(0x1030);
+            if (em2 & (1u << 13)) { w0(0x1030, em2 & ~(1u << 13), 32, "M5 EM2.L1SEN=0 (DMI L1 incompatible stream)"); m5Flags |= kF5L1; }
+            w0(ppOff + 0x04, r0(ppOff + 0x04) | (1u << idx), 32, "M5 PPCTL PROCEN(playback) decouple");
+            w0(sd, r0(sd) & 0x00FFFFE1u, 32, "M5 SD clear int-enable/RUN");
+            bool ok = poll0(sd, 2, 0, kStreamRunTimeoutUs, 10, &v, &el);
+            w0(sd + 3, kSdIntMask, 8, "M5 SD STS clear");
+            ok &= streamReset(idx, &rc);
+            w0(sd + 0x18, 0, 32, "M5 BDLPL=0"); w0(sd + 0x1C, 0, 32, "M5 BDLPU=0");
+            w0(sd, r0(sd) & 0x00FFFFE1u, 32, "M5 SD clear int-enable/RUN");
+            ok &= poll0(sd, 2, 0, kStreamRunTimeoutUs, 10, &v, &el);
+            w0(sd + 3, kSdIntMask, 8, "M5 SD STS clear");
+            w0(sd, (r0(sd) & 0x000FFFFFu) | (kM5Tag << 20), 32, "M5 SD stream tag=1");
+            w0(sd + 0x08, kM5Buf, 32, "M5 CBL=65536");
+            w0(sd + 0x12, kM5Fmt, 16, "M5 FORMAT=0x0041 (48k S32 2ch)");
+            w0(sd + 0x0C, kM5Frags - 1, 16, "M5 LVI=15");
+            w0(sd + 0x18, (uint32_t)(m5Iova + kM5BdlOff), 32, "M5 BDLPL");
+            w0(sd + 0x1C, (uint32_t)((m5Iova + kM5BdlOff) >> 32), 32, "M5 BDLPU");
+            w0(sd, (r0(sd) & 0x00FFFFFFu) | kSdIntMask, 32, "M5 SD int-enable bits");
+            // hda_dsp_stream_spib_config(DISABLE) (hda-pcm.c:139-143, hda-stream.c:187-214)
+            if (r0(spbOff + 0x04) & (1u << idx)) w0(spbOff + 0x04, r0(spbOff + 0x04) & ~(1u << idx), 32, "M5 SPBFCCTL off");
+            if (r0(spbOff + 0x08 + 0x08 * idx)) w0(spbOff + 0x08 + 0x08 * idx, 0, 32, "M5 SPIB=0");
+            m5Flags |= kF5Prep;
+            o[1] = r0(sd); o[2] = r0(sd + 0x08); o[3] = r0(sd + 0x0C); o[4] = r0(sd + 0x10);
+            o[5] = r0(sd + 0x18) | ((uint64_t)r0(sd + 0x1C) << 32); o[6] = r0(ppOff + 0x04); o[7] = r0(0x1030);
+            o[8] = rc; o[9] = idx; o[10] = r0(spbOff + 0x04);
+            bool verify = ((o[1] >> 20) & 0xF) == kM5Tag && o[2] == kM5Buf && ((o[4] >> 16) & 0xFFFF) == kM5Fmt &&
+                          (o[3] & 0xFFFF) == kM5Frags - 1 && (o[5] == m5Iova + kM5BdlOff);
+            o[0] = !ok ? kM2Timeout : verify ? kM2Ok : kM2Verify;
+        } else if (a0 == 1) {   // hda_dsp_stream_trigger START (INTCTL not touched: polled)
+            if (!(m5Flags & kF5Prep) || (m5Flags & kF5Run)) { o[0] = kM2Precond; o[15] = m5Flags; break; }
+            uint32_t b = r0(sd);
+            w0(sd, (b & 0x00FFFFFFu) | 0x2u | kSdIntMask, 32, "M5 SD RUN=1 (hda_dsp_stream_trigger START)");
+            m5Flags |= kF5Run;
+            bool ok = poll0(sd, 2, 2, kStreamRunTimeoutUs, 10, &v, &el);
+            o[1] = b; o[2] = r0(sd); o[3] = el; o[4] = r0(sd + 0x04);
+            o[0] = ok ? kM2Ok : kM2Timeout;
+        } else if (a0 == 2) {   // hda_dsp_stream_trigger STOP
+            o[1] = r0(sd); o[4] = r0(sd + 0x04);
+            w0(sd, r0(sd) & 0x00FFFFE1u, 32, "M5 SD RUN=0, int-enable off (STOP)");
+            bool ok = poll0(sd, 2, 0, kStreamRunTimeoutUs, 10, &v, &el);
+            if (ok) { w0(sd + 3, kSdIntMask, 8, "M5 SD STS clear"); m5Flags &= ~kF5Run; }
+            o[2] = r0(sd); o[3] = el;
+            o[0] = ok ? kM2Ok : kM2Timeout;
+        } else if (a0 == 3) {   // hda_dsp_stream_hw_free (757-787) + _hda_dsp_stream_put DMI L1 (hda-stream.c:296-340)
+            if (m5Flags & kF5Run) { o[0] = kM2Precond; o[15] = m5Flags; break; }
+            streamReset(idx, &rc);
+            w0(ppOff + 0x04, r0(ppOff + 0x04) & ~(1u << idx), 32, "M5 PPCTL PROCEN(playback)=0 (couple)");
+            if (m5Flags & kF5L1) { uint32_t em2 = r0(0x1030); w0(0x1030, em2 | (1u << 13), 32, "M5 EM2.L1SEN=1 (stream put)"); m5Flags &= ~kF5L1; }
+            m5Flags &= ~kF5Prep;
+            o[1] = r0(sd); o[2] = r0(ppOff + 0x04); o[3] = r0(0x1030); o[4] = rc;
+            o[0] = rc ? kM2Timeout : kM2Ok;
+        } else o[0] = kM2BadOp;
+        break;
+    }
+    case kM5OpRegW: {
+        uint32_t off = (uint32_t)a0, width = (uint32_t)(a0 >> 32);
+        if ((width != 16 && width != 32) || !m5Allowed(off, width)) {
+            o[0] = kM2BadOp; IOLog("AudShim M5: refused register write%u to 0x%x\n", width, off); break;
+        }
+        uint32_t b = (width == 16) ? r4h(off) : r4(off);
+        if (width == 16) w4h(off, (uint16_t)a1); else w4(off, (uint32_t)a1);
+        uint32_t aft = (width == 16) ? r4h(off) : r4(off);
+        m5Flags |= kF5Port;
+        m5Log("stream register", off, b, aft);
+        o[1] = b; o[2] = aft;
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM5OpXfer: {
+        uint32_t l = (uint32_t)(a0 & 0xFF), cnt = (uint32_t)((a0 >> 8) & 0xFF), cmd = (uint32_t)((a0 >> 16) & 0xFF);
+        uint32_t dev = (uint32_t)((a0 >> 24) & 0xF), dat = (uint32_t)((a0 >> 32) & 0xFF), addr = (uint32_t)a1;
+        bool ok = (l == 1 || l == 2) && m4Step[l] == kLRun && m4LinkPowered(l) && dev == 1 &&
+                  ((cmd == 2 && cnt >= 1 && cnt <= 6) || (cmd == 3 && cnt == 1)) &&
+                  m5RtRegOk(addr, cmd == 3) && m5RtRegOk(addr + cnt - 1, cmd == 3);
+        if (!ok) {
+            o[0] = kM2BadOp;
+            IOLog("AudShim M5: refused RT1316 access link %u dev %u cmd %u addr 0x%x cnt %u\n", l, dev, cmd, addr, cnt);
+            break;
+        }
+        if (cmd == 3) m5Flags |= kF5Amp;
+        m5Xfer(l, cmd, dev, addr, cnt, dat, kCdnsTxTimeoutMs * 1000, o);
+        IOLog("AudShim M5: link %u %s dev %u 0x%08x%s%02x -> %s\n", l, cmd == 3 ? "WRITE" : "READ ", dev, addr,
+              cmd == 3 ? " = 0x" : " x", cmd == 3 ? dat : cnt, o[1] == 0 ? "ok" : o[1] == 1 ? "IGNORED" : o[1] == 2 ? "NACK" : "TIMEOUT");
+        o[0] = kM2Ok;
+        break;
+    }
+    case kM5OpBank: {
+        // do_bank_switch (stream.c:857-965) for a 2-link stream with bus->multi_link and hw_sync_min_links 1
+        // (intel_auxdevice.c:400-414): per link intel_pre_bank_switch = sync arm (CMDSYNC, intel.c:500-513)
+        // + sdw_bank_switch = deferred broadcast write of SCP_FrameCtrl_B<next> (col idx | row idx << 3)
+        // with the SSP tag (stream.c:754-827, cadence_master.c:627-650, 793-809); then post_bank_switch of
+        // the first link = SYNCGO (intel_bus_common.c:257-280); then sdw_ml_sync_bank_switch waits for the
+        // deferred responses (stream.c:829-855, DEFAULT_BANK_SWITCH_TIMEOUT 3000 ms, bus.h:7).
+        uint32_t mask = (uint32_t)a0, bank = (uint32_t)a1;
+        if (mask != 0x6 || bank > 1) { o[0] = kM2BadOp; break; }
+        for (uint32_t l = 1; l <= 2; l++)
+            if (m4Step[l] != kLRun || !m4LinkPowered(l)) { o[0] = kM2Precond; o[1] = l; break; }
+        if (o[0]) break;
+        uint32_t fc = bank ? 0x70 : 0x60, val = (1u << 3) | 1u;   // rows 50 -> idx 1, cols 4 -> idx 1 (stream.c:29-34)
+        o[1] = r4(kSdwSYNC);
+        o[2] = r4(cdnsBase(1) + kCdSTAT) | ((uint64_t)r4(cdnsBase(2) + kCdSTAT) << 32);
+        for (uint32_t l = 1; l <= 2; l++) {
+            uint32_t sy = r4(kSdwSYNC);
+            w4(kSdwSYNC, sy | (kSyncCmdSync << l));                                   // intel_shim_sync_arm
+            uint32_t b = cdnsBase(l);
+            if (m4MsgCount[l] != 1) { w4(b + kCdFIFOLVL, 1); m4MsgCount[l] = 1; }
+            w4(b + kCdCMD, (1u << 31) | (3u << 28) | (15u << 24) | (fc << 8) | val); // SSP_TAG | WRITE | dev 15
+        }
+        uint32_t sy = r4(kSdwSYNC);
+        o[3] = sy;
+        if (sy & kSyncCmdSyncMask) w4(kSdwSYNC, sy | kSyncGO);                       // intel_shim_sync_go_unlocked
+        o[4] = r4(kSdwSYNC);
+        m5Flags |= kF5Bank;
+        uint64_t t0 = nowUs();
+        uint32_t bad = 0;
+        for (uint32_t l = 1; l <= 2; l++) {
+            uint32_t b = cdnsBase(l), is = 0, fs = 0, t = 0;
+            bool got = false;
+            while (t < 3000000) {
+                is = r4(b + kCdINTSTAT); fs = r4(b + kCdFIFOSTAT);
+                if ((is & kIntRXWL) || (fs & 0x3F) >= 1) { got = true; break; }
+                if (t < 2000) IODelay(10); else IOSleep(1);
+                t = (uint32_t)(nowUs() - t0);
+            }
+            uint32_t resp = 0, k = r4(b + kCdFIFOSTAT) & 0x3F;
+            for (uint32_t i = 0; i < k && i < 10; i++) { uint32_t x = r4(b + kCdCMD + 4 * i); if (!i) resp = x; }
+            if (got) w4(b + kCdINTSTAT, kIntRXWL);
+            o[5 + 3 * (l - 1)] = resp | ((uint64_t)k << 32);
+            o[6 + 3 * (l - 1)] = (uint32_t)(nowUs() - t0) | ((uint64_t)got << 32);
+            if (!got) bad |= 1u << l;   // Linux fails only on the timeout (sdw_ml_sync_bank_switch, stream.c:829-855)
+        }
+        IODelay(200);   // ~10 frames at 48 kHz: the new bank is active from the frame after the FrameCtrl write
+        for (uint32_t l = 1; l <= 2; l++) {
+            o[7 + 3 * (l - 1)] = r4(cdnsBase(l) + kCdSTAT);
+            IOLog("AudShim M5: link %u bank switch to %u: %s resp 0x%08x MCP_STAT 0x%08x\n", l, bank,
+                  (o[6 + 3 * (l - 1)] >> 32) ? "response" : "TIMEOUT", (uint32_t)o[5 + 3 * (l - 1)], (uint32_t)o[7 + 3 * (l - 1)]);
+        }
+        o[11] = r4(kSdwSYNC); o[12] = bad;
+        o[0] = bad ? kM2Timeout : kM2Ok;
+        break;
+    }
+    default:
+        o[0] = kM2BadOp;
+    }
+}
+
+// ------------------------------------------------------- AudShimUserClient
+
+const IOExternalMethodDispatch AudShimUserClient::sMethods[kAudShimMethodCount] = {
+    {sInfo, 0, 0, 16, 0},
+    {sCfgRead, 1, 0, 1, 0},
+    {sMmioRead, 2, 0, 1, 0},
+    {sMseInfo, 0, 0, 4, 0},
+    {sM2, 3, 0, 16, 0},
+};
+
+bool AudShimUserClient::start(IOService *provider) {
+    shim = OSDynamicCast(AudShim, provider);
+    return shim && IOUserClient::start(provider);
+}
+
+IOReturn AudShimUserClient::clientClose() {
+    if (shim) shim->m2ClientGone(this);   // M2: auto-rollback if this connection was mid-sequence
+    terminate();
+    return kIOReturnSuccess;
+}
+
+IOReturn AudShimUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+                                           IOExternalMethodDispatch *dispatch, OSObject *target,
+                                           void *reference) {
+    if (selector >= kAudShimMethodCount) return kIOReturnUnsupported;
+    return IOUserClient::externalMethod(selector, args,
+                                        (IOExternalMethodDispatch *)&sMethods[selector], this, nullptr);
+}
+
+static uint64_t barInfo(IOPCIDevice *pci, uint8_t reg, uint64_t *len) {
+    IODeviceMemory *m = pci->getDeviceMemoryWithRegister(reg);
+    *len = m ? m->getLength() : 0;
+    return m ? m->getPhysicalAddress() : 0;
+}
+
+// o[0] cfg 0x00 (ids)        o[1] cfg 0x08 (class/rev)   o[2] cfg 0x2C (subsystem)
+// o[3] cfg 0x04 (cmd/status) o[4] BAR0 phys o[5] BAR0 len o[6] BAR4 phys o[7] BAR4 len
+// o[8] cfg 0x10 o[9] cfg 0x14 o[10] cfg 0x20 o[11] cfg 0x24 (raw BAR registers)
+// o[12] PM cap offset        o[13] PMCSR (0 if no PM cap)
+// o[14] flags: b0 BAR0 mapped, b1 BAR0 ro, b2 BAR4 mapped, b3 BAR4 ro, b4 mmio ready
+// o[15] AudShim interface version (1 = M1 read-only, 2 = M1b: + MSE at start, method 3,
+//       3 = M2: + method 4, opt-in DSP core 0 / ROM sequence)
+IOReturn AudShimUserClient::sInfo(OSObject *t, void *, IOExternalMethodArguments *a) {
+    AudShim *s = ((AudShimUserClient *)t)->shim;
+    IOPCIDevice *pci = s->pci;
+    uint64_t *o = a->scalarOutput;
+    for (int i = 0; i < 16; i++) o[i] = 0;
+    o[0] = pci->configRead32(0x00);
+    o[1] = pci->configRead32(0x08);
+    o[2] = pci->configRead32(0x2C);
+    o[3] = pci->configRead32(0x04);
+    o[4] = barInfo(pci, kIOPCIConfigBaseAddress0, &o[5]);
+    o[6] = barInfo(pci, kIOPCIConfigBaseAddress4, &o[7]);
+    o[8] = pci->configRead32(0x10);
+    o[9] = pci->configRead32(0x14);
+    o[10] = pci->configRead32(0x20);
+    o[11] = pci->configRead32(0x24);
+    o[12] = s->pmCap;
+    o[13] = s->pmCap ? pci->configRead32(s->pmCap + 4) : 0;
+    o[14] = (s->map0 ? 1 : 0) | (s->ro0 ? 2 : 0) | (s->map4 ? 4 : 0) | (s->ro4 ? 8 : 0) |
+            (s->mmioReady() == kIOReturnSuccess ? 16 : 0);
+    o[15] = 7;   // interface v7 = M5 (AudShim 0.7.0)
+    a->scalarOutputCount = 16;
+    return kIOReturnSuccess;
+}
+
+IOReturn AudShimUserClient::sCfgRead(OSObject *t, void *, IOExternalMethodArguments *a) {
+    AudShim *s = ((AudShimUserClient *)t)->shim;
+    uint64_t off = a->scalarInput[0];
+    if (off > 0xFFC || (off & 3)) return kIOReturnBadArgument;
+    a->scalarOutput[0] = s->cfg32((uint32_t)off);
+    a->scalarOutputCount = 1;
+    return kIOReturnSuccess;
+}
+
+// o[0] MSE state (kMse*), o[1] command at start, o[2] command after start, o[3] command now
+IOReturn AudShimUserClient::sMseInfo(OSObject *t, void *, IOExternalMethodArguments *a) {
+    AudShim *s = ((AudShimUserClient *)t)->shim;
+    a->scalarOutput[0] = s->mseState;
+    a->scalarOutput[1] = s->cmdOrig;
+    a->scalarOutput[2] = s->cmdAfter;
+    a->scalarOutput[3] = s->pci->configRead16(kIOPCIConfigCommand);
+    a->scalarOutputCount = 4;
+    return kIOReturnSuccess;
+}
+
+IOReturn AudShimUserClient::sMmioRead(OSObject *t, void *, IOExternalMethodArguments *a) {
+    AudShim *s = ((AudShimUserClient *)t)->shim;
+    uint32_t v = 0;
+    IOReturn r = s->mmioRead((unsigned)a->scalarInput[0], a->scalarInput[1], &v);
+    if (r) return r;
+    a->scalarOutput[0] = v;
+    a->scalarOutputCount = 1;
+    return kIOReturnSuccess;
+}
+
+// M2 (method 4): in[0] op, in[1] a0, in[2] a1 -> 16 outputs; out[0] = kM2* result code.
+IOReturn AudShimUserClient::sM2(OSObject *t, void *, IOExternalMethodArguments *a) {
+    AudShimUserClient *uc = (AudShimUserClient *)t;
+    AudShim *s = uc->shim;
+    if (!s || !s->m2Lock) return kIOReturnNotReady;
+    s->m2Op(uc, a->scalarInput[0], a->scalarInput[1], a->scalarInput[2], a->scalarOutput);
+    a->scalarOutputCount = 16;
+    return kIOReturnSuccess;
+}

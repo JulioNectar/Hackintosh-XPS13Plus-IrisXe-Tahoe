@@ -35,7 +35,7 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | System Settings › Displays, colour profiles | ⚠️ may panic: change resolution with `tools/xe-res` and keep the factory colour profile |
 | WindowServer hang | ⚠️ rare, before login or on a UI-scale change (reboot recovers); fix in testing (csbresync) |
 
-Everything else about the laptop (Wi-Fi via itlwm/HeliPort, Bluetooth, NVMe, battery) is a regular OpenCore setup. Internal audio (SoundWire RT714/RT1316) and the camera do **not** work on macOS.
+Everything else about the laptop (native Wi-Fi via AirportItlwm, Bluetooth, NVMe, battery) is a regular OpenCore setup. The camera does **not** work on macOS. **Internal speakers: in progress** — our own `AudShim` kext boots the Intel cAVS 2.5 audio DSP with Intel's SOF firmware, starts SoundWire, initialises the two RT1316 amplifiers and has played a test tone on both speakers (2026-10-22); the macOS output device (CoreAudio) is next.
 
 ## How it works (one paragraph)
 
