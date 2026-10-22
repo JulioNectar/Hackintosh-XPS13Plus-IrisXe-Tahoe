@@ -19,7 +19,7 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 | Frequência da GPU | ✅ ~1300 MHz sob carga (pede 1500 MHz; o limite de energia do processador, PL4/IccMax, segura em ~1300), repouso em RC6 |
 | Processador | ✅ **os 16 threads (4 núcleos P com HT + 8 núcleos E)**: os núcleos E travavam o boot; corrigido com um byte no `Cpuid1Data`. O CpuTopologyRebuild 2.0.2 (modo padrão) agrupa como 4 núcleos P com 4 threads cada, então o trabalho pesado vai para os núcleos P; Informações do Sistema mostra 12 núcleos |
 | Imagens HEIC/YUV (papéis de parede, fotos) | ✅ |
-| Ícones de apps, Finder, miniaturas | ✅ (camadas no formato de 10 bits com faixa estendida, `w30r`/`BGR10_XR`, ainda não aparecem) |
+| Ícones de apps, Finder, miniaturas | ✅ (o formato de 10 bits com faixa estendida `w30r`/`BGR10_XR` é exclusivo dos chips Apple: nem os Macs Intel de verdade o desenham) |
 | Decodificação de vídeo por hardware | ✅ **H.264 na GPU** (idêntico ao software) para apps que usam o VideoToolbox: QuickTime, Fotos, editores, conversões. Precisa de `-ngreengva` e do plugin VA corrigido (`macos/vadriver/build-vadriver.sh`, instalação manual por enquanto) · ✅ **HEVC** também (XE-GVAHEVC no NootedGreen) · ⚠️ o Safari decodifica na CPU: o processo GPU do WebKit não pode carregar drivers de `/Library/GPUBundles` |
 | YouTube | ✅ Chrome com GPU, até 4K (VP9/AV1 decodificados na CPU) · ✅ Safari até 1080p H.264 (precisa de uma saída de áudio: Bluetooth ou o BlackHole virtual, `tools/build-blackhole.sh`) |
 | Gravação de tela | ✅ |

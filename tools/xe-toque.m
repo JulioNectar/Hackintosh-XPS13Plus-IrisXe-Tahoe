@@ -4,6 +4,7 @@
 //  - an active CGEventTap drops the pointer events VoodooI2C synthesizes for the touchscreen (recognised by CGEvent
 //    field 87 = sender registry ID) whenever xe-toque's own gesture handling owns the touch, and posts its own events:
 //    1 finger: drag = scroll with momentum, tap = click, hold 0.5 s = right click, hold then drag = left drag
+//    window-buttons magnet: a tap near close/minimize/zoom presses the nearest one
 //    edges: swipe in from the right = Notification Center, swipe up from the bottom = Mission Control
 //    optional own multi-finger: 2 = scroll, 3 horizontal = switch Space, 5 pinch = Apps; 2-finger hold = magnifier
 //  - menu-bar item with the toggles (stored in NSUserDefaults, domain local.xe.toque)
@@ -172,9 +173,15 @@ static void onda(CGPoint g, int tipo) {
     // ripples
     Onda *o = ondas.mutableBytes; NSUInteger n = ondas.length / sizeof(Onda), k = 0;
     for (NSUInteger i = 0; i < n; i++) {
-        double dur = o[i].tipo ? 0.45 : 0.35, a = (t - o[i].t) / dur;
+        double dur = o[i].tipo == 2 ? 0.55 : o[i].tipo ? 0.45 : 0.35, a = (t - o[i].t) / dur;
         if (a >= 1) continue;
         o[k++] = o[i];
+        if (o[i].tipo == 2) {  // magnet: ring closing in on the pressed window button
+            double rr2 = 22 - 12 * a;
+            NSBezierPath *b = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(o[i].p.x - rr2, o[i].p.y - rr2, 2 * rr2, 2 * rr2)];
+            b.lineWidth = 3; [[NSColor.systemBlueColor colorWithAlphaComponent:0.9 * (1 - a)] setStroke]; [b stroke];
+            continue;
+        }
         double raio = o[i].tipo ? 44 - 20 * a : 8 + 28 * a;
         NSRect rr = NSMakeRect(o[i].p.x - raio, o[i].p.y - raio, 2 * raio, 2 * raio);
         NSBezierPath *b = [NSBezierPath bezierPathWithOvalInRect:rr];
@@ -327,6 +334,145 @@ static void cliqueDireito(CGPoint p) {
     mouse(kCGEventRightMouseUp, p, kCGMouseButtonRight, 1);
 }
 
+// ---------------------------------------------------------------- window-buttons magnet
+// A touchscreen tap within IMA_R pt of a window's close / minimize / zoom button (and inside the window's top IMA_BAND pt)
+// presses the nearest of those buttons (AXPress, fallback: click at its centre). Lookup runs off the main thread.
+
+#define IMA_R 22.0
+#define IMA_BAND 52.0
+
+typedef struct { BOOL ok; CGPoint centro; CGRect frame; AXUIElementRef botao; NSString *nome, *janela, *motivo, *hit; pid_t pid; } Ima;
+
+static CFTypeRef axAttr(AXUIElementRef e, CFStringRef a) { CFTypeRef v = NULL; AXUIElementCopyAttributeValue(e, a, &v); return v; }
+static BOOL axFrame(AXUIElementRef e, CGRect *r) {
+    CFTypeRef p = axAttr(e, kAXPositionAttribute), s = axAttr(e, kAXSizeAttribute);
+    BOOL ok = p && s && AXValueGetValue(p, kAXValueCGPointType, &r->origin) && AXValueGetValue(s, kAXValueCGSizeType, &r->size);
+    if (p) CFRelease(p); if (s) CFRelease(s);
+    return ok;
+}
+static NSString *axStr(AXUIElementRef e, CFStringRef a) {
+    CFTypeRef v = axAttr(e, a);
+    if (v && CFGetTypeID(v) == CFStringGetTypeID()) return CFBridgingRelease(v);
+    if (v) CFRelease(v);
+    return nil;
+}
+
+// Decides which traffic-light button (if any) a tap at p should press. Caller releases r.botao.
+static Ima imaProcurar(CGPoint p) {
+    Ima r = { NO };
+    // 1. topmost on-screen window under the point (cheap; avoids AX for taps far from any title bar)
+    NSArray *ws = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    NSDictionary *alvo = nil; CGRect wb = CGRectZero;
+    CGDirectDisplayID dd = 0; uint32_t ndd = 0;
+    CGRect tela0 = CGGetDisplaysWithPoint(p, 1, &dd, &ndd) == kCGErrorSuccess && ndd ? CGDisplayBounds(dd) : CGRectInfinite;
+    for (NSDictionary *w in ws) {
+        CGRect b;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(id)kCGWindowBounds], &b)) continue;
+        if (!CGRectContainsPoint(b, p)) continue;
+        if ([w[(id)kCGWindowOwnerPID] intValue] == getpid() || [w[(id)kCGWindowAlpha] doubleValue] <= 0.01) continue;
+        int layer = [w[(id)kCGWindowLayer] intValue];
+        if (layer != 0 && b.size.width >= tela0.size.width && b.size.height >= tela0.size.height - 40) continue;  // e.g. Dock's full-screen window
+        if (layer != 0) { r.motivo = [NSString stringWithFormat:@"covered by layer-%d window of %@", layer, w[(id)kCGWindowOwnerName]]; return r; }
+        alvo = w; wb = b; break;
+    }
+    if (!alvo) { r.motivo = @"no window under the point"; return r; }
+    r.pid = [alvo[(id)kCGWindowOwnerPID] intValue];
+    r.janela = [NSString stringWithFormat:@"%@ \"%@\" (%.0f,%.0f %.0fx%.0f)", alvo[(id)kCGWindowOwnerName], alvo[(id)kCGWindowName] ?: @"",
+                wb.origin.x, wb.origin.y, wb.size.width, wb.size.height];
+    if (p.y - wb.origin.y > IMA_BAND) { r.motivo = @"below the title-bar band"; return r; }
+    // 2. its AX window (same frame) and buttons
+    AXUIElementRef app = AXUIElementCreateApplication(r.pid);
+    AXUIElementSetMessagingTimeout(app, 0.25);
+    CFTypeRef lista = axAttr(app, kAXWindowsAttribute);
+    AXUIElementRef win = NULL;
+    if (lista && CFGetTypeID(lista) == CFArrayGetTypeID())
+        for (id w in (__bridge NSArray *)lista) {
+            CGRect f;
+            if (axFrame((__bridge AXUIElementRef)w, &f) && fabs(f.origin.x - wb.origin.x) < 2 && fabs(f.origin.y - wb.origin.y) < 2 &&
+                fabs(f.size.width - wb.size.width) < 2 && fabs(f.size.height - wb.size.height) < 2) { win = (AXUIElementRef)CFRetain((__bridge CFTypeRef)w); break; }
+        }
+    if (lista) CFRelease(lista);
+    if (!win) { r.motivo = @"no matching AX window"; CFRelease(app); return r; }
+    CFTypeRef fs = axAttr(win, CFSTR("AXFullScreen"));
+    if (fs && CFBooleanGetValue(fs)) r.motivo = @"window is full screen";
+    if (fs) CFRelease(fs);
+    CFStringRef attrs[3] = { kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute };
+    NSString *nomes[3] = { @"close", @"minimize", @"zoom" };
+    AXUIElementRef bts[3] = { NULL }; double melhor = IMA_R; int iBest = -1;
+    for (int i = 0; i < 3 && !r.motivo; i++) {
+        CFTypeRef b = axAttr(win, attrs[i]);
+        if (!b || CFGetTypeID(b) != AXUIElementGetTypeID()) { if (b) CFRelease(b); continue; }
+        bts[i] = (AXUIElementRef)b;
+        CGRect f; if (!axFrame(bts[i], &f) || f.size.width < 1 || !CGRectContainsRect(CGRectInset(wb, -1, -1), f)) continue;
+        CFTypeRef en = axAttr(bts[i], kAXEnabledAttribute);
+        BOOL ligado = !en || CFBooleanGetValue(en); if (en) CFRelease(en);
+        if (!ligado) continue;
+        double d = dist(p, CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f)));
+        if (d <= melhor) { melhor = d; iBest = i; r.frame = f; }
+    }
+    if (!r.motivo && iBest < 0) r.motivo = [NSString stringWithFormat:@"no enabled button within %.0f pt", IMA_R];
+    // 3. a tap that lands on some other control (e.g. a toolbar button next to the lights) is left alone
+    if (!r.motivo) {
+        AXUIElementRef el = NULL;
+        if (AXUIElementCopyElementAtPosition(app, p.x, p.y, &el) == kAXErrorSuccess && el) {
+            BOOL ehBotao = NO;
+            for (int i = 0; i < 3; i++) if (bts[i] && CFEqual(el, bts[i])) ehBotao = YES;
+            NSString *role = axStr(el, kAXRoleAttribute);
+            r.hit = [NSString stringWithFormat:@"%@/%@", role, axStr(el, kAXSubroleAttribute)];
+            NSSet *controles = [NSSet setWithArray:@[@"AXButton", @"AXCheckBox", @"AXRadioButton", @"AXPopUpButton", @"AXMenuButton",
+                @"AXTextField", @"AXTextArea", @"AXComboBox", @"AXSlider", @"AXSegmentedControl", @"AXTabGroup", @"AXLink",
+                @"AXIncrementor", @"AXDisclosureTriangle", @"AXSearchField", @"AXMenuBarItem"]];
+            if (!ehBotao && role && [controles containsObject:role])
+                r.motivo = [NSString stringWithFormat:@"tap is on another control (%@ \"%@\")", role,
+                            axStr(el, kAXDescriptionAttribute) ?: axStr(el, kAXTitleAttribute) ?: @""];
+            CFRelease(el);
+        }
+    }
+    if (!r.motivo) {
+        r.ok = YES; r.botao = (AXUIElementRef)CFRetain(bts[iBest]); r.nome = nomes[iBest];
+        r.centro = CGPointMake(CGRectGetMidX(r.frame), CGRectGetMidY(r.frame));
+        r.motivo = [NSString stringWithFormat:@"%.1f pt from the %@ button", melhor, r.nome];
+    }
+    for (int i = 0; i < 3; i++) if (bts[i]) CFRelease(bts[i]);
+    CFRelease(win); CFRelease(app);
+    return r;
+}
+
+static dispatch_queue_t filaIma;
+
+// tap = click, unless the magnet redirects it to a traffic-light button. Order of taps is kept (serial queue -> main).
+static void toque1(CGPoint p) {
+    if (!opt(@"magnet") || !AXIsProcessTrusted()) { clique(p); return; }
+    dispatch_async(filaIma, ^{
+        double t = agora();
+        Ima r = imaProcurar(p);
+        double ms = (agora() - t) * 1000;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!r.ok) { clique(p); return; }
+            AXError e = AXUIElementPerformAction(r.botao, kAXPressAction);
+            if (e != kAXErrorSuccess) { mouse(kCGEventLeftMouseDown, r.centro, kCGMouseButtonLeft, 1); mouse(kCGEventLeftMouseUp, r.centro, kCGMouseButtonLeft, 1); }
+            ultClickT = 0;  // a following tap is not a double click
+            onda(r.centro, 2);
+            xlog(@"magnet: tap (%.0f,%.0f) -> %@ of %@ (%@; lookup %.0f ms; %@)", p.x, p.y, r.nome, r.janela, r.motivo, ms,
+                 e == kAXErrorSuccess ? @"AXPress" : [NSString stringWithFormat:@"AXPress err %d, clicked", e]);
+            CFRelease(r.botao);
+        });
+    });
+}
+
+static int testeIma(double x, double y) {  // xe-toque --test-magnet x y: report only, never clicks
+    printf("accessibility=%d\n", AXIsProcessTrusted());
+    double t = agora();
+    Ima r = imaProcurar(CGPointMake(x, y));
+    NSString *s = [NSString stringWithFormat:@"test-magnet (%.0f,%.0f): %@ | window: %@ | %@ | hit %@ | %.0f ms", x, y,
+                   r.ok ? [NSString stringWithFormat:@"-> %@ button at (%.0f,%.0f)", r.nome, r.centro.x, r.centro.y] : @"no redirect (plain click)",
+                   r.janela ?: @"-", r.motivo, r.hit ?: @"-", (agora() - t) * 1000];
+    printf("%s\n", s.UTF8String);
+    xlog(@"%@", s);
+    if (r.botao) CFRelease(r.botao);
+    return r.ok ? 0 : 1;
+}
+
 static double espalhamento(Contato *c, int n, CGPoint m) {
     double s = 0; for (int i = 0; i < n; i++) s += dist(c[i].p, m); return n ? s / n : 0;
 }
@@ -338,8 +484,8 @@ static void entrarMulti(Contato *c, int n, CGPoint m, double t) {
 
 static void soltar(double t) {  // all fingers lifted
     switch (est) {
-        case PEND: if (maxN == 1 && opt(@"scroll1")) clique(p0); break;
-        case EDGER: case EDGEB: if (maxN == 1) clique(p0); break;
+        case PEND: if (maxN == 1 && opt(@"scroll1")) toque1(p0); break;
+        case EDGER: case EDGEB: if (maxN == 1) toque1(p0); break;
         case SCROLL: scrollFim(YES, t); break;
         case HOLD: cliqueDireito(p0); break;
         case DRAG: mouse(kCGEventLeftMouseUp, pUlt, kCGMouseButtonLeft, 1); break;
@@ -744,7 +890,8 @@ static void atualizarMenu(void) {
     NSArray *ts = @[@[@"Trail", @"trail"], @[@"Ripple at touch", @"ripple"], @[@"One-finger scroll (tap/hold/drag)", @"scroll1"],
                     @[@"Edge swipes (right: Notifications, bottom: Mission Control)", @"edges"],
                     @[@"xe-toque handles 2–5 fingers (else macOS)", @"ownMulti"],
-                    @[@"Magnifier (two-finger hold)", @"lupa"]];
+                    @[@"Magnifier (two-finger hold)", @"lupa"],
+                    @[@"Window buttons magnet (taps near close/minimize/zoom)", @"magnet"]];
     for (NSArray *a in ts) add(m, a[0], @selector(alternar:), a[1], nil).state = opt(a[1]) ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:NSMenuItem.separatorItem];
     NSString *tt = [NSString stringWithFormat:@"Touch mode (larger UI, %ld pt wide)", (long)[ud integerForKey:@"touchWidth"]];
@@ -777,19 +924,21 @@ int xeProbeEvents(int argc, const char **argv);
 
 int main(int argc, const char **argv) { @autoreleasepool {
     if (argc > 1 && !strcmp(argv[1], "--probe-events")) return xeProbeEvents(argc, argv);
+    if (argc > 3 && !strcmp(argv[1], "--test-magnet")) return testeIma(atof(argv[2]), atof(argv[3]));
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     [NSFileManager.defaultManager createDirectoryAtPath:[@"~/xe/build/toque" stringByExpandingTildeInPath]
                             withIntermediateDirectories:YES attributes:nil error:nil];
     ud = NSUserDefaults.standardUserDefaults;
     [ud registerDefaults:@{@"trail": @YES, @"ripple": @YES, @"scroll1": @YES, @"edges": @YES, @"ownMulti": @NO,
-                           @"lupa": @NO, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": @"~/xe/build/xe-res"}];
+                           @"lupa": @NO, @"magnet": @YES, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": @"~/xe/build/xe-res"}];
     gOwnMulti = opt(@"ownMulti");
     src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     rastros = [NSMutableArray array];
     for (int i = 0; i < MAXF; i++) [rastros addObject:[NSMutableData data]];
     ondas = [NSMutableData data]; tracos = [NSMutableArray array]; tracoAtual = [NSMutableDictionary dictionary];
     idsAntes = [NSMutableSet set];
+    filaIma = dispatch_queue_create("xe.toque.magnet", DISPATCH_QUEUE_SERIAL);
 
     janela = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 100, 100) styleMask:NSWindowStyleMaskBorderless
                                            backing:NSBackingStoreBuffered defer:NO];

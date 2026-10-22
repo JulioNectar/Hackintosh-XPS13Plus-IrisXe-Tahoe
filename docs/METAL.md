@@ -128,7 +128,7 @@ has it, the TGL one doesn't; without it HEVC fails with `-12906`). Safari can't 
 
 ## 6. Known gaps in this layer
 
-- `BGR10_XR` / `w30r` (extended-range 10-bit) isn't supported by the 16.0.32 driver.
+- `BGR10_XR` / `w30r` (extended-range 10-bit) is not available on any Intel/AMD Mac: Metal's format validation requires the Apple1 GPU family, CoreAnimation only maps `w30r`/`w40a` for Apple2+ devices, and the 16.0.32 driver/Gen12 hardware have no XR surface format. Forcing CoreAnimation's Apple2 bit makes 10-bit 4:2:2/4:2:0 video use Apple-only multi-plane formats (crash), so it stays unsupported.
 - Hardware video decode needs `-ngreengva` and the plugin above (section 5); Safari still decodes on the CPU, and
   hardware encode is untested. Without `-ngreengva` (XE-NOGVA) VideoToolbox decodes and converts in software.
 - Chrome's own GPU path (ANGLE/Metal) draws blank windows.

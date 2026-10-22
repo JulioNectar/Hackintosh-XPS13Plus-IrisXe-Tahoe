@@ -8,6 +8,8 @@ The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
 
 | Date | Change | Status |
 |---|---|---|
+| 2026-10-22 | `tools/xe-haptic.c`: reads the Elan haptic touchpad's feature reports and sets the click-vibration intensity (report 0x09: intensity, second byte 0–100); confirmed it changes the vibration | confirmed |
+| 2026-10-22 | `tools/xe-toque`: **window buttons magnet** (menu toggle, on by default) — a touchscreen tap within 22 pt of a window's close/minimize/zoom button (in the top 52 pt of the window) presses the nearest one via AXPress; lookup off the main thread; `--test-magnet X Y` self-test | testing |
 | 2026-10-21 | **Clean, fast boot screen**: OpenCore `Resolution=Max`; WhateverGreen `gfxrst=1` (its framebuffer-copy mode read the whole boot screen through a slow mapping: ~18 s at 3840x2400, the "Max is slow" effect); NootedGreen **XE-BOOTHOLD** keeps the backlight and plane A off from Apple's first tiled plane write until WindowServer's buffer ring wraps (no garbage flash; `-xenobb` disables, `xebbms=` tunes); OpenCore file logging off and picker timeout 1 s | confirmed |
 | 2026-10-21 | `xe-brilho daemon` no longer restores its saved level at login (it lowered the panel behind the macOS slider); signed with a stable identity so Accessibility survives rebuilds | confirmed |
 | 2026-10-21 | **libxedrv v17**: private render-target Stencil8/X32_Stencil8 textures that are not 64 KB-aligned are re-created in their own 64 KB-aligned heap (the driver used 4 KB alignment). Fixes the streaks in the lock-screen clock (SwiftUI RenderBox stencil pass). `XE_STENCIL_NATIVO=1` turns it off | confirmed |

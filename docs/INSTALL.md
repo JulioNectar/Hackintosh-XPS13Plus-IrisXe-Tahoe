@@ -85,6 +85,12 @@ A hand icon in the menu bar holds the toggles (saved in `defaults read local.xe.
 - **One-finger scroll**: drag scrolls with momentum, tap clicks (double-tap works), hold 0.5 s = right click,
   hold then drag = left drag/selection. VoodooI2C's own pointer events for the touch are filtered out (CGEvent field 87 =
   sender registry ID of the touchscreen driver); the trackpad and mouse are never filtered.
+- **Window buttons magnet** (on by default; needs One-finger scroll, since it acts on xe-toque's own taps): a tap within
+  22 pt of a window's close / minimize / zoom button, inside the window's top 52 pt, presses the nearest of those buttons
+  (Accessibility AXPress, falling back to a click at its centre) and flashes a blue ring on it. Not applied to taps that
+  land on another control (toolbar button, tab, text field…), to full-screen windows, or to the trackpad/mouse. Each
+  redirect is logged (`magnet: tap … -> close of …`). Check a point without clicking:
+  `xe-toque.app/Contents/MacOS/xe-toque --test-magnet X Y` (global points, top-left origin).
 - **Edge swipes**: in from the right edge = Notification Center (presses the menu-bar clock via Accessibility),
   up from the bottom edge = Mission Control.
 - Two-, three- and four-finger gestures on the screen already reach macOS as trackpad gestures (VoodooI2C feeds them to an
