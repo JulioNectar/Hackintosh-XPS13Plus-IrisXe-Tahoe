@@ -7,8 +7,9 @@
 #   out/xe.bundle                               shader compiler stack
 # Then: sudo zsh macos/install-macos.sh <sle/> <le/>
 set -e
-SLE=${1:?pasta sle/ (bundles 16.0.32)}
+SLE=${1:?usage: build-all.sh <NootedGreen sle_Internal/sle folder> (16.0.32 bundles)}
 HERE=${0:A:h}; OUT=$HERE/out
+[[ -d $SLE/AppleIntelTGLGraphicsMTLDriver.bundle ]] || { echo "$SLE has no AppleIntelTGLGraphicsMTLDriver.bundle: pass NootedGreen's sle_Internal/sle folder"; exit 1; }
 # FAT/exFAT (USB sticks) keep macOS metadata in "._" files: bundles copied there break codesign and the build
 for d in $HERE $SLE; do
   fs=$(diskutil info "$(df -P "$d" | awk 'NR==2{print $1}')" 2>/dev/null | awk -F': *' '/Type \(Bundle\)/{print $2}')

@@ -1,11 +1,15 @@
 #!/bin/zsh
 # xe-sleep-diag.sh: diagnóstico da tela que não acorda depois do repouso da tela.
-#   zsh ~/xe/tools/xe-sleep-diag.sh    (segundo plano; saída em ~/xe/logs/sleep-*.txt)
+#   zsh tools/diagnostics/xe-sleep-diag.sh    (segundo plano; saída em ~/xe/logs/sleep-*.txt)
 # t=0 dump | t=5 pmset displaysleepnow | t=15 dump | t=20 acorda (caffeinate -u) | t=30 dump
 # t=35 tentativa 1: PP_CONTROL power+backlight, BLC_CTL enable, duty salvo | t=45 tentativa 2: plano + SURF | t=55 final
 set -u
-X=~/xe/build/xectl
+# xectl / xe-res: tools/build/ (docs/INSTALL.md) or $PATH
+TB=${0:A:h:h}/build
+tool() { local p=$TB/$1; [[ -x $p ]] || p=$(command -v $1) || { echo "$1 not found: build it into tools/build/ (docs/INSTALL.md; xectl: clang -O2 -o tools/build/xectl tools/xectl.c -framework IOKit)" >&2; return 1; }; echo $p; }
+X=$(tool xectl) || exit 1
 OUT=~/xe/logs/sleep-$(date +%Y%m%d-%H%M%S).txt
+mkdir -p ~/xe/logs
 REGS=(PIPECONF_A 0x70008 PIPESRC_A 0x6001C PLANE_CTL_1A 0x70180 PLANE_SURF_1A 0x7019C PLANE_SURFLIVE_1A 0x701AC
       PLANE_SIZE_1A 0x70190 PS_CTRL_1A 0x68180 CUR_CTL_A 0x70080 DDI_BUF_CTL_A 0x64000 DP_TP_CTL_A 0x64040
       TRANS_DDI_FUNC_CTL_A 0x60400 PP_STATUS 0xC7200 PP_CONTROL 0xC7204 BLC_CTL 0xC8250 BLC_FREQ 0xC8254

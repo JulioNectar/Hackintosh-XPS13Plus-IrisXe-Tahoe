@@ -57,7 +57,7 @@ static double dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); }
 static void xlog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap]; va_end(ap);
-    NSString *path = [@"~/xe/build/toque/xe-toque.log" stringByExpandingTildeInPath];
+    NSString *path = [@"~/Library/Logs/xe-toque/xe-toque.log" stringByExpandingTildeInPath];
     NSString *linha = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], s];
     fputs(linha.UTF8String, stderr);
     NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
@@ -927,11 +927,13 @@ int main(int argc, const char **argv) { @autoreleasepool {
     if (argc > 3 && !strcmp(argv[1], "--test-magnet")) return testeIma(atof(argv[2]), atof(argv[3]));
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-    [NSFileManager.defaultManager createDirectoryAtPath:[@"~/xe/build/toque" stringByExpandingTildeInPath]
+    [NSFileManager.defaultManager createDirectoryAtPath:[@"~/Library/Logs/xe-toque" stringByExpandingTildeInPath]
                             withIntermediateDirectories:YES attributes:nil error:nil];
     ud = NSUserDefaults.standardUserDefaults;
+    // default xe-res: tools/build/xe-res, next to tools/xe-toque.app (docs/INSTALL.md step 6)
+    NSString *xeResDef = [NSBundle.mainBundle.bundlePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"build/xe-res"];
     [ud registerDefaults:@{@"trail": @YES, @"ripple": @YES, @"scroll1": @YES, @"edges": @YES, @"ownMulti": @NO,
-                           @"lupa": @NO, @"magnet": @YES, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": @"~/xe/build/xe-res"}];
+                           @"lupa": @NO, @"magnet": @YES, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": xeResDef}];
     gOwnMulti = opt(@"ownMulti");
     src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     rastros = [NSMutableArray array];

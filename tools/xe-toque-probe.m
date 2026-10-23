@@ -4,7 +4,7 @@
 // (VoodooI2CTouchscreenHIDEventDriver) apart from the trackpad's and the mouse's.
 //   Glass     -> phase 1 (touch_s, default 25 s): use ONLY the touchscreen
 //   Ping      -> phase 2 (trackpad_s, default 15 s): use ONLY the trackpad
-//   Submarine -> done; the report is written to `out` (default ~/xe/build/toque/probe-<time>.txt)
+//   Submarine -> done; the report is written to `out` (default ~/Library/Logs/xe-toque/probe-<time>.txt)
 // An event is labelled "touch" when it arrives in phase 1 while the touchscreen HID stream is active
 // (a value within the last 250 ms; VoodooI2C sends the click ~50 ms after the finger lifts).
 #import <Cocoa/Cocoa.h>
@@ -159,7 +159,7 @@ static void relatorio(NSString *out) {
 
 int xeProbeEvents(int argc, const char **argv) { @autoreleasepool {
     double durT = argc > 2 ? atof(argv[2]) : 25, durP = argc > 3 ? atof(argv[3]) : 15;
-    NSString *dir = [@"~/xe/build/toque" stringByExpandingTildeInPath];
+    NSString *dir = [@"~/Library/Logs/xe-toque" stringByExpandingTildeInPath];
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     NSDateFormatter *df = [NSDateFormatter new]; df.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *out = argc > 4 ? @(argv[4]) : [dir stringByAppendingFormat:@"/probe-%@.txt", [df stringFromDate:[NSDate date]]];

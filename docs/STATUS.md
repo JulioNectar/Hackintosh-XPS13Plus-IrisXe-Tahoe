@@ -12,7 +12,7 @@
 - Fast shutdown/restart (XE-IDLEBOUND), trackpad and touchscreen on interrupts, multitouch gestures.
 - **Internal speakers** (since 2026-10-22): `AudShim` (kext) runs Intel's SOF firmware on the audio DSP, SoundWire and
   the two RT1316 amplifiers; the `XeSpeakers` HAL plug-in makes them a normal output device (volume, mute, system
-  sounds, music). Capped at −6 dB, no speaker protection: see below.
+  sounds, music). Capped at −3 dB (AudShim 0.9.1), no speaker protection: see below.
 - **Internal microphones** (since 2026-10-22): AudShim 0.9.0 also runs the RT714 microphone codec on SoundWire link 0
   and the SOF capture pipeline; XeSpeakers 0.9.0 adds the input device "Microfone interno" (48 kHz stereo).
 - **Native Wi-Fi** (AirportItlwm-Tahoe, macOS Wi-Fi menu; no HeliPort). Bluetooth as before.
@@ -30,7 +30,7 @@
 | Problem | Details | Workaround |
 |---|---|---|
 | WindowServer hang | fixed 2026-10-21 (csbresync): not seen again in daily use since | — |
-| GPU hang → reboot | any hang on the render or compute engine (e.g. Photos' `mediaanalysisd`) used to end in a restart loop and a WindowServer watchdog panic: the reset of the shared render domain left the other engine unconfigured. **Fixed 2026-10-22 (XE-GPUREC), waiting for a real hang to confirm**; a hang should now cost a glitched frame | `launchctl disable gui/$UID/com.apple.mediaanalysisd` removes the most common trigger |
+| GPU hang → reboot | any hang on the render or compute engine (e.g. Photos' `mediaanalysisd`) used to end in a restart loop and a WindowServer watchdog panic: the reset of the shared render domain left the other engine unconfigured. Fixed 2026-10-22 (XE-GPUREC): three real hangs on 2026-10-23 (two natural, one induced by an encode experiment) were reset without a restart, **but the screen still froze**: the render-domain reset (GDRST bit 1) leaves the compute engine (CCS) disabled, because RCU_MODE (0x14800) bit 0 is only programmed by `IntelAccelerator::initModeRegisters` at boot/wake and is in neither of Apple's reset-register lists. WindowServer's CCS channels (stamps 24–31) then never complete ("no channel associated with stamp_idx", watchdog). Being tested: re-enable CCS right after the reset (`-ngreennogpurecex` turns it off) | `launchctl disable gui/$UID/com.apple.mediaanalysisd` removes the most common trigger |
 | Slow shutdown / watchdog panic | fixed 2026-10-21 (XE-IDLEBOUND): shutdown no longer waits on a GPU that never goes idle | — |
 | Panic at shutdown (rare) | "corrupt list" in `IOAccelOrphanedMemoryPool` (release path) | none yet |
 | System Settings › Displays and colour profiles | fixed in practice: no panics since 21 Oct, including colour-profile changes (re-tested 22 Oct). The three page-fault panics of 20 Oct (ITU-709) stopped after XE-RCPOLICY, csbresync and libxedrv v16/v17; the exact root cause was never isolated | — |
@@ -38,7 +38,7 @@
 | Trackpad / touchscreen | fixed 2026-10-20: GPIO/APIC interrupts instead of forced polling (the I2C bus used to get stuck, "Timeout waiting for bus not to be busy") | — |
 | Hardware video decode | **H.264 works** (2026-10-21) with `-ngreengva` + the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed in `/Library/GPUBundles`): frames are bit-exact against software decode, for VideoToolbox clients outside the WebKit GPU-process sandbox (verified with `xe-vtdec` and in-process decoder tests). **Safari still decodes on the CPU**: its `com.apple.WebKit.GPU` sandbox denies `file-map-executable` for `/Library/GPUBundles`, so the plugin cannot load there. **HEVC**: the plugin fixes are in the same build (bit-exact in tests, I/P/B frames); the accelerator property `IOGVAHEVCDecode` comes from NootedGreen XE-GVAHEVC; **confirmed on the GPU 2026-10-21** (30/30 frames, no hang). Hardware encode is untested | software decode (Safari) |
 | E-cores | fixed 2026-10-21: all 16 threads run (see below), grouped by CpuTopologyRebuild | — |
-| Internal speakers | **work** (2026-10-22): AudShim 0.9.0 + XeSpeakers. Limits: 48 kHz stereo only; the kext caps the DSP gain at **−6 dB** (`audshimcapdb=0..20` changes it) because the topology has **no speaker protection** (no Smart Amp/temperature model), so very loud playback for long periods is at your own risk; the DSP and SoundWire links stay powered while the device is open (power cost not measured); no headphone/HDMI routing (the laptop has no jack). The firmware boots when coreaudiod loads the plug-in (~1–2 s) | `uninstall-audio.sh hal`; emergency `-audshimoff` |
+| Internal speakers | **work** (2026-10-22): AudShim 0.9.1 + XeSpeakers. Limits: 48 kHz stereo only; the kext caps the DSP gain at **−3 dB** (−6 dB before 0.9.1) (`audshimcapdb=0..20` changes it) because the topology has **no speaker protection** (no Smart Amp/temperature model), so very loud playback for long periods is at your own risk; the DSP and SoundWire links stay powered while the device is open (power cost not measured); no headphone/HDMI routing (the laptop has no jack). The firmware boots when coreaudiod loads the plug-in (~1–2 s) | `uninstall-audio.sh hal`; emergency `-audshimoff` |
 | Microphones | **work** (2026-10-22): "Microfone interno", 48 kHz stereo. The input level slider is a software gain (0 to +30 dB, default +12 dB); no echo cancellation or noise suppression beyond what apps do themselves; the DSP stays powered while the input is open | — |
 | System sleep | **none**: the firmware is Modern Standby (S0ix) only, `_S3` is hidden in the DSDT, and the TGL framebuffer cannot retrain the eDP link after a power cycle. Recommended setup: `tools/sleep/10-pmset-safe.sh` (no sleep, display sleep only) + `xe-lid` (lid → display off). The machine stays awake with the lid closed; shut down for long breaks | display sleep |
 | Lid / sun-key events | on some boots the EC does not report lid or brightness-key events (same firmware state as the brightness keys below); then `xe-lid` does not see the lid | turn the display off by hand (`pmset displaysleepnow`, a hot corner); F6/F7 for brightness |
@@ -49,6 +49,7 @@
 | Chrome UI broken when it starts with a GPU disk cache | toolbar icons missing, `border-radius` ignored, Google logo drawn as a bar. **Cause found (21/10):** not the cache itself but a race in the 16.0.32 Metal driver's blits: a `fillBuffer`/aligned copy (2D blit path) is not ordered before later 3D work in the same command buffer, so Dawn's zero-fill overwrote Graphite's static index buffer after the upload (it stayed all zero; per-launch race, almost always lost when the cache makes startup faster). **Fixed by libxedrv v16**, which routes every buffer fill/copy through the 3D path ([METAL.md](METAL.md) §3 item 6); test Chrome profile: 12/12 launches correct with v16 vs 2/12 without | — |
 | Boot screen | fixed 2026-10-21: OpenCore Resolution=Max (native GOP, no 1024x768 stretch stage) + WhateverGreen `gfxrst=1` (skips the ~18 s copy of the boot screen) + NootedGreen XE-BOOTHOLD (backlight and plane off until WindowServer's buffer ring has been drawn once). The logo is sharp from the start, no line/garbage flashes, first frame at ~20 s | — |
 | WKWebView apps: dark box over tall cards | Apple's CPU fallback for IOSurface-backed CoreGraphics contexts mis-renders `box-shadow` on elements taller than ~8,000 device px (the shadow is not clipped and darkens the element). WebKit uses that fallback because its GPU/WebContent processes cannot load our Metal driver from /Library/GPUBundles (sandbox). Not a driver bug: with the driver loaded the same drawing is correct | per app: `defaults write <bundle-id> WebKitDebugAcceleratedDrawingEnabled -bool NO` (or `-g` for all non-sandboxed WKWebView apps; Safari not covered) |
+| Login-screen wallpaper black with an Aerial | when the desktop wallpaper is an Aerial, macOS snapshots a 5632×3524 HEVC frame with `AVAssetImageGenerator` for the login screen; on this stack any generated image ≥4096 px wide comes out black (≤4000 px is fine, and `AVAssetReader` + CoreImage at full size is fine). Root cause open | a still wallpaper, or replace `/var/db/Wallpapers/<user UUID>/Wallpaper.png` with a correctly rendered frame (sudo) |
 | Transition glitch | a brief wrong frame during UI-scale changes (`xe-res`). The login → desktop glitch is gone since libxedrv v16 | cosmetic |
 
 ## E-cores
@@ -81,17 +82,20 @@ How each of these was reached, and what was already tried, is in [HISTORY.md](HI
 
 Not verified here: I only have the XPS 13 Plus 9320.
 
-- **Dell Latitude 7430** (i7-1265U, Iris Xe 46A8, 1080p panel, macOS 26.7.1), reported by a user (22 Oct):
+- **Dell Latitude 7430** (i7-1265U, Iris Xe 46A8, 96 EU, 1080p panel, macOS 26.7.1), reported 22 Oct ([#2](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/2)):
   - Works: Metal, hardware decode (`-ngreengva` + the VA plugin), AirportItlwm, touchpad and touchscreen. The XOSI/I2C
     ACPI gave the Synaptics touchpad its GPIO interrupt.
   - The missing `HookCase.kext` was found on this install: now in `src/HookCase` + `build-hookcase.sh`.
   - Known issues there:
     - GPU hangs (context 5, `WAIT_ON_SCANLINE` in the gpuRestart report) when opening System Settings › Displays,
-      System Settings › Trackpad or Photo Booth. That machine has a plain UVC webcam, so the camera path runs. The
-      reporter ruled out the 48 Hz mode and mode switching.
+      System Settings › Trackpad or Photo Booth: the render engine (RCS) hangs on the dummy page `0xc01dbead`. That
+      machine has a plain UVC webcam, so the camera path runs. The reporter ruled out the 48 Hz mode and mode switching.
     - Occasional screen corruption when viewing screenshots.
+- **i5-1334U / i5-1340P** (80 EU): rendering artifacts ([#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3)).
+- **ASUS VivoBook K3502ZA** (i5-12500H, Iris Xe 46A6, 80 EU): boot stall with the acceleration stack ([#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)).
 
-  Issues and PRs from other machines are welcome.
+The 80 EU reports match a known limit: NootedGreen hard-codes the 96 EU topology for every non-Tiger-Lake GPU (see
+[INSTALL.md](INSTALL.md)). Issues and PRs from other machines are welcome.
 
 ## iServices
 

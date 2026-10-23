@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Build a single-file C++ kext without Xcode: build-kext.sh <Name>
-# Source: ~/xe/<Name>/<Name>.cpp + Info.plist  ->  ~/xe/build/<Name>.kext
+# Source: tools/<Name>/*.cpp + Info.plist  ->  tools/build/<Name>.kext
 set -e
 NAME=$1
 SRC=${0:A:h}/$NAME

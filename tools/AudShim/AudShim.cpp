@@ -24,7 +24,7 @@
 //   - the kext replays the M3 -> M5 sequence itself through the same validated ops, from AudShimData.h (generated
 //     by `audctl gen-header`: firmware payload, IPC3 plan from the topology, SoundWire/RT1316 tables);
 //   - the pipeline stays prepared between plays (READY); START/STOP switch amps, SoundWire stream and DMA;
-//   - SOF PGA volume from the HAL, hard digital cap (default -6 dB, boot-arg audshimcapdb=0..20), PGA ramp on
+//   - SOF PGA volume from the HAL, hard digital cap (default -3 dB since 0.9.1, boot-arg audshimcapdb=0..20), PGA ramp on
 //     start/stop, amps muted + PS3 whenever not playing;
 //   - teardown to the M1 state on CLOSE, client death (coreaudiod crash/kill), system sleep (power state 0),
 //     shutdown/restart (systemWillShutdown) and stop(); the kext now joins the power plane (PMinit/joinPMtree/
@@ -591,7 +591,7 @@ public:
     uint64_t drvFailUs = 0;
     uint32_t drvGainReq = 0x2000;              // requested PGA gain Q16 (default -18 dB until the HAL sets one)
     uint32_t drvGainApplied = 0;               // what the PGA was last set to (0 = silent)
-    uint32_t drvCapDb = 6, drvCapQ16 = 0;      // hard digital cap (boot-arg audshimcapdb=0..20, default 6 dB)
+    uint32_t drvCapDb = 3, drvCapQ16 = 0;      // hard digital cap (boot-arg audshimcapdb=0..20, default 3 dB)
     bool drvMuted = false, drvSuspended = false, drvKSrc = false, drvTopo = false, drvVerbose = false, pmJoined = false;
     bool drvLinger = false;                    // STOP received, stream kept running silent until drvLingerUntil
     uint64_t drvLingerUntil = 0;
@@ -778,7 +778,7 @@ bool AudShim::start(IOService *provider) {
     drvLock = IOLockAlloc();
     if (!drvLock) return false;
     {   // M6 driver mode: digital cap and verbosity
-        uint32_t cap = 6;
+        uint32_t cap = 3;   // 0.9.1: was 6
         char dummy[8];
         if (PE_parse_boot_argn("audshimcapdb", &cap, sizeof cap) && cap > 20) cap = 20;
         drvCapDb = cap; drvCapQ16 = kCapQ16[cap];

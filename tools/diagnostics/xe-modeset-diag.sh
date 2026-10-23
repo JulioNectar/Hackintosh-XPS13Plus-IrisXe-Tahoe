@@ -1,6 +1,6 @@
 #!/bin/zsh
 # xe-modeset-diag.sh: diagnóstico da tela preta (cursor visível) depois de trocar o modo de tela.
-#   zsh ~/xe/tools/xe-modeset-diag.sh w1024      (roda sozinho em segundo plano; saída em ~/xe/logs/modeset-*.txt)
+#   zsh tools/diagnostics/xe-modeset-diag.sh w1024      (roda sozinho em segundo plano; saída em ~/xe/logs/modeset-*.txt)
 # Linha do tempo (contada a partir do início):
 #   t=0   dump "antes"            t=5   troca o modo (xe-res)        t=15  dump "depois"
 #   t=20  tentativa 1: reescreve PLANE_SURF_1_A com o próprio valor (força o latch do flip)
@@ -9,7 +9,11 @@
 #   t=50  dump final
 set -u
 MODO=${1:-w1024}
-X=~/xe/build/xectl
+# xectl / xe-res: tools/build/ (docs/INSTALL.md) or $PATH
+TB=${0:A:h:h}/build
+tool() { local p=$TB/$1; [[ -x $p ]] || p=$(command -v $1) || { echo "$1 not found: build it into tools/build/ (docs/INSTALL.md; xectl: clang -O2 -o tools/build/xectl tools/xectl.c -framework IOKit)" >&2; return 1; }; echo $p; }
+X=$(tool xectl) || exit 1
+XERES=$(tool xe-res) || exit 1
 OUT=~/xe/logs/modeset-$(date +%Y%m%d-%H%M%S).txt
 mkdir -p ~/xe/logs
 REGS=(
@@ -35,7 +39,7 @@ reescreve_surf() { local v=$($X rd 0x7019C | awk '{print $3}'); $X wr 0x7019C 0x
 (
   dump "antes"
   sleep 5; echo "== troca de modo: $MODO ($(date +%T))" >> $OUT
-  ( ~/xe/build/xe-res $MODO >> $OUT 2>&1 & )
+  ( $XERES $MODO >> $OUT 2>&1 & )
   sleep 10; dump "depois da troca"
   sleep 5; echo "== tentativa 1: reescreve SURF ($(date +%T))" >> $OUT; reescreve_surf; sleep 2; dump "após tentativa 1"
   sleep 3; echo "== tentativa 2: enable do PLANE_CTL ($(date +%T))" >> $OUT

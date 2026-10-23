@@ -44,6 +44,10 @@ else warn "macOS build is $BUILD, the patches were made for $BUILD_REQ (Tahoe 26
      [[ "$XE_FORCE" == 1 ]] || fail "refusing to continue (set XE_FORCE=1 to try anyway, at your own risk)"; fi
 xcode-select -p >/dev/null 2>&1 && ok "Command Line Tools" || fail "install the Command Line Tools first: xcode-select --install"
 for t in git python3 clang codesign; do command -v $t >/dev/null || fail "missing tool: $t"; done
+# FAT/exFAT (USB sticks) keep macOS metadata in "._" files, which break the bundle copies and codesign
+FS=$(diskutil info "$(df -P "$ROOT" | awk 'NR==2{print $1}')" 2>/dev/null | awk -F': *' '/Type \(Bundle\)/{print $2}')
+[[ $FS == (apfs|hfs) ]] && ok "repository on an $FS volume" \
+  || fail "the repository is on a '$FS' volume: clone it to an APFS disk (e.g. your home folder) and run it from there"
 if ioreg -r -c IOPCIDevice -n IGPU -d 1 2>/dev/null | grep -q '"device-id" = <499a0000>'; then ok "GPU presented as Tiger Lake (device-id 9A49)"
 else warn "IGPU device-id is not 9A49: is this Mac booting through the repository's EFI?"; fi
 if kextstat 2>/dev/null | grep -q NootedGreen; then ok "NootedGreen loaded"

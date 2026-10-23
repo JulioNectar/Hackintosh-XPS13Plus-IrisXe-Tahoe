@@ -125,9 +125,21 @@ pam_sm_authenticate (pam_handle_t *pamh, int flags, int argc, const char **argv)
 
   snprintf (tbuf, sizeof tbuf, "%d", timeout);
   {
+    /* sudo authenticates with PAM_SILENT (sudoers pam_silent, on by default), so a PAM_TEXT_INFO never shows and the
+       wait for the finger went unnoticed. Write the prompt (with a bell) straight to the controlling terminal; only
+       without one fall back to the conversation function. */
     char msg[128];
+    int tty = open ("/dev/tty", O_WRONLY | O_NOCTTY | O_CLOEXEC);
     snprintf (msg, sizeof msg, "Touch the fingerprint sensor (or wait %d s for the password prompt)", timeout);
-    if (!(flags & PAM_SILENT)) say (pamh, msg);
+    if (tty >= 0)
+      {
+        char line[160];
+        int n = snprintf (line, sizeof line, "\a\xf0\x9f\x91\x86 %s\n", msg);
+        if (n > 0) (void) write (tty, line, (size_t) n);
+        close (tty);
+      }
+    else if (!(flags & PAM_SILENT))
+      say (pamh, msg);
   }
 
   pid = fork ();
@@ -158,7 +170,11 @@ pam_sm_authenticate (pam_handle_t *pamh, int flags, int argc, const char **argv)
           return PAM_SUCCESS;
         case 1:
           logx (LOG_NOTICE, "pam_xefp: fingerprint NOT matched for %s", user);
-          if (!(flags & PAM_SILENT)) say (pamh, "Fingerprint not recognized.");
+          {
+            int tty = open ("/dev/tty", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+            if (tty >= 0) { static const char m[] = "Fingerprint not recognized.\n"; (void) write (tty, m, sizeof m - 1); close (tty); }
+            else if (!(flags & PAM_SILENT)) say (pamh, "Fingerprint not recognized.");
+          }
           return PAM_AUTH_ERR;
         default:
           logx (LOG_DEBUG, "pam_xefp: helper unavailable/timeout for %s", user);

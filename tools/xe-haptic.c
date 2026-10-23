@@ -11,15 +11,16 @@
 //        xe-haptic elements       -> the feature/output elements (usage, report ID, size, range) as macOS parsed them
 // A reboot (HID RESET + power-up in VoodooI2CHID::start) puts the firmware default back.
 // Writes are limited to the Haptics Intensity field. Vendor reports (0xFF00/0xFF05) and the surface/button switch
-// (report 0x05) are never written. Every SET is appended to ~/xe/build/haptic/xe-haptic.log.
+// (report 0x05) are never written. Every SET is appended to ~/Library/Logs/xe-toque/xe-haptic.log.
 //
-// Build: clang -O2 -Wall -o ~/xe/build/haptic/xe-haptic tools/xe-haptic.c -framework IOKit -framework CoreFoundation
+// Build: clang -O2 -Wall -o tools/build/xe-haptic tools/xe-haptic.c -framework IOKit -framework CoreFoundation
 #include <IOKit/hid/IOHIDManager.h>
 #include <IOKit/hid/IOHIDKeys.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -256,7 +257,9 @@ int main(int argc, char **argv) {
     }
 
     char path[1024];
-    snprintf(path, sizeof path, "%s/xe/build/haptic/xe-haptic.log", getenv("HOME"));
+    snprintf(path, sizeof path, "%s/Library/Logs/xe-toque", getenv("HOME"));
+    mkdir(path, 0755);
+    strlcat(path, "/xe-haptic.log", sizeof path);
     logf_ = fopen(path, "a");
 
     if (!strcmp(cmd, "set") && argc > 2) {

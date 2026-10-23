@@ -4,14 +4,19 @@
 > installing macOS, `zsh install.sh`. See the README. This guide is the manual procedure behind those scripts.
 
 Target: Dell XPS 13 Plus 9320, i7-1360P, Iris Xe 8086:A7A0, **macOS Tahoe 26.7.1 (25G241)**. Other Raptor Lake /
-Alder Lake laptops may work with their own EFI, but the patches were only tested here.
+Alder Lake laptops may work with their own EFI, but the patches were only tested here. NootedGreen currently hard-codes
+the 96 EU GPU topology (12 subslices × 8 EU, MCR steering to DSS0) for every non-Tiger-Lake GPU, so 80 EU parts
+(e.g. i5-1334U, i5-1340P, i5-12500H) get a wrong topology (issues [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3),
+[#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)); a fix that reads the fuses is being investigated.
 
 ## 0. What you need
 
 - A USB drive (16 GB+) for OpenCore and the installer, or a second disk.
 - Another Mac (or the laptop itself, from Windows/Linux) to create the installer.
 - The `sle_Internal/le` and `sle_Internal/sle` folders of [NootedGreen](https://github.com/sgiammori/NootedGreen)
-  (Apple's 16.0.32 Tiger Lake driver bundles).
+  (Apple's 16.0.32 Tiger Lake driver bundles) at commit `95f81898be65cb9f7b3d370ca78054be4cc8a62d`. `install.sh`
+  clones it into `build/deps/NootedGreen` by itself. Keep this repository and NootedGreen on an APFS/HFS disk, not on
+  FAT/exFAT (see step 5).
 
 ## 1. BIOS
 
@@ -54,17 +59,27 @@ Keep the repository and the NootedGreen download on an APFS disk (your home fold
 stick: macOS stores metadata there in `._` files, which break the bundle copies and code signing.
 
 ```sh
-zsh macos/build-all.sh /path/to/sle_Internal/sle
-sudo zsh macos/install-macos.sh /path/to/sle_Internal/sle /path/to/sle_Internal/le
+git clone https://github.com/sgiammori/NootedGreen.git ~/NootedGreen
+git -C ~/NootedGreen checkout 95f81898be65cb9f7b3d370ca78054be4cc8a62d
+zsh macos/build-all.sh ~/NootedGreen/sle_Internal/sle
+sudo zsh macos/install-macos.sh ~/NootedGreen/sle_Internal/sle ~/NootedGreen/sle_Internal/le
 ```
+
+`zsh install.sh --build-only` does the clone, checkout and builds automatically (into `build/deps/NootedGreen`).
 
 Approve the extension in **System Settings › Privacy & Security** if asked, and reboot.
 
 ## 6. After the first accelerated boot
 
-- Resolution / UI scale: `tools/xe-res` (list) and `tools/xe-res w1680` (HiDPI 1680 pt wide). Avoid
+- Build the two command-line tools into `tools/build/`:
+  ```sh
+  mkdir -p tools/build
+  clang -O2 -o tools/build/xe-res tools/xe-res.c -framework CoreGraphics -framework CoreFoundation
+  clang -O2 -fobjc-arc -DXECTL_NO_MAIN -o tools/build/xe-brilho tools/xe-brilho.m tools/xectl.c -framework AppKit -framework IOKit
+  ```
+- Resolution / UI scale: `tools/build/xe-res` (list) and `tools/build/xe-res w1680` (HiDPI 1680 pt wide). Avoid
   **System Settings › Displays**.
-- Brightness: build `tools/XeShim` (`zsh tools/build-kext.sh XeShim`), load it, then `xe-brilho 70`.
+- Brightness: build `tools/XeShim` (`zsh tools/build-kext.sh XeShim`), load it, then `tools/build/xe-brilho 70`.
 - Touchscreen trail (optional): `zsh tools/build-xe-toque.sh`, then `open tools/xe-toque.app` and allow it in
   Privacy & Security › Input Monitoring. Only touches on the screen draw; the trackpad is ignored.
 - Check: `system_profiler SPDisplaysDataType` shows **Metal Support** and the chipset model you set.
@@ -78,7 +93,11 @@ Approve the extension in **System Settings › Privacy & Security** if asked, an
 
 ## Recovery
 
-- Boot with the USB OpenCore and `config-install.plist` (NootedGreen off) to reach the desktop without acceleration.
+- `config-install.plist` (NootedGreen off) is only safe **before** the TGL files are installed, or after
+  `zsh install.sh --uninstall`. It still spoofs the GPU as 9A49, and once `install-macos.sh` has set the TGL
+  accelerator's `IOPCIPrimaryMatch` to `0x9a498086`, Apple's stock TGL driver binds 9A49 without NootedGreen's patches
+  and panics or stalls (stock 16.0.32 only accepts 9A40/9A48). For an unaccelerated fallback after installing, also
+  remove the `device-id` / `AAPL,ig-platform-id` spoof from that config, or uninstall first.
 - Each patch can be turned off with its boot-arg ([KERNEL-PATCHES.md](KERNEL-PATCHES.md)).
 - Remove the user-space pieces: delete `/Library/GPUBundles/AppleIntelTGL*`, `/System/Library/Caches/xe.bundle`
   and the TGL kexts in `/Library/Extensions`, then run `sudo kmutil load -z` again.
@@ -105,9 +124,10 @@ A hand icon in the menu bar holds the toggles (saved in `defaults read local.xe.
   emulated Magic Trackpad), so they follow System Settings › Trackpad. With **xe-toque handles 2–5 fingers** on,
   xe-toque replaces them: 2 = scroll, 3 sideways = switch Space (ctrl+←/→), 5-finger pinch = Apps.
 - **Trail** / **Ripple** visual feedback, **Magnifier** (two-finger hold), **Pen mode** (draw on screen; Esc exits,
-  *Clear drawing* wipes it), **Touch mode** (switches to a 1152-pt-wide HiDPI mode with `~/xe/build/xe-res` and back
-  to the previous mode).
-- Log: `~/xe/build/toque/xe-toque.log`. Diagnostic: `xe-toque.app/Contents/MacOS/xe-toque --probe-events`.
+  *Clear drawing* wipes it), **Touch mode** (switches to a 1152-pt-wide HiDPI mode with `xe-res` and back
+  to the previous mode). It uses `build/xe-res` next to the app (`tools/build/xe-res`, see step 6); if you moved the app,
+  point it at the tool with `defaults write local.xe.toque xeRes /path/to/xe-res`.
+- Log: `~/Library/Logs/xe-toque/xe-toque.log`. Diagnostic: `xe-toque.app/Contents/MacOS/xe-toque --probe-events`.
 
 ## Internal speakers and microphones
 
@@ -155,7 +175,7 @@ Input. The volume starts at 30 % the first time; the input level slider is a sof
 With an older 0.8.0 kext (interface v8) only the speakers appear.
 
 Notes:
-- **Level.** The kext caps the DSP gain at −6 dB and ramps every change; the SOF topology has no speaker protection.
+- **Level.** The kext caps the DSP gain at −3 dB (−6 dB before 0.9.1) and ramps every change; the SOF topology has no speaker protection.
   Boot-arg `audshimcapdb=N` (0–20) moves the cap, `audshimlingerms=N` the 5 s delay before the amps are switched off
   after playback stops, `-audshimverbose` logs every register access, `-audshimoff` stops AudShim from attaching.
 - The hardware is brought up when coreaudiod loads the plug-in (~1–2 s after login) and fully torn down (amps muted

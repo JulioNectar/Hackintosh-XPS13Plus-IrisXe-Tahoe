@@ -18,7 +18,7 @@
 #   libigc.dylib + Resources/*        Apple's 16.0.32 files, re-signed
 # The bundle must live in /System/Library/Caches/xe.bundle (sandbox and plugin-path rules, see docs/METAL.md).
 set -e
-SLE=${1:?pasta sle/ com os bundles 16.0.32}; OUT=${2:?pasta de saída}
+SLE=${1:?sle/ folder with the 16.0.32 bundles}; OUT=${2:?output folder}
 HERE=${0:A:h}
 SH=$SLE/AppleIntelGraphicsShared.bundle/Contents
 MTL=$SLE/AppleIntelTGLGraphicsMTLDriver.bundle/Contents
