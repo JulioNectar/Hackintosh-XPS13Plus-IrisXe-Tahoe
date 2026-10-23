@@ -4,7 +4,7 @@ Everything here is built by `macos/build-all.sh` from Apple's 16.0.32 bundles pl
 installed by `macos/install-macos.sh`.
 
 **Version history.** The Metal driver went through builds v1–v12 and MTL13–MTL17 (18–19 Oct); **MTL18** (20 Oct, in
-test) is MTL17 with two bytes restored — see the L3 row below. libxedrv went through v7–v16 and the LLVM bridge through
+test) is MTL17 with two bytes restored — see the L3 row below. libxedrv went through v7–v18 and the LLVM bridge through
 v1–v2. Every build, with its evidence and result, is in [HISTORY.md](HISTORY.md) and [CATALOG.md](CATALOG.md) §4;
 abandoned approaches are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
@@ -94,9 +94,19 @@ An ObjC dylib loaded into every Metal client (WindowServer included) by the driv
    that is not 64 KB aligned in its own `MTLHeap` (size rounded up to 64 KB), so it owns whole blocks (log line
    `STENCIL64K`). The likely hardware reason (64 KB units for ≥32 bpp colour targets) is inferred, not documented.
 
+8. **IOSurface textures with ≥32768 bytes per row (v18, the black login wallpaper)**: the kernel never uses an IOSurface
+   texture in place; the GPU works on a Y-tiled copy and `IGAccelResource::pageon`/`pageoff` copy between the two with
+   `IntelAccelerator::submitBlit`. The 2D blit takes linear pitches up to 0x7ffe only; wider ones go to the 3D blit,
+   which does not work on this GPU, so the GPU reads zeros and its writes never come back, with no error. Any plane of
+   32768 bytes per row or more is affected: a half-float RGBA frame ≥4096 px wide, which is what macOS renders from a
+   10-bit Aerial for the login-screen wallpaper (all black). v18 creates such textures (2D, one mip, one sample, pitch
+   and offset aligned to `minimumLinearTextureAlignment`) as a linear texture over a no-copy `MTLBuffer` that aliases
+   the IOSurface's own memory, so no copy is needed (log line `PITCH LARGO`). Repro: 18 of 136 pitch cases failed
+   before, 3 after (the remaining 3 use a pitch that is not 256-byte aligned and keep the old path).
+
 Environment switches: `XE_COMPRESSAO=1` keeps compression, `XE_NOCOPY_ZERO=1` disables fix 4, `XE_FILL_NATIVO=1`
 disables fix 6, `XE_COPIA_NATIVA=1` keeps aligned buffer copies on the 2D path (fills stay fixed),
-`XE_STENCIL_NATIVO=1` disables fix 7.
+`XE_STENCIL_NATIVO=1` disables fix 7, `XE_NOWIDEPITCH=1` disables fix 8.
 
 ## 4. Shader compiler (xe.bundle)
 

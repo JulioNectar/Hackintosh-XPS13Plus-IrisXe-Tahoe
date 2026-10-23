@@ -372,7 +372,46 @@ static id xe_realinha64k(id dev, id r, MTLTextureDescriptor* d) {
 }
 static id w_tex_dev(id s, SEL c, MTLTextureDescriptor* d) { MTLTextureDescriptor* dd = sem_compressao(d); id r = ((id(*)(id, SEL, id))g_tex_dev)(s, c, dd);
   r = xe_realinha64k(s, r, dd); tex_stat(0, d, NULL, 0, r); return r; }
-static id w_tex_dev_ios(id s, SEL c, MTLTextureDescriptor* d, void* io, NSUInteger pl) { id r = ((id(*)(id, SEL, id, void*, NSUInteger))g_tex_dev_ios)(s, c, sem_compressao(d), io, pl); tex_stat(1, d, io, pl, r); return r; }
+// v18 (23/10): IOSurface com bytesPerRow >= 32768. O kernel não usa a IOSurface no lugar: a GPU trabalha num "cache"
+// Y-tiled e IGAccelResource::pageon/pageoff copiam com IntelAccelerator::submitBlit. O blit 2D só aceita pitch linear
+// até 0x7ffe; acima disso vai para o Blit3D, que não funciona neste spoof (o mesmo do BLITALIGN no NootedGreen): a
+// GPU lê zeros e o que ela escreve nunca volta. Sintoma: RGhA >= 4096 px de largura sai preta (AVAssetImageGenerator
+// do Aerial de 5632 px, wallpaper da tela de login). Correção: textura linear sobre um MTLBuffer no-copy que aponta
+// para a própria memória da IOSurface, sem cache nem blit. Só 2D, 1 mip, 1 amostra, pitch/offset alinhados ao que o
+// driver exige. Desliga com XE_NOWIDEPITCH.
+static long g_wide_n;
+static id xe_tex_largo(id dev, MTLTextureDescriptor* d, IOSurfaceRef s, NSUInteger pl) {
+  if (!s || !d || getenv("XE_NOWIDEPITCH")) return nil;
+  size_t np = IOSurfaceGetPlaneCount(s);
+  size_t bpr = np ? IOSurfaceGetBytesPerRowOfPlane(s, pl) : IOSurfaceGetBytesPerRow(s);
+  if (bpr < 32768 || d.textureType != MTLTextureType2D || d.mipmapLevelCount != 1 || d.sampleCount != 1) return nil;
+  NSUInteger al = [dev minimumLinearTextureAlignmentForPixelFormat:d.pixelFormat];
+  char* base = IOSurfaceGetBaseAddress(s);
+  size_t off = np ? (size_t)((char*)IOSurfaceGetBaseAddressOfPlane(s, pl) - base) : 0;
+  size_t len = (IOSurfaceGetAllocSize(s) + 4095) & ~(size_t)4095;
+  if (!al || ((uintptr_t)base & 4095) || (bpr % al) || (off % al)) {
+    if (__sync_add_and_fetch(&g_wide_n, 1) <= 8) LOG("PITCH LARGO bpr=%zu off=%zu al=%lu: não alinhado, caminho original", bpr, off, (unsigned long)al);
+    return nil;
+  }
+  CFRetain(s);
+  id<MTLBuffer> b = [dev newBufferWithBytesNoCopy:base length:len options:MTLResourceStorageModeShared
+                                      deallocator:^(void* p, NSUInteger l) { CFRelease(s); }];
+  if (!b) { CFRelease(s); return nil; }
+  MTLTextureDescriptor* dd = [d copy];
+  dd.storageMode = MTLStorageModeShared;
+  dd.resourceOptions = (dd.resourceOptions & ~MTLResourceStorageModeMask) | MTLResourceStorageModeShared;
+  id t = [b newTextureWithDescriptor:dd offset:off bytesPerRow:bpr];
+  [dd release]; [b release];
+  long n = __sync_add_and_fetch(&g_wide_n, 1);
+  if (n <= 8 || (n & (n - 1)) == 0) LOG("PITCH LARGO %lux%lu fmt=%lu plano=%lu bpr=%zu -> textura linear %p (n=%ld)", (unsigned long)d.width,
+      (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)pl, bpr, t, n);
+  return t;
+}
+static id w_tex_dev_ios(id s, SEL c, MTLTextureDescriptor* d, void* io, NSUInteger pl) {
+  MTLTextureDescriptor* dd = sem_compressao(d);
+  id r = xe_tex_largo(s, dd, (IOSurfaceRef)io, pl);
+  if (!r) r = ((id(*)(id, SEL, id, void*, NSUInteger))g_tex_dev_ios)(s, c, dd, io, pl);
+  tex_stat(1, d, io, pl, r); return r; }
 static id w_tex_heap(id s, SEL c, MTLTextureDescriptor* d) { id r = ((id(*)(id, SEL, id))g_tex_heap)(s, c, sem_compressao(d)); tex_stat(2, d, NULL, 0, r); return r; }
 static id w_tex_heap_off(id s, SEL c, MTLTextureDescriptor* d, NSUInteger off) { id r = ((id(*)(id, SEL, id, NSUInteger))g_tex_heap_off)(s, c, sem_compressao(d), off); tex_stat(3, d, NULL, 0, r); return r; }
 static MTLSizeAndAlign w_heap_size(id s, SEL c, MTLTextureDescriptor* d) { return ((MTLSizeAndAlign(*)(id, SEL, id))g_heap_size)(s, c, sem_compressao(d)); }
