@@ -341,6 +341,7 @@ static volatile uint64_t gFwUnderflowCaller = 0;    // file offset of the last i
 static void xeSafeForceWake(void *that, bool set, uint32_t dom);
 static void xeRc6FwStart(void *accel);
 static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);  // xe/gpurec (22/10)
+static bool xeBlitFixInstall(KernelPatcher &patcher, KernelPatcher::KextInfo *kext, mach_vm_address_t address, size_t size, const uint8_t *v2, size_t v2Size);  // xe/blitfix (23/10)
 static uint8_t *volatile gAccelObj = nullptr;  // xe/csstate: IntelAccelerator (capturado em signalDisplayStampUpdate)
 static mach_vm_address_t gOrgDpSubmit = 0, gOrgDpIsComplete = 0, gOrgDpSignal = 0, gOrgDispStamp = 0;
 static volatile uint32_t gDpSubmitN = 0, gDpIsCompN = 0, gDpIsCompTrue = 0, gDpSignalN = 0, gDispStampN = 0;
@@ -2408,6 +2409,11 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 						{activeKext, f_ba_rota, r_ba_rota, arrsize(f_ba_rota), 1}};
 					bool okba = LookupPatchPlus::applyAll(patcher, patchBa, address, size);
 					IOLog("XeNG BLITALIGN: cópias lineares de IOSurface desalinhadas (offset %% 64) pelo motor de cópia: %s\n", okba ? "aplicado" : "NAO encontrado");
+					// xe/blitfix (23/10): estende a v2 para pitch não múltiplo de 64 (ver xeBlitFixInstall). -ngreennoblitfix desliga.
+					if (okba && !checkKernelArgument("-ngreennoblitfix")) {
+						bool okbf = xeBlitFixInstall(patcher, activeKext, address, size, r_ba_rota, arrsize(r_ba_rota));
+						IOLog("XeNG BLITFIX: cópias de IOSurface com pitch %% 64 != 0 pelo motor de cópia: %s\n", okbf ? "aplicado" : "NAO encontrado");
+					}
 				}
 				// xe/rpcs (20/10, do WhateverXe 1163642): o construtor do contexto RCS grava R_PWR_CLK_STATE (0x20c8) = 0x80000000
 				// (só ENABLE). O Linux pede ENABLE | S_CNT_ENABLE | 1 fatia (0x80041000); o RPL também tem 1 fatia (SLICE_EN=1).
@@ -11867,6 +11873,67 @@ static void xeRecWriteList(void *acc, volatile uint8_t *mmio, uint8_t *d, uint64
 	(void)xeRecRd(mmio, xeRecReg(d, 0));  // posting read
 }
 
+// ─── xe/gpurec2 (23/10): registers of the render reset domain that are in NEITHER Apple reset list ──────────────
+// IntelAccelerator::initModeRegisters (file 0x28e1a, called only from startGraphicsEngine 0x2513e, i.e. boot/wake) writes
+//   RCU_MODE 0x14800 = masked bit0 <- (accel->0x1190 >> 33) & 1   ("Multi-Context (Compute Command Streamer) Enabled")
+//   0xce90 |= 0x10001 (conditional), CCS FORCE_TO_NONPRIV0 0x1a4d0 = 0xb134
+// GDRST bit1 (GEN11_GRDOM_RENDER) resets them, and neither _rcsResetRegisters (32) nor _ccsResetRegisters (4: HWS_PGA,
+// INSTPM, MI_MODE, GFX_MODE) contains them. After ANY render-domain reset (RCS by Apple, CCS by Apple, or our sibling
+// path) the CCS is left disabled: ELSP writes produce no CSB event, IGHardwareCommandStreamer5 never flips its port, so
+// getActiveContexts() is empty -> IGAccelEventMachine::eventTimeout returns NULL -> IOAF "no channel associated with
+// stamp_idx 24..31" forever; or, when the CCS itself is restarted, the post-reset stamp test times out every time.
+// Fix: snapshot them before the reset, and re-apply them right after GDRST, BEFORE any replay touches ELSP (the own
+// engine's replay runs inside Apple's resetGraphicsEngine, so it is done from an IGScheduler5::processGPUReset wrapper).
+// CCS RING_IMR 0x1a0a8 / RING_HWSTAM 0x1a098 are engine registers also missing from the CCS list (RCS list has
+// CONTROL_IMR 0x20a8); they are restored to their pre-reset values only if the reset changed them.
+static const uint32_t kXeRecEx[5] = {0x14800, 0xce90, 0x1a4d0, 0x1a0a8, 0x1a098};
+static const bool kXeRecExMasked[5] = {true, true, false, false, false};
+static uint32_t gRecExSnap[5], gRecExGood[5];
+static bool gRecExSnapOk = false, gRecExGoodOk = false;
+static mach_vm_address_t gOrgS5Proc = 0;
+static int gRecExOn = 0;
+static void *volatile gRecPendAcc = nullptr;
+static volatile uint8_t *volatile gRecPendMmio = nullptr;
+static volatile uint32_t gRecExFix = 0, gRecExLastRcu = 0xffffffffu;
+
+static inline uint32_t xeRecCcsOn(void *acc) {
+	return (uint32_t)((*reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(acc) + 0x1190) >> 33) & 1);
+}
+static void xeRecExSnapshot(void *acc, volatile uint8_t *mmio) {
+	uint32_t v[5];
+	for (int i = 0; i < 5; i++) v[i] = xeRecRd(mmio, kXeRecEx[i]);
+	// only trust a snapshot taken while the domain was healthy (RCU_MODE matches what startGraphicsEngine programmed)
+	gRecExSnapOk = (v[0] & 1) == xeRecCcsOn(acc);
+	if (gRecExSnapOk) {
+		for (int i = 0; i < 5; i++) gRecExSnap[i] = gRecExGood[i] = v[i];
+		gRecExGoodOk = true;
+	}
+}
+// Idempotent: writes only registers whose live value differs from the healthy one. Returns a bitmask of what it wrote.
+static uint32_t xeRecExFix(void *acc, volatile uint8_t *mmio) {
+	if (gRecExOn != 1 || !acc || !mmio) return 0;
+	uint32_t did = 0, on = xeRecCcsOn(acc), rcu = xeRecRd(mmio, kXeRecEx[0]);
+	gRecExLastRcu = rcu;
+	if ((rcu & 1) != on) { xeRecWr(mmio, kXeRecEx[0], 0x10000u | on); did |= 1; }   // exactly Apple's initModeRegisters write
+	const uint32_t *src = gRecExSnapOk ? gRecExSnap : (gRecExGoodOk ? gRecExGood : nullptr);
+	if (src) for (int i = 1; i < 5; i++) {
+		if (i == 2 && !on) continue;                       // CCS whitelist only matters with CCS enabled
+		uint32_t cur = xeRecRd(mmio, kXeRecEx[i]);
+		if (kXeRecExMasked[i] ? ((cur & 0xffff) == (src[i] & 0xffff)) : (cur == src[i])) continue;
+		xeRecWr(mmio, kXeRecEx[i], kXeRecExMasked[i] ? (0xffff0000u | (src[i] & 0xffff)) : src[i]);
+		did |= 1u << i;
+	}
+	if (did) { (void)xeRecRd(mmio, kXeRecEx[0]); gRecExFix++; }
+	return did;
+}
+// IGScheduler5::processGPUReset is called by resetGraphicsEngine right after GDRST + list restore (file 0x43842) and by
+// our sibling replay. Re-enable the CCS before Apple resubmits to ELSP.
+static void xeRecProc(void *sched, uint32_t type, void *ctx) {
+	auto orig = FunctionCast(xeRecProc, gOrgS5Proc);
+	if (gRecPendAcc && gRecPendMmio) xeRecExFix(gRecPendAcc, gRecPendMmio);
+	orig(sched, type, ctx);
+}
+
 static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 	auto orig = FunctionCast(xeRecResetGraphicsEngine, gOrgRge);
 	auto *r = static_cast<uint8_t *>(ring);
@@ -11894,7 +11961,11 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 	auto *eng = *reinterpret_cast<uint8_t **>(r + 0x8b8 + (uint64_t)type * 8);
 	bool kick = eng && (*reinterpret_cast<uint32_t *>(eng + 0xa4) & 0xc);
 
+	xeRecExSnapshot(acc, mmio);
+	gRecPendAcc = acc; gRecPendMmio = mmio;     // xeRecProc() re-applies the extras between GDRST and Apple's replay
 	bool ret = orig(ring, ctx);
+	gRecPendAcc = nullptr; gRecPendMmio = nullptr;
+	uint32_t exDid = xeRecExFix(acc, mmio);   // no-op if xeRecProc already did it
 
 	uint32_t sibHws = xeRecRd(mmio, xeRecReg(sd, 0));
 	bool lost = snap[0] ? (sibHws == 0) : true;
@@ -11922,6 +11993,7 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 	} else if (kick && !gdrst) {
 		gRecSkipKick++;
 	}
+	if (exDid) did |= 8;
 	sfw(acc, false, 7);
 	gRecLast = (uint32_t)own | ((uint32_t)ret << 4) | ((uint32_t)kick << 5) | (did << 8) | ((snap[0] >> 12) << 12);
 	xeEv('GREC', gRecLast, snap[0], sibHws);
@@ -11934,6 +12006,8 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 	svc->setProperty("xe-rec-sibreplays", gRecSibReplays, 32);
 	svc->setProperty("xe-rec-ownfix", gRecOwnFix, 32);
 	svc->setProperty("xe-rec-last", gRecLast, 32);
+	svc->setProperty("xe-rec-exfix", gRecExFix, 32);
+	svc->setProperty("xe-rec-rcu", gRecExLastRcu, 32);    // RCU_MODE seen right after the last reset (bit0 0 = CCS was off)
 	return ret;
 }
 
@@ -11973,13 +12047,118 @@ static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_addres
 	// the lists are filled by the static constructors of the TGL kext, which ran before processKext; check them now
 	bool l0 = xeRecList(0, n0, d0), l1 = xeRecList(1, n1, d1);
 	bool ok = rge && gRecSfw && gRecGetDef && gRecS5Proc && sig1 && sig2 && sig3 && sig4 && sig5;
+	// IntelAccelerator::initModeRegisters @0x28e7e: movl $0xfffefffe,%ecx; andl 0x14800(%rax),%ecx; movq 0x1190(%rdi),%rdx;
+	// shrq $0x21,%rdx; andl $1,%edx; leal 0x10000(%rcx,%rdx),%ecx; movl %ecx,0x14800(%rax)
+	static const uint8_t sRcu[] = {0xb9, 0xfe, 0xff, 0xfe, 0xff, 0x23, 0x88, 0x00, 0x48, 0x01, 0x00, 0x48, 0x8b, 0x97, 0x90, 0x11, 0x00, 0x00,
+	                               0x48, 0xc1, 0xea, 0x21, 0x83, 0xe2, 0x01, 0x8d, 0x8c, 0x11, 0x00, 0x00, 0x01, 0x00, 0x89, 0x88, 0x00, 0x48, 0x01, 0x00};
+	// ... movl $0xb134,0x1a4d0(%rax)
+	static const uint8_t sNp[] = {0xc7, 0x80, 0xd0, 0xa4, 0x01, 0x00, 0x34, 0xb1, 0x00, 0x00};
+	mach_vm_address_t imr = patcher.solveSymbol(index, "__ZN16IntelAccelerator17initModeRegistersEv", address, size); patcher.clearError();
+	bool sig6 = has(imr, 0x120, sRcu, sizeof(sRcu)) && has(imr, 0x120, sNp, sizeof(sNp));
 	if (ok) {
 		RouteRequestPlus rec[] = {
 			{"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", xeRecResetGraphicsEngine, gOrgRge},
 		};
 		if (RouteRequestPlus::routeAll(patcher, index, rec, address, size)) gRecOn = 1;
 		else patcher.clearError();
+		// second route only if the first one is in and initModeRegisters matches; off with -ngreennogpurecex
+		if (gRecOn == 1 && sig6 && !checkKernelArgument("-ngreennogpurecex")) {
+			RouteRequestPlus rec2[] = {
+				{"__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext", xeRecProc, gOrgS5Proc},
+			};
+			if (RouteRequestPlus::routeAll(patcher, index, rec2, address, size) && gOrgS5Proc) gRecExOn = 1;
+			else patcher.clearError();
+		}
 	}
-	SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d route=%d",
-	       rge != 0, gRecSfw != 0, gRecGetDef != 0, gRecS5Proc != 0, cs5Proc != 0, l0, l1, n0, n1, sig1, sig2, sig3, sig4, sig5, gRecOn);
+	SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d%d route=%d ex=%d",
+	       rge != 0, gRecSfw != 0, gRecGetDef != 0, gRecS5Proc != 0, cs5Proc != 0, l0, l1, n0, n1, sig1, sig2, sig3, sig4, sig5, sig6, gRecOn, gRecExOn);
+}
+
+// ─── xe/blitfix (23/10): IOSurface copies whose linear row pitch is not a multiple of 64 bytes ────────────────────────
+// A Metal texture over an IOSurface is never used in place: IGAccelResource pageon/pageoff copy between the IOSurface
+// pages (linear) and the Y-tiled device cache with IntelAccelerator::submitBlit (16.0.32, file 0x2bc8e). Routing there:
+//   blit2d_supported (0x300f4 -> blit2d_common_supported 0x3011e) accepts linear pitch % 4 == 0 && <= 0x7ffe;
+//   blit2d_fast_supported (0x302e6) needs pitch & 0x3f == 0 when src/dst tiling differ (mask 0x3f at 0x30370);
+//   if blit3d_supported && !fast, the block at 0x2c228 sends the copy to Blit3D (0x2bd28) when
+//   area*bpp >= 0x20001 (0x51001 for bpp 16), otherwise to blt2d_source_copy (XY_SRC_COPY_BLT, BCS).
+// Blit3D produces nothing here, so an IOSurface with bytesPerRow 656 (R8 642 px) reads as zeros / loses GPU writes once
+// it is larger than 128 KB, while the same surface below 128 KB is correct (XY_SRC_COPY_BLT takes 16-byte pitch).
+// BLITALIGN v2 already rewrote 0x2c228 to divert ((src|dst base) & 0x3f) != 0. This replaces that block with a call to
+// xeBlitFixRoute(params, pixelArea, accel), which keeps the original thresholds and the v2 rule and adds
+// ((srcPitch|dstPitch) & 0x3f) != 0 -> 2D. Copies with 64-aligned base and pitch still go to Blit3D exactly as before.
+// Counters (ioreg -rc IntelAccelerator | grep xe-blitfix) are published from a thread_call, never from submitBlit.
+static volatile uint32_t gBfPitch = 0, gBfBase = 0, gBf3D = 0, gBfLast = 0;
+static void *volatile gBfAcc = nullptr;
+static thread_call_t volatile gBfTc = nullptr;
+
+static void xeBlitFixPublish(thread_call_param_t, thread_call_param_t) {
+	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gBfAcc));
+	if (!svc) return;
+	svc->setProperty("xe-blitfix-pitch", gBfPitch, 32);   // large copies sent to XY_SRC_COPY because of the pitch (new)
+	svc->setProperty("xe-blitfix-base", gBfBase, 32);     // same, because of the base address (BLITALIGN v2 rule)
+	svc->setProperty("xe-blitfix-3d", gBf3D, 32);         // large non-fast copies still left on Blit3D (64-aligned)
+	svc->setProperty("xe-blitfix-last", gBfLast, 32);     // last pitch diversion: srcPitch<<16 | dstPitch (low 16 bits)
+}
+
+static void xeBlitFixNote(void *acc) {
+	gBfAcc = acc;   // gBfTc is allocated once in xeBlitFixInstall (no allocation inside submitBlit)
+	if (gBfTc) thread_call_enter(gBfTc);   // coalesces if already pending
+}
+
+// Called from the patched block (rdi = blit3d_params_t*, rsi = sum of rect w*h, rdx = IntelAccelerator*).
+// true -> blt2d_source_copy, false -> Blit3D. Must stay cheap: runs for every large non-fast copy.
+static bool xeBlitFixRoute(const uint8_t *p, uint64_t px, void *acc) {
+	const uint32_t bpp = p[0xa0];
+	const uint64_t bytes = px * bpp;
+	if (bytes < (bpp == 16 ? 0x51001ULL : 0x20001ULL)) return true;     // original 0x2c228..0x2c25f
+	const uint32_t sb = *reinterpret_cast<const uint32_t *>(p) + *reinterpret_cast<const uint32_t *>(p + 0x2c);
+	const uint32_t db = *reinterpret_cast<const uint32_t *>(p + 0x48) + *reinterpret_cast<const uint32_t *>(p + 0x74);
+	if ((sb | db) & 0x3f) {                                               // BLITALIGN v2
+		uint32_t n = OSIncrementAtomic(&gBfBase) + 1;
+		if (!(n & (n - 1))) xeBlitFixNote(acc);
+		return true;
+	}
+	const uint32_t sp = *reinterpret_cast<const uint32_t *>(p + 0x8), dp = *reinterpret_cast<const uint32_t *>(p + 0x50);
+	if ((sp | dp) & 0x3f) {                                               // new: pitch not 64-aligned
+		uint32_t n = OSIncrementAtomic(&gBfPitch) + 1;
+		gBfLast = (sp << 16) | (dp & 0xffff);
+		if (n <= 8) IOLog("XeNG BLITFIX #%u: pitch %u->%u tiling %u->%u bpp %u bytes %llu -> XY_SRC_COPY\n",
+		                  n, sp, dp, p[0xc], p[0x54], bpp, bytes);
+		if (!(n & (n - 1))) xeBlitFixNote(acc);   // 1, 2, 4, 8, ... : rare
+		return true;
+	}
+	uint32_t n = OSIncrementAtomic(&gBf3D) + 1;
+	if (!(n & (n - 1))) xeBlitFixNote(acc);
+	return false;
+}
+
+// v2 = BLITALIGN v2's 60-byte block at submitBlit+0x59a (0x2c228), as it is in memory after BLITALIGN applied it.
+// New block (same 60 bytes; branch targets are relative to the block start, identical to the ones v2 encodes):
+//   +0  4c 89 f7            mov  rdi, r14            ; blit3d_params_t*
+//   +3  48 89 d6            mov  rsi, rdx            ; sum of w*h
+//   +6  48 8b 55 c0         mov  rdx, [rbp-0x40]     ; IntelAccelerator* (stored at 0x2bd06)
+//   +10 48 b8 <imm64>       movabs rax, xeBlitFixRoute
+//   +20 ff d0               call rax                 ; stack is 16-aligned here (6 pushes + sub 0x38)
+//   +22 84 c0               test al, al
+//   +24 0f 84 e2 fa ff ff   je   Blit3D (0x2bd28)     ; same target as v2's je
+//   +30 be 01 00 00 00      mov  esi, 1               ; != 2 -> blt2d_source_copy (as the original 0x2c245)
+//   +35 eb d4               jmp  0x2c221 (jmp 0x2bf0c) ; same target as v2's "eb be"
+//   +37 cc x 23
+// Only caller-saved registers are clobbered; all of them are dead at both targets.
+static bool xeBlitFixInstall(KernelPatcher &patcher, KernelPatcher::KextInfo *kext, mach_vm_address_t address, size_t size, const uint8_t *v2, size_t v2Size) {
+	if (!gBfTc) gBfTc = thread_call_allocate(xeBlitFixPublish, nullptr);
+	static uint8_t blk[60];
+	if (v2Size != sizeof(blk)) return false;
+	// v2 must still be the BLITALIGN v2 block with its two branches where this code expects them
+	static const uint8_t v2je[] = {0x0f, 0x84, 0xc7, 0xfa, 0xff, 0xff, 0xeb, 0xbe};
+	if (memcmp(v2 + 51, v2je, sizeof(v2je)) != 0) return false;
+	static const uint8_t head[] = {0x4c, 0x89, 0xf7, 0x48, 0x89, 0xd6, 0x48, 0x8b, 0x55, 0xc0, 0x48, 0xb8};
+	static const uint8_t tail[] = {0xff, 0xd0, 0x84, 0xc0, 0x0f, 0x84, 0xe2, 0xfa, 0xff, 0xff, 0xbe, 0x01, 0x00, 0x00, 0x00, 0xeb, 0xd4};
+	memset(blk, 0xcc, sizeof(blk));
+	memcpy(blk, head, sizeof(head));
+	uint64_t fn = reinterpret_cast<uint64_t>(&xeBlitFixRoute);
+	memcpy(blk + 12, &fn, sizeof(fn));
+	memcpy(blk + 20, tail, sizeof(tail));
+	LookupPatchPlus const p[] = {{kext, v2, blk, sizeof(blk), 1}};
+	return LookupPatchPlus::applyAll(patcher, p, address, size);
 }
