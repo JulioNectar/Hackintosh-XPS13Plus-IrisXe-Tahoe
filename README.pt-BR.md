@@ -8,6 +8,22 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 > no próprio XPS 13 Plus do autor, e cada correção entra aqui depois de confirmada no hardware real. Atualizações
 > frequentes; veja o [CHANGELOG.md](CHANGELOG.md) (o que mudou e o que ainda está em teste).
 
+## Já tem instalado? Atualize
+
+Se o projeto já roda no seu notebook, para atualizar (as novidades estão no [CHANGELOG.md](CHANGELOG.md)):
+
+1. **Faça backup da EFI** de onde você liga (copie a pasta `EFI` ou tenha uma segunda EFI num pendrive).
+2. No seu clone do repositório, num disco APFS:
+   ```sh
+   git pull
+   zsh install.sh          # recompila e reinstala o NootedGreen, o driver Metal, o libxedrv e o compilador de shaders
+   ```
+3. Copie o novo `build/NootedGreen.kext` por cima de `EFI/OC/Kexts/NootedGreen.kext` na EFI de onde você liga.
+4. Reinicie e confira: `kmutil showloaded | grep NootedGreen`.
+
+Se não ligar, use a EFI de backup. Cada correção pode ser desligada com o boot-arg indicado no CHANGELOG.
+Detalhes: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
+
 > ⚠️ **Experimental.** Ainda acontecem travamentos da GPU e kernel panics de vez em quando. Tenha sempre um segundo disco de boot (ou o instalador no USB). Leia [docs/STATUS.md](docs/STATUS.md) antes de começar.
 
 ## O que funciona
@@ -44,9 +60,6 @@ os amplificadores RT1316, e o plug-in `XeSpeakers` publica a saída de som e o m
 (12 subslices × 8 EU) para toda GPU que não é Tiger Lake, então os chips de 80 EU (i5-1334U, i5-1340P, i5-12500H)
 recebem uma topologia errada ([#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3),
 [#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)). Veja o [guia de instalação](docs/INSTALL.md).
-
-**Para atualizar** uma instalação que já funciona: faça backup da EFI, rode `git pull` e `zsh install.sh`, copie o novo
-`build/NootedGreen.kext` para a EFI e reinicie ([docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install)).
 
 ## Documentação
 

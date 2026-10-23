@@ -9,6 +9,22 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 > see [CHANGELOG.md](CHANGELOG.md) for what changed and what is still being tested, and the
 > [releases](../../releases) for the stable points.
 
+## Already installed? Update
+
+If the stack already runs on your machine, update it like this (latest changes in [CHANGELOG.md](CHANGELOG.md)):
+
+1. **Back up the EFI you boot from** (a copy of the `EFI` folder or a second bootable USB EFI).
+2. In your clone, on an APFS disk:
+   ```sh
+   git pull
+   zsh install.sh          # rebuilds and reinstalls NootedGreen, the Metal driver, libxedrv and the shader compiler
+   ```
+3. Copy the new `build/NootedGreen.kext` over `EFI/OC/Kexts/NootedGreen.kext` on the EFI you boot from.
+4. Reboot and check: `kmutil showloaded | grep NootedGreen`.
+
+If it doesn't boot, use the backup EFI. Single fixes can be turned off with the boot-arg named in their CHANGELOG
+entry. Details: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
+
 > 🇧🇷 Leia em português: [README.pt-BR.md](README.pt-BR.md)
 
 > ⚠️ **Experimental.** Expect occasional GPU hangs and kernel panics. Keep a second bootable disk (or the USB installer) around. Read [docs/STATUS.md](docs/STATUS.md) before you start.
@@ -96,8 +112,7 @@ zsh install.sh                  # checks, downloads Apple's driver bundles via N
 Copy the freshly built `build/NootedGreen.kext` to `EFI/OC/Kexts/`, approve the extension if asked, reboot.
 `zsh install.sh --check` only runs the checks; `zsh install.sh --uninstall` removes everything.
 
-**Updating:** `git pull`, `zsh install.sh`, copy the new `build/NootedGreen.kext` to your EFI and reboot (back up the EFI
-first). Details: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
+**Updating:** see [Already installed? Update](#already-installed-update).
 
 Other hardware (other Raptor Lake / Alder Lake laptops): the user-space part is the same, but you need your own
 EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTALL.md](docs/INSTALL.md).
