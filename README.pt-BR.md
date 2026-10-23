@@ -21,6 +21,9 @@ Se o projeto já roda no seu notebook, para atualizar (as novidades estão no [C
 3. Copie o novo `build/NootedGreen.kext` por cima de `EFI/OC/Kexts/NootedGreen.kext` na EFI de onde você liga.
 4. Reinicie e confira: `kmutil showloaded | grep NootedGreen`.
 
+Não rode o `make-efi.sh` de novo para atualizar: ele gera **novos** números de série (SMBIOS), e isso desconecta o
+iCloud/iMessage. Mantenha a sua EFI e troque só o kext.
+
 Se não ligar, use a EFI de backup. Cada correção pode ser desligada com o boot-arg indicado no CHANGELOG.
 Detalhes: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
 

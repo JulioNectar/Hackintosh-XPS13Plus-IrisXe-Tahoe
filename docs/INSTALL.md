@@ -107,7 +107,7 @@ Fixes land in the repository as they are confirmed (see [CHANGELOG.md](../CHANGE
    started afterwards, and for WindowServer after the reboot).
 3. Copy the new `build/NootedGreen.kext` over `EFI/OC/Kexts/NootedGreen.kext` on the EFI you boot from. Only
    compare `config.plist` with the repository's if the CHANGELOG entry says boot-args or kexts changed; keep your
-   own serials.
+   own serials. Do not run `make-efi.sh` again: it generates new SMBIOS serials (iCloud/iMessage sign-out).
 4. Reboot, then check that the new kext is loaded: `kmutil showloaded | grep NootedGreen` and
    `system_profiler SPDisplaysDataType | grep Metal`.
 5. Optional parts are updated separately with their own scripts: speakers/microphones

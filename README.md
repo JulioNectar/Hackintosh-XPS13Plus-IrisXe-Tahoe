@@ -22,6 +22,9 @@ If the stack already runs on your machine, update it like this (latest changes i
 3. Copy the new `build/NootedGreen.kext` over `EFI/OC/Kexts/NootedGreen.kext` on the EFI you boot from.
 4. Reboot and check: `kmutil showloaded | grep NootedGreen`.
 
+Don't run `make-efi.sh` again to update: it generates **new** serial numbers (SMBIOS), which signs you out of
+iCloud/iMessage. Keep your EFI and only replace the kext.
+
 If it doesn't boot, use the backup EFI. Single fixes can be turned off with the boot-arg named in their CHANGELOG
 entry. Details: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
 
