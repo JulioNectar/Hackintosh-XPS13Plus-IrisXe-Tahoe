@@ -283,6 +283,7 @@ class NGreen {
     bool isRealTGL = false;  // true if CPU is genuine TGL (model 0x8C/0x8D), false if spoofed (RPL/ADL)
 public:
     bool getIsRealTGL() const { return isRealTGL; }
+    uint64_t mmioLength() const { return (rmmio && rmmioPtr) ? rmmio->getLength() : 0; }  // xe/rc6fw (22/10)
 private:
     bool dmcIsAdlp = false;    // true when ADL-P DMC blob was loaded in hwInitializeCState
     void adlpDcExit(const char *caller);

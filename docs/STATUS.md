@@ -4,7 +4,7 @@
 
 - Metal desktop: WindowServer, Dock, Finder, Liquid Glass materials, Mission Control, animations at 60 Hz.
 - 3840×2400 panel, HiDPI 1280–1920 pt (via `tools/xe-res`).
-- GPU at ~1300 MHz under load (XE-GTFREQ requests 1500 MHz = RP0; `GT_PERF_LIMIT_REASONS` shows the PL4/IccMax package limit holding it at ~1300), RC6 when idle.
+- GPU at ~1300 MHz under load (XE-GTFREQ requests 1500 MHz = RP0; `GT_PERF_LIMIT_REASONS` shows the PL4/IccMax package limit holding it at ~1300), RC6 when idle (XE-RC6FW, since 2026-10-22: before, a forcewake leak could keep the GPU awake at ~5 W).
 - HEIC/YUV images, wallpapers (PLANES2). App icons, thumbnails and image layers (libxedrv v15).
 - Video: YouTube in **Chrome with GPU acceleration** (software decode on the CPU), including 4K. Screen recording works. Safari works once an audio output exists: the internal speakers (XeSpeakers), Bluetooth, or the BlackHole virtual device (`tools/build-blackhole.sh`).
 - Brightness through `xe-brilho` (XeShim).
@@ -30,6 +30,7 @@
 | Problem | Details | Workaround |
 |---|---|---|
 | WindowServer hang | fixed 2026-10-21 (csbresync): not seen again in daily use since | — |
+| GPU hang → reboot | any hang on the render or compute engine (e.g. Photos' `mediaanalysisd`) used to end in a restart loop and a WindowServer watchdog panic: the reset of the shared render domain left the other engine unconfigured. **Fixed 2026-10-22 (XE-GPUREC), waiting for a real hang to confirm**; a hang should now cost a glitched frame | `launchctl disable gui/$UID/com.apple.mediaanalysisd` removes the most common trigger |
 | Slow shutdown / watchdog panic | fixed 2026-10-21 (XE-IDLEBOUND): shutdown no longer waits on a GPU that never goes idle | — |
 | Panic at shutdown (rare) | "corrupt list" in `IOAccelOrphanedMemoryPool` (release path) | none yet |
 | System Settings › Displays and colour profiles | fixed in practice: no panics since 21 Oct, including colour-profile changes (re-tested 22 Oct). The three page-fault panics of 20 Oct (ITU-709) stopped after XE-RCPOLICY, csbresync and libxedrv v16/v17; the exact root cause was never isolated | — |

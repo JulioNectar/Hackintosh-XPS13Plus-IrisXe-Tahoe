@@ -320,6 +320,27 @@ static void applyFixBootMode(KernelPatcher &patcher, KernelPatcher::KextInfo *ke
 // retido esperando algo (provavelmente a conclusão da transação de display). Contadores no caminho de conclusão
 // (TGL: submit/isComplete/signalComplete/signalDisplayStampUpdate), com IOLog nas primeiras chamadas e a cada 64.
 static void xeEv(uint32_t tag, uint32_t a, uint32_t b, uint32_t c);
+// xe/rc6fw (22/10): state shared by forceWake, xeSafeForceWake, the idle watchdog and the route code
+static IOSimpleLock *gFwLock = nullptr;     // forceWake's FWREF lock (was a static local in forceWake)
+static uint32_t gFwRef[8][4];               // forceWake's per-(domain, ctx) reference counts
+static mach_vm_address_t gOrgSafeForceWake = 0;
+static mach_vm_address_t gFwSymAddr = 0;    // runtime address of Apple's SafeForceWake(bool, uint)
+static int gRc6FwOn = 0;                    // 1 = route installed and active
+static int gRc6FwDrop = 1;                  // 0 = -ngreenrc6fwnodrop
+static uint32_t gRc6IdleMs = 500;
+static void *gFwAccel = nullptr;
+static thread_call_t gFwIdleTc = nullptr;
+static volatile uint32_t gFwActSeq = 0;     // bumped by every SafeForceWake call (multi path)
+static volatile uint32_t gFwUnderflow = 0;  // puts at count 0 (ignored) + negative counts repaired
+static volatile uint32_t gFwLeakDrops = 0;  // times the watchdog released a leaked hold
+static volatile uint32_t gFwLeakDom = 0;    // OR of the domains released
+static volatile uint64_t gFwLastGetCaller[3] = {};  // file offset of the last 0->1 get, per domain
+static volatile uint64_t gFwLeakCaller = 0;         // file offset of the get that leaked (last drop)
+static volatile uint64_t gFwUnderflowCaller = 0;    // file offset of the last ignored put
+
+static void xeSafeForceWake(void *that, bool set, uint32_t dom);
+static void xeRc6FwStart(void *accel);
+static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);  // xe/gpurec (22/10)
 static uint8_t *volatile gAccelObj = nullptr;  // xe/csstate: IntelAccelerator (capturado em signalDisplayStampUpdate)
 static mach_vm_address_t gOrgDpSubmit = 0, gOrgDpIsComplete = 0, gOrgDpSignal = 0, gOrgDispStamp = 0;
 static volatile uint32_t gDpSubmitN = 0, gDpIsCompN = 0, gDpIsCompTrue = 0, gDpSignalN = 0, gDispStampN = 0;
@@ -2013,7 +2034,36 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			if (forceFullMTL && wegCoexist) {
 				SYSLOG("ngreen", "FULL_MTL: forcing SafeForceWakeMultithreaded route despite coexist mode");
 			}
+			// xe/rc6fw (22/10): clamped SafeForceWake + idle release of leaked ctx-1 forcewake (see xeSafeForceWake)
+			if (!checkKernelArgument("-ngreennorc6fw")) {
+				uint32_t ms = 0;
+				if (PE_parse_boot_argn("ngreenfwidle", &ms, sizeof(ms)) && ms >= 100 && ms <= 60000) gRc6IdleMs = ms;
+				gRc6FwDrop = checkKernelArgument("-ngreenrc6fwnodrop") ? 0 : 1;
+				mach_vm_address_t sfw = patcher.solveSymbol(index, "__ZN16IntelAccelerator13SafeForceWakeEbj", address, size);
+				patcher.clearError();
+				bool sigCnt = false, sigLock = false;
+				if (sfw) {
+					static const uint8_t sCnt[] = {0x41, 0x8b, 0x85, 0x90, 0x12, 0x00, 0x00};   // movl 0x1290(%r13),%eax
+					static const uint8_t sLck[] = {0x49, 0x8b, 0x9d, 0x68, 0x14, 0x00, 0x00};   // movq 0x1468(%r13),%rbx
+					auto *pb = reinterpret_cast<const uint8_t *>(sfw);
+					for (size_t i = 0; i + sizeof(sCnt) <= 0x140; i++) {
+						if (!sigCnt && !memcmp(pb + i, sCnt, sizeof(sCnt))) sigCnt = true;
+						if (!sigLock && !memcmp(pb + i, sLck, sizeof(sLck))) sigLock = true;
+					}
+				}
+				if (sigCnt && sigLock) {
+					gFwSymAddr = sfw;
+					RouteRequestPlus rc6fw[] = {
+						{"__ZN16IntelAccelerator13SafeForceWakeEbj", xeSafeForceWake, gOrgSafeForceWake},
+					};
+					if (RouteRequestPlus::routeAll(patcher, index, rc6fw, address, size)) gRc6FwOn = 1;
+					else patcher.clearError();
+				}
+				SYSLOG("ngreen", "XE-RC6FW: sym=%d sig=%d/%d route=%d idle=%u drop=%d", sfw != 0, sigCnt, sigLock, gRc6FwOn, gRc6IdleMs, gRc6FwDrop);
+			}
 		}
+		// xe/gpurec (22/10): restore + replay the render-reset-domain sibling (RCS <-> CCS) after a GPU restart
+		if (!NGreen::callback->isRealTGL) xeGpuRecInstall(patcher, index, address, size);
 
 		if (!wegCoexist) {
 			RouteRequestPlus gpuInfoRoute[] = {
@@ -5485,6 +5535,7 @@ unsigned long Gen11::start(void *that,void  *param_1)
 	
 	// V42: Save accelerator instance for child enumeration in hangcheck
 	callback->accelInstance = that;
+	xeRc6FwStart(that);  // xe/rc6fw (22/10)
 	
 	// V54: Pre-enable Master IRQ BEFORE calling original start().
 	// V53 proved that the TGL driver never enables GFX_MSTR_IRQ bit 31 on RPL.
@@ -10075,6 +10126,155 @@ static const FwMediaEngine fwMediaEngines[] = {
 	{ FORCEWAKE_MEDIA_VEBOX_GEN11(0), FORCEWAKE_ACK_MEDIA_VEBOX_GEN11(0), "VEBOX0" },  // 0xa560 / 0x0D70
 };
 
+// ─── xe/rc6fw (22/10): forcewake ctx 1 balanced + released on idle ─────────────────────────────────────────
+// Apple's IntelAccelerator::SafeForceWake(bool, uint dom) (TGL 16.0.x, file offset 0x28c2a) keeps SIGNED counters per
+// domain at accel+0x1290/0x1294/0x1298 (render/media/GT) under the spin lock *(accel+0x1468), and calls
+// SafeForceWakeMultithreaded(set, changed, ctx=1) (= our forceWake) only on transitions:
+//   get: count++ , wake if the old count <= 0;    put: count-- , release only if the old count == 1.
+// That is asymmetric: one extra put leaves the count at -1; from then on every get (-1 -> 0) wakes and every put
+// (0 -> -1) does NOT release -> forcewake bit 1 stays set on RENDER/GT/VDBOX0/VEBOX0 forever and the GT never enters
+// RC6 (seen 22/10 04:25: RC6 0 %, GT 4.6-5.3 W, all engines idle, MI_MODE idle bit set). A get without a put (leak)
+// has the same visible effect. This block:
+//   (1) replaces SafeForceWake's multi-forcewake path with the same algorithm but with the count clamped at 0
+//       (an extra put is ignored and logged, so it can never turn into a sticky hold);
+//   (2) runs a 100 ms watchdog: if any count is > 0 while there has been no SafeForceWake call and no execlist
+//       submission for ngreenfwidle ms (default 500) and every engine reports idle (RING_MI_MODE bit 9), the hold is
+//       a leak: the counts are zeroed under Apple's lock and ctx 1 is released (logged with the caller of the
+//       leaked get). A later stray put is absorbed by (1). Apple itself never needs ctx 1 while the engine runs:
+//       submitExecList drops it right after writing the ELSP, and the interrupt path uses ctx 2.
+//   (3) publishes diagnostics on the IntelAccelerator service (ioreg -rc IntelAccelerator | grep xe-fw).
+// Off: -ngreennorc6fw (pure Apple path, as before). Keep (1)+(3) but never drop: -ngreenrc6fwnodrop.
+static inline uint64_t xeFwOff(uint64_t ra) {
+	// return address -> AppleIntelTGLGraphics file offset (matches `otool -tV` addresses)
+	return (gFwSymAddr && ra > gFwSymAddr - 0x28c2a) ? ra - gFwSymAddr + 0x28c2a : 0;
+}
+
+static inline IOSimpleLock *xeAppleFwLock(uint8_t *a) {
+	void *holder = *reinterpret_cast<void **>(a + 0x1468);
+	return holder ? *reinterpret_cast<IOSimpleLock **>(holder) : nullptr;
+}
+
+static void xeSafeForceWake(void *that, bool set, uint32_t dom) {
+	auto *a = static_cast<uint8_t *>(that);
+	if (gRc6FwOn != 1 || !dom || !a) {
+		FunctionCast(xeSafeForceWake, gOrgSafeForceWake)(that, set, dom);
+		return;
+	}
+	uint64_t flags = *reinterpret_cast<volatile uint64_t *>(a + 0x1190);
+	IOSimpleLock *lk = xeAppleFwLock(a);
+	if ((flags & 0x1000) || !(flags & 0x800) || !lk) {  // not the MultiForceWake path: Apple's code unchanged
+		FunctionCast(xeSafeForceWake, gOrgSafeForceWake)(that, set, dom);
+		return;
+	}
+	gFwAccel = that;
+	uint64_t caller = xeFwOff(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	auto *cnt = reinterpret_cast<volatile int32_t *>(a + 0x1290);
+	IOSimpleLockLock(lk);
+	uint32_t changed = 0;
+	for (unsigned i = 0; i < 3; i++) {
+		uint32_t d = 1u << i;
+		if (!(dom & d)) continue;
+		int32_t c = cnt[i];
+		if (c < 0) { gFwUnderflow++; c = 0; }  // left by Apple's original code (before the route) or a reset
+		if (set) {
+			cnt[i] = c + 1;
+			if (c == 0) { changed |= d; gFwLastGetCaller[i] = caller; }
+		} else if (c == 0) {
+			gFwUnderflow++; gFwUnderflowCaller = caller;   // extra put: ignore (Apple would go to -1 = sticky hold)
+			cnt[i] = 0;
+			xeEv('FWUF', i, (uint32_t)caller, gFwUnderflow);
+		} else {
+			cnt[i] = c - 1;
+			if (c == 1) changed |= d;
+		}
+	}
+	gFwActSeq++;
+	if (changed) Gen11::xeForceWakePub(that, set, changed, 1);
+	IOSimpleLockUnlock(lk);
+}
+
+static inline bool xeEngIdle(uint32_t base) {
+	// RING_MI_MODE bit 9 = MODE_IDLE. 0 = engine fused off / powered down (also idle).
+	// never let readReg32 fall into its index/data (write) path: only read inside the mapped BAR
+	auto *cb = NGreen::callback;
+	if (base + 0xa0 > cb->mmioLength()) return false;  // outside the BAR / unmapped -> treat as busy (never drop)
+	uint32_t m = cb->readReg32(base + 0x9c);
+	return m == 0 || m == 0xffffffff || (m & 0x200);
+}
+
+static void xeFwIdleWorker(thread_call_param_t, thread_call_param_t) {
+	static uint32_t lastSeq = 0, lastSub = 0, quietMs = 0, pubTick = 0;
+	const uint32_t tick = 100;
+	void *acc = gFwAccel;
+	if (acc && NGreen::callback) {
+		auto *a = static_cast<uint8_t *>(acc);
+		auto *cnt = reinterpret_cast<volatile int32_t *>(a + 0x1290);
+		uint32_t seq = gFwActSeq, sub = gCs5SubmitN;
+		if (seq != lastSeq || sub != lastSub) { quietMs = 0; lastSeq = seq; lastSub = sub; }
+		else if (quietMs < 0x40000000) quietMs += tick;
+		// held = Apple still counts a holder, or our FWREF count for ctx 1 is set while Apple's is not (desync, e.g. after
+		// IntelAccelerator::systemDidWake zeroes Apple's counts but not ours -> the next get/put pair would leave it held)
+		bool held = false;
+		for (unsigned i = 0; i < 3; i++) if (cnt[i] > 0 || gFwRef[i][1] > 0) held = true;
+		if (gRc6FwDrop && held && quietMs >= gRc6IdleMs) {
+			// 0x1c4000 (VCS1) is fused off on this SKU; VCS2 0x1d0000 reads 0 when unused
+			bool idle = xeEngIdle(0x2000) && xeEngIdle(0x22000) && xeEngIdle(0x1c0000) &&
+			            xeEngIdle(0x1c8000) && xeEngIdle(0x1d0000);
+			IOSimpleLock *lk = idle ? xeAppleFwLock(a) : nullptr;
+			if (lk) {
+				IOSimpleLockLock(lk);
+				if (gFwActSeq == seq && gCs5SubmitN == sub) {  // nobody took/released forcewake meanwhile
+					uint32_t drop = 0;
+					int32_t c0 = cnt[0], c1 = cnt[1], c2 = cnt[2];
+					for (unsigned i = 0; i < 3; i++) {
+						if (cnt[i] > 0 || gFwRef[i][1] > 0) {
+							drop |= 1u << i;
+							if (cnt[i] > 0) gFwLeakCaller = gFwLastGetCaller[i];
+							cnt[i] = 0;
+							// make forceWake's FWREF do exactly one 1->0 transition (it ignores a put at 0)
+							if (gFwLock) gFwRef[i][1] = 1;
+						}
+					}
+					if (drop) {
+						Gen11::xeForceWakePub(acc, false, drop, 1);
+						gFwLeakDrops++; gFwLeakDom |= drop;
+						xeEv('FWLK', drop, (uint32_t)gFwLeakCaller, (uint32_t)((c0 & 0xff) | ((c1 & 0xff) << 8) | ((c2 & 0xff) << 16)));
+					}
+				}
+				IOSimpleLockUnlock(lk);
+			}
+			quietMs = 0;
+		}
+		if (++pubTick >= 10) {  // 1 s: publish diagnostics (thread context, outside any lock)
+			pubTick = 0;
+			auto *svc = static_cast<IOService *>(acc);
+			svc->setProperty("xe-fw-leakdrops", gFwLeakDrops, 32);
+			svc->setProperty("xe-fw-leakdom", gFwLeakDom, 32);
+			svc->setProperty("xe-fw-leakcaller", (unsigned long long)gFwLeakCaller, 64);
+			svc->setProperty("xe-fw-underflow", gFwUnderflow, 32);
+			svc->setProperty("xe-fw-underflowcaller", (unsigned long long)gFwUnderflowCaller, 64);
+			svc->setProperty("xe-fw-count", (unsigned long long)(((uint64_t)(uint32_t)cnt[0]) | ((uint64_t)(uint16_t)cnt[1] << 32) | ((uint64_t)(uint16_t)cnt[2] << 48)), 64);
+		}
+	}
+	if (gFwIdleTc) {
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(tick, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gFwIdleTc, deadline);
+	}
+}
+
+static void xeRc6FwStart(void *accel) {
+	if (gRc6FwOn != 1 || gFwIdleTc) return;
+	gFwAccel = accel;
+	gFwIdleTc = thread_call_allocate(xeFwIdleWorker, nullptr);
+	if (gFwIdleTc) {
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(5000, kMillisecondScale, &deadline);  // start after the accelerator is up
+		thread_call_enter_delayed(gFwIdleTc, deadline);
+	}
+	SYSLOG("ngreen", "XE-RC6FW: watchdog %s (idle %u ms, drop %d)", gFwIdleTc ? "armed" : "FAILED", gRc6IdleMs, gRc6FwDrop);
+}
+
 void Gen11::wrapSafeForceWake(void *that, bool set, uint32_t dom) {
 	forceWake(that, set, dom, 1);  // forward to our forceWake with ctx=1 (normal, non-IRQ)
 }
@@ -10452,8 +10652,9 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 	if (fwRelease < 0) fwRelease = checkKernelArgument("-ngreenfwhold") ? 0 : 1;  // 19/10: segurar sempre quebrou o boot
 	static int fwRefArg = -1;
 	if (fwRefArg < 0) fwRefArg = (checkKernelArgument("-ngreenxefix") && !checkKernelArgument("-ngreennofwref")) ? 1 : 0;
-	static IOSimpleLock *fwLock = nullptr;
-	static uint32_t fwRef[8][4];
+	// xe/rc6fw (22/10): fwLock/fwRef moved to file scope (gFwLock/gFwRef) so the idle watchdog shares them
+	auto &fwLock = gFwLock;
+	auto &fwRef = gFwRef;
 	if (fwRefArg == 1 && !fwLock) {
 		IOSimpleLock *l = IOSimpleLockAlloc();
 		if (l && !__sync_bool_compare_and_swap(&fwLock, (IOSimpleLock *)nullptr, l)) IOSimpleLockFree(l);
@@ -11619,3 +11820,166 @@ void Gen11::endReset(void *that)
 //undefined8 __thiscall IntelAccelerator::stopGraphicsEngine(IntelAccelerator *this)
 //void __thiscall IGAccelSegmentResourceList::initBlitUsage(IGAccelSegmentResourceList *this)
 //ulong IntelAccelerator::submitBlit (blit3d_params_t *param_1,IGVector *param_2,IGAccelTask *param_3,bool param_4)
+
+// ─── xe/gpurec (22/10): recover the render reset domain sibling (RCS <-> CCS) after a GPU restart ───────────────
+// AppleIntelTGLGraphics 16.0.x, IGHardwareRingBuffer::resetGraphicsEngine (file 0x43576), host scheduler path:
+//   save ring->0x78 list (MMIO) -> GAMTARBMODE 0x4a08 |= bit2 -> GDRST 0x941c = ring->0x70 -> poll -> 0x4a08 &= ~bit2
+//   -> restore ring->0x78 list (value = accel->getDefaultResetValue(reg) ?: saved, masked regs | 0xffff0000)
+//   -> IGScheduler5::processGPUReset(ring->0x40 = IGHwCsType, ctx) for THAT engine only.
+// RCS (type 0, IGHardwareRingBufferMain::init 0x84d10) and CCS (type 1, IGHardwareRingBufferCompute::init 0x4e35a)
+// both use GDRST mask 0x2 (GEN11_GRDOM_RENDER, the shared render reset domain), but each restores only its own list
+// (_rcsResetRegisters / _ccsResetRegisters) and replays only its own engine. A reset of one therefore leaves the other
+// with HWS_PGA=0, GFX_MODE=0, FORCE_TO_NONPRIV at defaults, its in-flight context dropped by the hardware and the
+// scheduler still waiting for its CSB events: every gpuRestart report after the first CCS reset shows exactly that
+// (RCS GFX_MODE 0x8000->0, HWS_PGA 0x40004000->0, NONPRIV 0xe100->0xe000, EXECLIST_STATUS 0x1), its stamps never return,
+// restarts of its channels are "Skipped / no channel associated", WindowServer blocks and watchdogd panics.
+// Fix (what i915 does for engines that share a reset domain): around the original, snapshot the sibling's list; after
+// a real GDRST, restore it (same value rule as Apple, last known-good snapshot if the live one is already broken) and
+// run IGScheduler5::processGPUReset for the sibling (CSB head reset, in-flight stamps retired, execlist resubmitted).
+// Off: -ngreennogpurec. Diagnostics: ioreg -rc IntelAccelerator | grep xe-rec.
+static mach_vm_address_t gOrgRge = 0, gRecSfw = 0, gRecGetDef = 0, gRecS5Proc = 0, gRecList[2] = {0, 0};
+static int gRecOn = 0;
+static uint32_t gRecGood[2][64];
+static bool gRecGoodOk[2] = {false, false};
+static volatile uint32_t gRecResets = 0, gRecSibRestores = 0, gRecSibReplays = 0, gRecOwnFix = 0, gRecSkipKick = 0, gRecLast = 0;
+
+static inline uint32_t xeRecRd(volatile uint8_t *mmio, uint32_t r) { return *reinterpret_cast<volatile uint32_t *>(mmio + r); }
+static inline void xeRecWr(volatile uint8_t *mmio, uint32_t r, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(mmio + r) = v; }
+// IGVector<resetRegisterInfo>: {u64 count; u64 capacity; resetRegisterInfo *data}, entry 0x24 B: u32 reg, u32 val, u8 masked, name@0xa
+static inline bool xeRecList(int i, uint64_t &n, uint8_t *&d) {
+	auto *v = reinterpret_cast<uint8_t *>(gRecList[i]);
+	if (!v) return false;
+	n = *reinterpret_cast<uint64_t *>(v);
+	d = *reinterpret_cast<uint8_t **>(v + 0x10);
+	return d && n > 0 && n <= 64 && *reinterpret_cast<uint32_t *>(d) == (i == 0 ? 0x2080u : 0x1a080u);  // entry 0 = HWS_PGA
+}
+static inline uint32_t xeRecReg(uint8_t *d, uint64_t i) { return *reinterpret_cast<uint32_t *>(d + i * 0x24); }
+static inline bool xeRecMasked(uint8_t *d, uint64_t i) { return d[i * 0x24 + 8] != 0; }
+
+static void xeRecWriteList(void *acc, volatile uint8_t *mmio, uint8_t *d, uint64_t n, const uint32_t *src) {
+	auto getDef = reinterpret_cast<uint32_t (*)(void *, uint32_t)>(gRecGetDef);
+	for (uint64_t i = 0; i < n; i++) {
+		uint32_t reg = xeRecReg(d, i), v = getDef(acc, reg);
+		if (!v) v = src[i];
+		if (xeRecMasked(d, i)) v |= 0xffff0000u;
+		xeRecWr(mmio, reg, v);
+	}
+	(void)xeRecRd(mmio, xeRecReg(d, 0));  // posting read
+}
+
+static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
+	auto orig = FunctionCast(xeRecResetGraphicsEngine, gOrgRge);
+	auto *r = static_cast<uint8_t *>(ring);
+	if (gRecOn != 1 || !r) return orig(ring, ctx);
+	auto *acc = *reinterpret_cast<uint8_t **>(r + 0x10);
+	auto *mmio = *reinterpret_cast<volatile uint8_t **>(r + 0x50);
+	uint32_t mask = *reinterpret_cast<uint32_t *>(r + 0x70);
+	mach_vm_address_t ownList = *reinterpret_cast<mach_vm_address_t *>(r + 0x78);
+	uint8_t type = r[0x40];
+	int own = ownList == gRecList[0] ? 0 : ownList == gRecList[1] ? 1 : -1;
+	if (!acc || !mmio || !(mask & 2) || own < 0 || type != (uint8_t)own) return orig(ring, ctx);
+	int sib = 1 - own;
+	uint64_t sn = 0, on = 0; uint8_t *sd = nullptr, *od = nullptr;
+	if (!xeRecList(sib, sn, sd) || !xeRecList(own, on, od)) return orig(ring, ctx);
+
+	auto sfw = reinterpret_cast<void (*)(void *, bool, uint32_t)>(gRecSfw);
+	sfw(acc, true, 7);  // hold render/media/GT across the whole reset (Apple takes and drops its own inside)
+	uint32_t snap[64], osnap[64];
+	for (uint64_t i = 0; i < sn; i++) snap[i] = xeRecRd(mmio, xeRecReg(sd, i));
+	for (uint64_t i = 0; i < on; i++) osnap[i] = xeRecRd(mmio, xeRecReg(od, i));
+	if (snap[0]) { for (uint64_t i = 0; i < sn; i++) gRecGood[sib][i] = snap[i]; gRecGoodOk[sib] = true; }
+	if (osnap[0]) { for (uint64_t i = 0; i < on; i++) gRecGood[own][i] = osnap[i]; gRecGoodOk[own] = true; }
+	// resetGraphicsEngine's "ring wait" path (engine flags 0x4/0x8 at ring->0x8b8[type]+0xa4) only kicks RING_CTL and may
+	// not reach GDRST; then only act if the sibling visibly lost its state.
+	auto *eng = *reinterpret_cast<uint8_t **>(r + 0x8b8 + (uint64_t)type * 8);
+	bool kick = eng && (*reinterpret_cast<uint32_t *>(eng + 0xa4) & 0xc);
+
+	bool ret = orig(ring, ctx);
+
+	uint32_t sibHws = xeRecRd(mmio, xeRecReg(sd, 0));
+	bool lost = snap[0] ? (sibHws == 0) : true;
+	bool gdrst = !kick || (snap[0] && sibHws == 0);
+	gRecResets++;
+	uint32_t did = 0;
+	if (ret && gdrst && lost) {
+		const uint32_t *src = snap[0] ? snap : (gRecGoodOk[sib] ? gRecGood[sib] : snap);
+		xeRecWriteList(acc, mmio, sd, sn, src);
+		gRecSibRestores++; did |= 1;
+		// own engine: Apple restored from what it saved; if that was already broken (HWS_PGA 0), use the known-good copy
+		if (xeRecRd(mmio, xeRecReg(od, 0)) == 0 && gRecGoodOk[own]) {
+			xeRecWriteList(acc, mmio, od, on, gRecGood[own]);
+			gRecOwnFix++; did |= 2;
+		}
+		// replay the sibling: IGScheduler5::processGPUReset(type, ctx) -> IGHardwareCommandStreamer5::processGPUReset
+		auto *sched = *reinterpret_cast<uint8_t **>(acc + 0x1250);
+		auto *vt = sched ? *reinterpret_cast<mach_vm_address_t **>(sched) : nullptr;
+		auto *cs = sched ? *reinterpret_cast<uint8_t **>(sched + 0xca0 + (uint64_t)sib * 8) : nullptr;
+		auto *desc = cs ? *reinterpret_cast<uint8_t **>(cs + 0x28) : nullptr;
+		if (vt && vt[0x190 / 8] == gRecS5Proc && desc && desc[0] == (uint8_t)sib) {
+			reinterpret_cast<void (*)(void *, uint32_t, void *)>(gRecS5Proc)(sched, (uint32_t)sib, nullptr);
+			gRecSibReplays++; did |= 4;
+		}
+	} else if (kick && !gdrst) {
+		gRecSkipKick++;
+	}
+	sfw(acc, false, 7);
+	gRecLast = (uint32_t)own | ((uint32_t)ret << 4) | ((uint32_t)kick << 5) | (did << 8) | ((snap[0] >> 12) << 12);
+	xeEv('GREC', gRecLast, snap[0], sibHws);
+	if (gRecResets <= 32)
+		IOLog("XeNG GPUREC: reset %s ret=%d kick=%d sibHWS %x->%x restore=%d ownfix=%d replay=%d (n=%u)\n", own ? "CCS" : "RCS",
+		      ret, kick, snap[0], sibHws, !!(did & 1), !!(did & 2), !!(did & 4), gRecResets);
+	auto *svc = reinterpret_cast<IOService *>(acc);
+	svc->setProperty("xe-rec-resets", gRecResets, 32);
+	svc->setProperty("xe-rec-sibrestores", gRecSibRestores, 32);
+	svc->setProperty("xe-rec-sibreplays", gRecSibReplays, 32);
+	svc->setProperty("xe-rec-ownfix", gRecOwnFix, 32);
+	svc->setProperty("xe-rec-last", gRecLast, 32);
+	return ret;
+}
+
+// Route installer (called from processKext). All addresses are runtime; every assumption is checked by bytes first.
+static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (checkKernelArgument("-ngreennogpurec")) { SYSLOG("ngreen", "XE-GPUREC: off (-ngreennogpurec)"); return; }
+	mach_vm_address_t rge = patcher.solveSymbol(index, "__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", address, size);
+	patcher.clearError();
+	gRecSfw = patcher.solveSymbol(index, "__ZN16IntelAccelerator13SafeForceWakeEbj", address, size); patcher.clearError();
+	gRecGetDef = patcher.solveSymbol(index, "__ZN16IntelAccelerator20getDefaultResetValueEj", address, size); patcher.clearError();
+	gRecS5Proc = patcher.solveSymbol(index, "__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext", address, size); patcher.clearError();
+	mach_vm_address_t cs5Proc = patcher.solveSymbol(index, "__ZN26IGHardwareCommandStreamer515processGPUResetEv", address, size); patcher.clearError();
+	gRecList[0] = patcher.solveSymbol(index, "_rcsResetRegisters", address, size); patcher.clearError();
+	gRecList[1] = patcher.solveSymbol(index, "_ccsResetRegisters", address, size); patcher.clearError();
+	auto has = [](mach_vm_address_t f, size_t len, const uint8_t *p, size_t n) {
+		if (!f) return false;
+		auto *b = reinterpret_cast<const uint8_t *>(f);
+		for (size_t i = 0x10; i + n <= len; i++) if (!memcmp(b + i, p, n)) return true;  // skip the entry (route jump)
+		return false;
+	};
+	// movl $0x40004,0x4a08(%rax); movl 0x70(%r12),%ecx; movl %ecx,0x941c(%rax)
+	static const uint8_t sGdrst[] = {0xc7, 0x80, 0x08, 0x4a, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x41, 0x8b, 0x4c, 0x24, 0x70, 0x89, 0x88, 0x1c, 0x94, 0x00, 0x00};
+	// movzbl 0x40(%r12),%esi; movq (%rdi),%rax; movq -0x30(%rbp),%rdx; callq *0x190(%rax)   (sched->processGPUReset(type, ctx))
+	static const uint8_t sProc[] = {0x41, 0x0f, 0xb6, 0x74, 0x24, 0x40, 0x48, 0x8b, 0x07, 0x48, 0x8b, 0x55, 0xd0, 0xff, 0x90, 0x90, 0x01, 0x00, 0x00};
+	// movzbl 0x40(%r12),%eax; movq 0x8b8(%r12,%rax,8),%rax; movl 0xa4(%rax),%ecx
+	static const uint8_t sFlags[] = {0x41, 0x0f, 0xb6, 0x44, 0x24, 0x40, 0x49, 0x8b, 0x84, 0xc4, 0xb8, 0x08, 0x00, 0x00, 0x8b, 0x88, 0xa4, 0x00, 0x00, 0x00};
+	// IGScheduler5::processGPUReset: movl %esi,%eax; movq 0xca0(%rdi,%rax,8),%rdi
+	static const uint8_t sS5[] = {0x89, 0xf0, 0x48, 0x8b, 0xbc, 0xc7, 0xa0, 0x0c, 0x00, 0x00};
+	// IGHardwareCommandStreamer5::processGPUReset: movl $7,%eax; movl %eax,0x1c04(%rdi)
+	static const uint8_t sCs5[] = {0xb8, 0x07, 0x00, 0x00, 0x00, 0x89, 0x87, 0x04, 0x1c, 0x00, 0x00};
+	bool sig1 = has(rge, 0x320, sGdrst, sizeof(sGdrst)), sig2 = has(rge, 0x320, sProc, sizeof(sProc)),
+	     sig3 = has(rge, 0x320, sFlags, sizeof(sFlags));
+	bool sig4 = false;
+	if (gRecS5Proc) sig4 = !memcmp(reinterpret_cast<const uint8_t *>(gRecS5Proc) + 4, sS5, sizeof(sS5));
+	bool sig5 = has(cs5Proc, 0x40, sCs5, sizeof(sCs5)) || (cs5Proc && !memcmp(reinterpret_cast<const uint8_t *>(cs5Proc) + 0xe, sCs5, sizeof(sCs5)));
+	uint64_t n0 = 0, n1 = 0; uint8_t *d0 = nullptr, *d1 = nullptr;
+	// the lists are filled by the static constructors of the TGL kext, which ran before processKext; check them now
+	bool l0 = xeRecList(0, n0, d0), l1 = xeRecList(1, n1, d1);
+	bool ok = rge && gRecSfw && gRecGetDef && gRecS5Proc && sig1 && sig2 && sig3 && sig4 && sig5;
+	if (ok) {
+		RouteRequestPlus rec[] = {
+			{"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", xeRecResetGraphicsEngine, gOrgRge},
+		};
+		if (RouteRequestPlus::routeAll(patcher, index, rec, address, size)) gRecOn = 1;
+		else patcher.clearError();
+	}
+	SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d route=%d",
+	       rge != 0, gRecSfw != 0, gRecGetDef != 0, gRecS5Proc != 0, cs5Proc != 0, l0, l1, n0, n1, sig1, sig2, sig3, sig4, sig5, gRecOn);
+}
