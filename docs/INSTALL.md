@@ -91,6 +91,31 @@ Approve the extension in **System Settings › Privacy & Security** if asked, an
 2. In the Dell BIOS (F2) › Boot Configuration › Boot Sequence: **Add Boot Option** → the internal disk →
    `\EFI\BOOT\BOOTx64.efi`, and move it to the top.
 
+## Updating an existing install
+
+Fixes land in the repository as they are confirmed (see [CHANGELOG.md](../CHANGELOG.md)). To update a working setup:
+
+1. **Back up the EFI you boot from** (copy the whole `EFI` folder somewhere, or keep a second bootable USB EFI), so a
+   kext that does not boot can be undone.
+2. Update and rebuild, from your clone (on an APFS disk):
+   ```sh
+   cd ~/XPS13Plus-Tahoe-IrisXe   # your clone
+   git pull
+   zsh install.sh                # rebuilds and reinstalls NootedGreen, the Metal driver, libxedrv and the shader compiler
+   ```
+   This replaces the user-space files in `/Library/GPUBundles` and `/Library/Extensions` (they take effect for apps
+   started afterwards, and for WindowServer after the reboot).
+3. Copy the new `build/NootedGreen.kext` over `EFI/OC/Kexts/NootedGreen.kext` on the EFI you boot from. Only
+   compare `config.plist` with the repository's if the CHANGELOG entry says boot-args or kexts changed; keep your
+   own serials.
+4. Reboot, then check that the new kext is loaded: `kmutil showloaded | grep NootedGreen` and
+   `system_profiler SPDisplaysDataType | grep Metal`.
+5. Optional parts are updated separately with their own scripts: speakers/microphones
+   (`zsh tools/audio/install-audio.sh build`, then `kext`, then `hal`), fingerprint (`tools/fingerprint`), etc.
+
+If the new kext does not boot, boot the backup EFI and put the old `NootedGreen.kext` back. A single fix can also be
+turned off with its boot-arg (listed in the CHANGELOG entry and in [KERNEL-PATCHES.md](KERNEL-PATCHES.md)).
+
 ## Recovery
 
 - `config-install.plist` (NootedGreen off) is only safe **before** the TGL files are installed, or after

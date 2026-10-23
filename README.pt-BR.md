@@ -45,6 +45,9 @@ os amplificadores RT1316, e o plug-in `XeSpeakers` publica a saída de som e o m
 recebem uma topologia errada ([#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3),
 [#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)). Veja o [guia de instalação](docs/INSTALL.md).
 
+**Para atualizar** uma instalação que já funciona: faça backup da EFI, rode `git pull` e `zsh install.sh`, copie o novo
+`build/NootedGreen.kext` para a EFI e reinicie ([docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install)).
+
 ## Documentação
 
 - [Guia de instalação](docs/INSTALL.md)

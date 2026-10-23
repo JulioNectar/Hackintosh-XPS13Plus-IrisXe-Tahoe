@@ -96,6 +96,9 @@ zsh install.sh                  # checks, downloads Apple's driver bundles via N
 Copy the freshly built `build/NootedGreen.kext` to `EFI/OC/Kexts/`, approve the extension if asked, reboot.
 `zsh install.sh --check` only runs the checks; `zsh install.sh --uninstall` removes everything.
 
+**Updating:** `git pull`, `zsh install.sh`, copy the new `build/NootedGreen.kext` to your EFI and reboot (back up the EFI
+first). Details: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
+
 Other hardware (other Raptor Lake / Alder Lake laptops): the user-space part is the same, but you need your own
 EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTALL.md](docs/INSTALL.md).
 NootedGreen currently hard-codes the 96 EU GPU topology (12 subslices × 8 EU, MCR steering to DSS0) for every
