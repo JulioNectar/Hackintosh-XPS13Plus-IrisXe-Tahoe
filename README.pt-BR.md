@@ -60,8 +60,9 @@ com o firmware SOF da Intel (baixado do sof-bin oficial na instalação, não ve
 os amplificadores RT1316, e o plug-in `XeSpeakers` publica a saída de som e o microfone ([docs/INSTALL.md](docs/INSTALL.md#internal-speakers-and-microphones)).
 
 **Outros notebooks** (Raptor Lake / Alder Lake): o NootedGreen descreve toda GPU que não é Tiger Lake como 96 EU
-(12 subslices × 8 EU). **Chips de 80 EU** (i5-1334U, i5-1340P, i5-12500H): adicione `ngreen-eu=80` aos boot-args
-(em teste, [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3), [#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)). Veja o [guia de instalação](docs/INSTALL.md).
+(12 subslices × 8 EU). **Chips de 80 EU** (i5-1334U, i5-1340P, i5-12500H): adicione **`ngreen-eu=80 ngreen-l3=6`** aos
+boot-args. Isso elimina os artefatos (confirmado por dois usuários, num i5-1340P e num i5-1334U, [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3)): esses chips têm
+6 bancos de L3, não 8. Veja o [guia de instalação](docs/INSTALL.md).
 
 ## Documentação
 

@@ -6,8 +6,11 @@
 Target: Dell XPS 13 Plus 9320, i7-1360P, Iris Xe 8086:A7A0, **macOS Tahoe 26.7.1 (25G241)**. Other Raptor Lake /
 Alder Lake laptops may work with their own EFI, but the patches were only tested here. NootedGreen describes
 every non-Tiger-Lake GPU as 96 EU (12 subslices × 8 EU, 8 L3 banks, MCR steering to DSS0). On an **80 EU part**
-(e.g. i5-1334U, i5-1340P, i5-12500H) add `ngreen-eu=80` to the boot-args (testing, issues [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3),
-[#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)); `ioreg -rc IntelAccelerator -d1 | grep xe-topo` then shows 20488 (80 EU, 8 L3 banks) instead of 24584.
+(e.g. i5-1334U, i5-1340P, i5-12500H) add **`ngreen-eu=80 ngreen-l3=6`** to the boot-args: it removes the rendering
+artifacts (confirmed on an i5-1340P and an i5-1334U, issue [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3)). `ioreg -rc IntelAccelerator -d1 | grep xe-topo`
+then shows 20486 (80 EU, 6 L3 banks) instead of 24584. To check another chip, read the fuses from a Linux live USB:
+`sseu_topology` (number of DSS × 16 = EU) and register `0x9118` (low 4 bits = L3 bank **pairs** fused off; banks =
+2 × (4 − number of set bits)), see [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3), [#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4).
 
 ## 0. What you need
 

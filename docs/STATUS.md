@@ -97,8 +97,8 @@ Not verified here: I only have the XPS 13 Plus 9320.
 - **ASUS VivoBook K3502ZA** (i5-12500H, Iris Xe 46A6, 80 EU): boot stall with the acceleration stack ([#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)).
 
 The 80 EU reports match a known limit: NootedGreen describes every non-Tiger-Lake GPU as 96 EU. Since 2026-10-24 the
-boot-arg `ngreen-eu=80` selects the 80 EU layout (5 DSS × 16 EU, from Linux data in #3); it is waiting for a test on an
-80 EU machine (see [INSTALL.md](INSTALL.md)). Issues and PRs from other machines are welcome.
+boot-args `ngreen-eu=80 ngreen-l3=6` describe these chips correctly (5 DSS × 16 EU, 6 L3 banks, from Linux fuse data in #3 and
+#4) and **remove the artifacts** (confirmed on an i5-1340P and an i5-1334U); see [INSTALL.md](INSTALL.md). Issues and PRs from other machines are welcome.
 
 ## iServices
 

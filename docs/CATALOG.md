@@ -966,7 +966,7 @@ This table lists every boot-arg the plugin parses. They are read with `checkKern
 | `-ngreennogpurec` | XE-GPUREC off | on | – | 1.5 |
 | `-ngreennogpurecex` | XE-GPUREC v2 part off (keeps v1) | on | – | 1.5 |
 | `-ngreennoblitfix` | XE-BLITFIX off | on | – | 1.5 |
-| `ngreen-eu=N`, `ngreen-l3=N` | XE-TOPO: GPU size (48/64/80/96 EU) and L3 bank count (even, 2–16) | 96, 8 | – | 1.5 |
+| `ngreen-eu=N`, `ngreen-l3=N` | XE-TOPO: GPU size (48/64/80/96 EU) and L3 bank count (even, 2–16). 80 EU parts: `ngreen-eu=80 ngreen-l3=6` | 96, 8 | – | 1.5 |
 | `-ngreenengineinert` | Do not start the engines; drop engine MMIO writes | off | – | 1.2 |
 | `-ngreennofwref`, `-ngreenfwhold` | Turn off forcewake ref-counting / never release forcewake at refcount 0 (hold) | ref on, hold off | – | 1.2 |
 | `-ngreennofwsubmit` | No forcewake around submit | on | – | 1.2 |
