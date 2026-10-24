@@ -20,6 +20,26 @@ static volatile uint32_t gXeResFreeFix = 0;  // XE-RESFREE: entradas inválidas 
 extern volatile uint32_t gXeOrphanMiss;  // XE-NOORPHAN (kern_green.cpp)
 extern bool gXeLockRouted;
 
+// ─── xe/topo4/5 (24/10): topologia escolhida por boot-arg, sem ler fusíveis ──────────────────────────────────────
+// topo/topo2/topo3 liam os fusíveis no boot e todos travaram o boot (23/10), mesmo calculando 96 EU aqui. Agora o
+// layout só muda com ngreen-eu=80 (ou 64/48) e, opcional, ngreen-l3=N. Sem os args: 12 SS × 8 EU, L3 8, como antes.
+// Dados de 80 EU (Linux, issue #3): i5-1340P = 5 DSS × 16 EU (máscara 0x1f, DSS0 presente) -> 10 SS × 8 EU.
+// O steering MCR continua no DSS0 (presente nos chips de 80 EU vistos). ioreg: xe-topo = eu<<8 | l3 (no acelerador).
+static uint32_t gTopoSs = 12, gTopoL3 = 8;
+static bool gTopoParsed = false;
+static void xeTopoArgs() {
+	if (gTopoParsed) return;
+	gTopoParsed = true;
+	uint32_t eu = 0, l3 = 0;
+	if (PE_parse_boot_argn("ngreen-eu", &eu, sizeof(eu)) && (eu == 48 || eu == 64 || eu == 80 || eu == 96)) gTopoSs = eu / 8;
+	if (PE_parse_boot_argn("ngreen-l3", &l3, sizeof(l3)) && l3 >= 2 && l3 <= 16 && !(l3 & 1)) gTopoL3 = l3;
+}
+static void *volatile gTopoAcc = nullptr;
+static void xeTopoPublish(thread_call_param_t, thread_call_param_t) {
+	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gTopoAcc));
+	if (svc) svc->setProperty("xe-topo", (gTopoSs * 8) << 8 | gTopoL3, 32);
+}
+
 // ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
 //trivial
 // ICL FB — com.apple (fallback path)
@@ -2098,7 +2118,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t f3b[] = {// jmp L3BankCount
 			0x74, 0x23, 0x83, 0xf9, 0x02, 0x0f, 0x85, 0x89, 0x01, 0x00, 0x00, 0x83, 0xfe, 0x01, 0x75, 0x59, 0x83, 0xfa, 0x0c, 0x75, 0x54, 0x41, 0xc7, 0x87, 0x64, 0x11, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
 		};
-		static const uint8_t r3b[] = {
+		static uint8_t r3b[] = {  // xe/topo4: byte 28 = L3 (ngreen-l3)
 			0x90, 0x90, 0x83, 0xf9, 0x02, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x83, 0xfe, 0x01, 0x90, 0x90, 0x83, 0xfa, 0x0c, 0x90, 0x90, 0x41, 0xc7, 0x87, 0x64, 0x11, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
 		};
 		
@@ -2122,7 +2142,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t f3bbb[] = {//NumSubSlices
 			0x8b, 0x5d, 0xd0, 0xf3, 0x0f, 0xb8, 0xf3, 0x01, 0xf6, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
-		static const uint8_t r3bbb[] = {
+		static uint8_t r3bbb[] = {  // xe/topo4: byte 4 = SS (ngreen-eu / 8)
 			0x8b, 0x5d, 0xd0, 0xbe, 0x0c, 0x00, 0x00, 0x00, 0x90, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
 		
@@ -2278,10 +2298,16 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			
 			if (!NGreen::callback->isRealTGL) {
 				// RPL-only: hardcode topology and bypass BCS readiness check
+				xeTopoArgs();
+				r3b[28] = (uint8_t)gTopoL3;
+				r3bbb[4] = (uint8_t)gTopoSs;
 				LookupPatchPlus const patchesRPL[] = {
-					{activeKext, f3b, r3b, arrsize(f3b),	1},      // L3BankCount=8
+					// xe/topo5: r3b/r3bbb are writable now; passed as const pointers so the (find, replace, size, count)
+					// constructor is used. As plain uint8_t[N] they matched the template (find[N], replace[N], count, skip),
+					// i.e. count=32 skip=1: the only match was skipped, the patch failed and PANIC_COND hung topo..topo4 at boot.
+					{activeKext, f3b, static_cast<const uint8_t *>(r3b), arrsize(f3b),	1},      // L3BankCount=8 (ngreen-l3)
 					{activeKext, f3bb, r3bb, arrsize(f3bb),	1},    // MaxEU/SS=8
-					{activeKext, f3bbb, r3bbb, arrsize(f3bbb),	1},// NumSubSlices=12
+					{activeKext, f3bbb, static_cast<const uint8_t *>(r3bbb), arrsize(f3bbb),	1},// NumSubSlices=12 (ngreen-eu)
 					{activeKext, f_devstart, m_devstart, r_devstart, rm_devstart, arrsize(f_devstart), 1}, // BCS bypass
 				};
 				PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesRPL, address, size), "ngreen",
@@ -6376,7 +6402,8 @@ void Gen11::getGPUInfo(void *that)
 	//   0x1150 = Frequency pair (low32=fMaxMHz, high32=fMinMHz)
 	//   0x1164 = L3BankCount
 	unsigned int numSlices        = 1;
-	unsigned int numSubSlices     = 12;  // 6 DSS × 2 = 12 traditional SS
+	xeTopoArgs();
+	unsigned int numSubSlices     = gTopoSs;  // 6 DSS × 2 = 12 traditional SS (xe/topo4: ngreen-eu / 8)
 	unsigned int maxEUPerSubSlice = 8;   // 16 EU/DSS ÷ 2 SS/DSS = 8 EU/SS
 	unsigned int totalEU          = maxEUPerSubSlice * numSubSlices; // = 96
 	
@@ -6386,13 +6413,20 @@ void Gen11::getGPUInfo(void *that)
 	getMember<UInt32>(that, 0x1124) = totalEU;
 	getMember<UInt32>(that, 0x0dd8) = numSlices;
 	getMember<UInt32>(that, 0x0ddc) = numSubSlices;
-	getMember<UInt32>(that, 0x1164) = 8;  // L3BankCount (confirmed from InsanelyMac TGL logs)
+	getMember<UInt32>(that, 0x1164) = gTopoL3;  // L3BankCount (8 confirmed from InsanelyMac TGL logs; xe/topo4: ngreen-l3)
 	
 	// Frequency: fMaxFrequencyInMhz=1000, fMinFrequencyInMhz=450 (TGL defaults)
 	getMember<uint64_t>(that, 0x1150) = 0x1C2000003E8ULL;
 	
-	SYSLOG("ngreen", "getGPUInfo: overridden topology → slices=%u subslices=%u maxEU/SS=%u totalEU=%u L3Banks=8",
-		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU);
+	SYSLOG("ngreen", "getGPUInfo: overridden topology → slices=%u subslices=%u maxEU/SS=%u totalEU=%u L3Banks=%u",
+		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU, gTopoL3);
+	IOLog("XeNG TOPO: subslices=%u eu/ss=%u eu=%u l3=%u%s\n", numSubSlices, maxEUPerSubSlice, totalEU, gTopoL3,
+	      (numSubSlices == 12 && gTopoL3 == 8) ? " (default)" : " (boot-arg)");
+	// published later from a thread_call, not from inside getGPUInfo
+	static thread_call_t tc = nullptr;
+	gTopoAcc = that;
+	if (!tc) tc = thread_call_allocate(xeTopoPublish, nullptr);
+	if (tc) thread_call_enter(tc);
 
 }
 

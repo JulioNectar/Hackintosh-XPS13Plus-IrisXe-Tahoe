@@ -59,10 +59,9 @@ A câmera (OV01A10 atrás do IPU6 da Intel) **não funciona** no macOS; o leitor
 com o firmware SOF da Intel (baixado do sof-bin oficial na instalação, não vem neste repositório), inicia o SoundWire e
 os amplificadores RT1316, e o plug-in `XeSpeakers` publica a saída de som e o microfone ([docs/INSTALL.md](docs/INSTALL.md#internal-speakers-and-microphones)).
 
-**Outros notebooks** (Raptor Lake / Alder Lake): por enquanto o NootedGreen fixa a topologia da GPU de 96 EU
-(12 subslices × 8 EU) para toda GPU que não é Tiger Lake, então os chips de 80 EU (i5-1334U, i5-1340P, i5-12500H)
-recebem uma topologia errada ([#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3),
-[#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)). Veja o [guia de instalação](docs/INSTALL.md).
+**Outros notebooks** (Raptor Lake / Alder Lake): o NootedGreen descreve toda GPU que não é Tiger Lake como 96 EU
+(12 subslices × 8 EU). **Chips de 80 EU** (i5-1334U, i5-1340P, i5-12500H): adicione `ngreen-eu=80` aos boot-args
+(em teste, [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3), [#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)). Veja o [guia de instalação](docs/INSTALL.md).
 
 ## Documentação
 

@@ -4,10 +4,10 @@
 > installing macOS, `zsh install.sh`. See the README. This guide is the manual procedure behind those scripts.
 
 Target: Dell XPS 13 Plus 9320, i7-1360P, Iris Xe 8086:A7A0, **macOS Tahoe 26.7.1 (25G241)**. Other Raptor Lake /
-Alder Lake laptops may work with their own EFI, but the patches were only tested here. NootedGreen currently hard-codes
-the 96 EU GPU topology (12 subslices × 8 EU, MCR steering to DSS0) for every non-Tiger-Lake GPU, so 80 EU parts
-(e.g. i5-1334U, i5-1340P, i5-12500H) get a wrong topology (issues [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3),
-[#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)); a fix that reads the fuses is being investigated.
+Alder Lake laptops may work with their own EFI, but the patches were only tested here. NootedGreen describes
+every non-Tiger-Lake GPU as 96 EU (12 subslices × 8 EU, 8 L3 banks, MCR steering to DSS0). On an **80 EU part**
+(e.g. i5-1334U, i5-1340P, i5-12500H) add `ngreen-eu=80` to the boot-args (testing, issues [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3),
+[#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)); `ioreg -rc IntelAccelerator -d1 | grep xe-topo` then shows 20488 (80 EU, 8 L3 banks) instead of 24584.
 
 ## 0. What you need
 

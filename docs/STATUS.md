@@ -95,8 +95,9 @@ Not verified here: I only have the XPS 13 Plus 9320.
 - **i5-1334U / i5-1340P** (80 EU): rendering artifacts ([#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3)).
 - **ASUS VivoBook K3502ZA** (i5-12500H, Iris Xe 46A6, 80 EU): boot stall with the acceleration stack ([#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)).
 
-The 80 EU reports match a known limit: NootedGreen hard-codes the 96 EU topology for every non-Tiger-Lake GPU (see
-[INSTALL.md](INSTALL.md)). Issues and PRs from other machines are welcome.
+The 80 EU reports match a known limit: NootedGreen describes every non-Tiger-Lake GPU as 96 EU. Since 2026-10-24 the
+boot-arg `ngreen-eu=80` selects the 80 EU layout (5 DSS × 16 EU, from Linux data in #3); it is waiting for a test on an
+80 EU machine (see [INSTALL.md](INSTALL.md)). Issues and PRs from other machines are welcome.
 
 ## iServices
 

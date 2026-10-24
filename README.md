@@ -119,11 +119,9 @@ Copy the freshly built `build/NootedGreen.kext` to `EFI/OC/Kexts/`, approve the 
 
 Other hardware (other Raptor Lake / Alder Lake laptops): the user-space part is the same, but you need your own
 EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTALL.md](docs/INSTALL.md).
-NootedGreen currently hard-codes the 96 EU GPU topology (12 subslices × 8 EU, MCR steering to DSS0) for every
-non-Tiger-Lake GPU, so 80 EU parts (e.g. i5-1334U, i5-1340P, i5-12500H) get a wrong topology
-([#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3),
-[#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)); a fix that reads the fuses is being
-investigated.
+NootedGreen describes every non-Tiger-Lake GPU as 96 EU (12 subslices × 8 EU, 8 L3 banks) unless told otherwise.
+**80 EU parts** (e.g. i5-1334U, i5-1340P, i5-12500H): add `ngreen-eu=80` to the boot-args (testing, see
+[#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3), [#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)).
 
 ## Credits
 
