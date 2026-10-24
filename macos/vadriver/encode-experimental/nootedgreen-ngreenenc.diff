@@ -1,0 +1,26 @@
+--- a/src/NootedGreen/kern_gen11.cpp	2026-10-24 01:32:35
++++ b/src/NootedGreen/kern_gen11.cpp	2026-10-24 02:54:25
+@@ -5431,6 +5431,23 @@
+ 		// falha com -12906. Com o plugin VA corrigido (macos/vadriver), a decodificação HEVC sai idêntica à de software.
+ 		service->setProperty("IOGVAHEVCDecode", "2");
+ 		SYSLOG("ngreen", "XE-GVAHEVC: IOGVAHEVCDecode = \"2\"");
++		// xe/h264enc (24/10): hardware H.264 encode (VDENC, low-latency sessions only) works with the patched VA plugin
++		// (macos/vadriver patches 9-15). AppleGVA offers it only if the accelerator has IOGVAH264EncodeCapabilities (the
++		// ICL kext's Info.plist has it, the TGL personality does not). Opt-in: -ngreenenc. Ordinary (non-low-latency)
++		// sessions still fail inside AppleGVA and VideoToolbox falls back to the software encoder.
++		if (checkKernelArgument("-ngreenenc")) {
++			auto *caps = OSDictionary::withCapacity(2);
++			auto *q = OSNumber::withNumber(50ULL, 32), *r = OSNumber::withNumber(400ULL, 32);
++			if (caps && q && r) {
++				caps->setObject("VTQualityRating", q);
++				caps->setObject("VTRating", r);
++				service->setProperty("IOGVAH264EncodeCapabilities", caps);
++			}
++			if (q) q->release();
++			if (r) r->release();
++			if (caps) caps->release();
++			IOLog("XeNG H264ENC: IOGVAH264EncodeCapabilities published\n");
++		}
+ 	}
+ 	} else {
+ 		SYSLOG("ngreen", "V52: Real TGL — skipping MultiForceWakeSelect override");
