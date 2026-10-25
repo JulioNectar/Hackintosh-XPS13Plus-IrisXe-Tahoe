@@ -84,7 +84,7 @@ FS=$(diskutil info "$(df -P "$ROOT" | awk 'NR==2{print $1}')" 2>/dev/null | awk 
 [[ $FS == (apfs|hfs) ]] && ok "repository on an $FS volume" \
   || fail "the repository is on a '$FS' volume: clone it to an APFS disk (e.g. your home folder) and run it from there"
 if [[ $(ioreg -r -c IOPCIDevice -n IGPU -d 1 2>/dev/null) == *'"device-id" = <499a0000>'* ]]; then ok "GPU presented as Tiger Lake (device-id 9A49)"
-else warn "IGPU device-id is not 9A49: is this Mac booting through the repository's EFI?"; fi
+else warn "IGPU device-id is not 9A49: is this Mac booting through the repository's EFI? Without the spoof the framebuffer kext is left out of the Auxiliary Kernel Collection (black screen); boot the spoofed EFI and run this again"; fi
 if (( NG_LOADED )); then ok "NootedGreen loaded"
 else warn "NootedGreen is not loaded (fine for a first install; the EFI must load it for acceleration)"; fi
 
