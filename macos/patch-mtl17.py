@@ -21,7 +21,7 @@ What the byte patches do (offsets are file offsets in the x86_64 binary):
   - 0x018c28: `mov ecx,[rax+0x18]` -> `xor ecx,ecx` (v15)
   - 0x01c7c0 / 0x01c7cf: two `setne` -> NOP (v13)
   - 0x049cfe: `setne al` -> NOP (v14)
-  - 0x065f12 / 0x07ff77 / 0x080253: L3 allocation dword 0x20000088 -> 0x200000d0 (v11)
+  - 0x065f12: L3 allocation dword 0x20000088 -> 0x200000d0 (v11; the 0x07ff77 / 0x080253 copies were restored in MTL18)
   - 0x067c27: `je +0x5c` -> NOP (v16, fast clear off)
   - 0x067c5c: `jne` -> `jmp` (v17, clear always disables the VS stage)
   - 0x07ed87: `jne` -> NOP in -[MTLIGAccelCommandBuffer dealloc] (v18, #12): the per-buffer POSH block

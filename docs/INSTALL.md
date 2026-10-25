@@ -108,6 +108,12 @@ Fixes land in the repository as they are confirmed (see [CHANGELOG.md](../CHANGE
    ```
    This replaces the user-space files in `/Library/GPUBundles` and `/Library/Extensions` (they take effect for apps
    started afterwards, and for WindowServer after the reboot).
+   If you update by hand instead, rebuild the Metal bundle with `zsh macos/build-all.sh <sle/>` (it builds libxedrv
+   and runs `patch-mtl17.py`) and reinstall it with `sudo zsh macos/install-macos.sh <sle/> <le/>` (step 5). A
+   `git pull` alone changes nothing on the system: the WindowServer memory leak fix (Metal bundle v18,
+   [#12](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/12)) and the invisible Dock badge
+   digits fix (libxedrv v19, [#10](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/10)) only
+   apply after this rebuild and reinstall, and WindowServer picks them up after a reboot.
 3. Copy the new `build/NootedGreen.kext` over `EFI/OC/Kexts/NootedGreen.kext` on the EFI you boot from. Only
    compare `config.plist` with the repository's if the CHANGELOG entry says boot-args or kexts changed; keep your
    own serials. Do not run `make-efi.sh` again: it generates new SMBIOS serials (iCloud/iMessage sign-out).
@@ -228,6 +234,27 @@ appears in the menu bar like on a Mac (HeliPort is not needed; remove its login 
   breaks AirportItlwm.
 - Not available with this driver: AirDrop/AWDL, WPA3-only networks.
 
+## Hardware video decode (optional)
+
+H.264 and HEVC decode on the GPU for VideoToolbox clients (QuickTime, Photos, video editors). It needs the boot-arg
+**`-ngreengva`** and the patched VA plugin, which is not part of `install.sh` and is installed by hand:
+
+```sh
+zsh macos/vadriver/build-vadriver.sh ~/NootedGreen/sle_Internal/sle      # -> macos/out/AppleIntelTGLGraphicsVADriver.bundle (no sudo)
+sudo rm -rf /Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle
+sudo ditto macos/out/AppleIntelTGLGraphicsVADriver.bundle /Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle
+killall VTDecoderXPCService     # apps that already opened a decoder need a restart
+```
+
+(With `install.sh` the `sle/` folder is `build/deps/NootedGreen/sle_Internal/sle`.) Add `-ngreengva` to the boot-args
+and reboot. Without the boot-arg the plugin is not used and decode stays in software.
+
+- **FairPlay does not play with `-ngreengva`**: Apple Music (and probably Apple TV+) fails, the VA plugin logs "ME not
+  loaded" ([#11](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/11)). Remove the boot-arg if
+  you need that content.
+- Safari still decodes on the CPU: its WebKit GPU process may not load plugins from `/Library/GPUBundles`.
+- Undo: remove `-ngreengva` and delete `/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle`.
+
 ## Sleep, lid and display sleep
 
 This laptop has no working system sleep on macOS (Modern Standby firmware, `_S3` hidden, eDP cannot be retrained by
@@ -242,6 +269,10 @@ The machine stays awake (a few watts) with the lid closed: shut it down for long
 `sudo pmset -b lowpowermode 1` on battery. Undo: `sudo zsh tools/sleep/90-pmset-revert.sh` and
 `zsh tools/sleep/install-xe-lid.sh --remove`. On boots where the EC does not report the lid (see STATUS), turn the display
 off by hand.
+
+Keep the default display sleep (NootedGreen XE-FBDPMS, backlight off only): with `-ngreenfbdpms` the panel is really
+powered down and does not come back on wake (eDP link not retrained). Experimental S0 deep idle work is described in
+[STATUS.md](STATUS.md); it is paused and not part of this install.
 
 ## Touchpad vibration
 

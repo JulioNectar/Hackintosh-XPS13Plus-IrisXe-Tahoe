@@ -52,12 +52,12 @@ entry. Details: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
 | Brightness | ✅ `tools/xe-brilho` (the macOS slider now covers the full panel range with `ngreenblmax=17777`) · ⚠️ the sun keys depend on a Dell firmware state that changes from boot to boot; F6/F7 always work through `xe-brilho daemon` |
 | Shutdown / restart | ✅ fast (XE-IDLEBOUND; used to stall ~3 min and panic) |
 | Boot screen | ✅ sharp Apple logo from the first frame, no garbage flash (OpenCore `Resolution=Max` + `gfxrst=1` + XE-BOOTHOLD) |
-| Internal speakers | ✅ our own `AudShim` kext runs Intel's SOF firmware on the audio DSP, SoundWire and both RT1316 amplifiers; `XeSpeakers` makes them a normal macOS output (volume, mute). Capped at −6 dB, no speaker protection · ✅ internal microphones (RT714) as **"Microfone interno"** |
+| Internal speakers | ✅ our own `AudShim` kext runs Intel's SOF firmware on the audio DSP, SoundWire and both RT1316 amplifiers; `XeSpeakers` makes them a normal macOS output (volume, mute). Capped at −3 dB (AudShim 0.9.1), no speaker protection · ✅ internal microphones (RT714) as **"Microfone interno"** |
 | Wi-Fi, Bluetooth | ✅ native Wi-Fi menu via AirportItlwm-Tahoe (no HeliPort) · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
 | Touchpad haptics | ✅ click-vibration strength with `tools/xe-haptic` / the `xe-hapticbar` menu-bar slider · ❌ no on-demand pulse (Force Touch feedback) |
 | Fingerprint reader | ✅ for `sudo` (Goodix 27C6:63BC via libfprint, PAM module in `sudo_local`; `tools/fingerprint`) · ❌ login, screen unlock and Touch ID prompts (no Secure Enclave) |
 | Power button | ✅ a short press locks the screen (`tools/xe-pblock`) |
-| Sleep | ❌ no system sleep (Modern Standby only firmware); ✅ display sleep, and lid close turns the display off (`tools/sleep`) |
+| Sleep | ❌ no system sleep in the default install (Modern Standby only firmware; experimental S0 deep idle enters and wakes by RTC alarm, but lid/power button do not wake it and the panel stays black on wake, so it is paused and not shipped, see [STATUS](docs/STATUS.md)); ✅ display sleep (backlight off; with `-ngreenfbdpms` the panel does not come back), and lid close turns the display off (`tools/sleep`) |
 
 Everything else about the laptop (NVMe, battery, USB) is a regular OpenCore setup. The camera (OV01A10 behind Intel's
 IPU6) does **not** work on macOS; the fingerprint reader works for `sudo` only. **Internal speakers** work since

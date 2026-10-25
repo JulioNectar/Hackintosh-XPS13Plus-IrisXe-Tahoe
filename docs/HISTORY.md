@@ -10,7 +10,9 @@ abandoned approach is collected in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 The work was done by the owner of the laptop ("the user") pair-programming with Claude (Anthropic) ("the assistant"),
 over about a week in October 2026. From 21 Oct the work widened from graphics to the rest of the laptop (Wi-Fi,
-boot screen, sleep, touchpad haptics and, from 21–22 Oct, the internal speakers: Phases 22–25).
+boot screen, sleep, touchpad haptics and, from 21–22 Oct, the internal speakers: Phases 22–25). From 22 Oct, issue
+reports from other machines drove most of the work: GPU hang recovery, image corruption, 80 EU parts, a Metal leak
+(Phases 26–31).
 
 ## Conventions
 
@@ -23,7 +25,8 @@ boot screen, sleep, touchpad haptics and, from 21–22 Oct, the internal speaker
   `IOAcceleratorFamily2` (25G241). Kernel patches are applied by pattern search, so the offsets are informational.
 - **Names.** Kernel patches written for this project are tagged `XE-*` (or `xe/*` in the source) and most are enabled
   by `-ngreenxefix`. Patches inherited from the NootedGreen lineage are `V1…V509`. Metal driver builds are `v1…v12`,
-  then `MTL13…MTL18`. The user-space adapter is `libxedrv` (v7…v17). The audio kext `AudShim` was built in milestones
+  then `MTL13…MTL18`; the 25 Oct leak fix is "MTL17 patch v18" (the name `patch-mtl17.py` uses), a different change from
+MTL18. The user-space adapter is `libxedrv` (v7…v19). The audio kext `AudShim` was built in milestones
   `M1…M6` (versions 0.1.0…0.8.0).
 - **Uncertain points** are marked *(uncertain)*. Hypotheses that were later disproved are labelled as such.
 - Development-tree paths (`build/…`, `nooted/tahoe/…`) are from the working tree the repository was later cut from.
@@ -64,13 +67,19 @@ boot screen, sleep, touchpad haptics and, from 21–22 Oct, the internal speaker
 | 16 | 19 Oct 21:20 → 23:30 | c01dbead hangs, brightness, depth resolve | XE-NODEPTH: stable desktop, work moves onto Tahoe itself |
 | 17 | 19 Oct 23:20 → 20 Oct 14:30 | Living on Tahoe; clean reinstall | GPU frequency fixed; Tahoe on the internal SSD |
 | 18 | 20 Oct 14:30 → 17:30 | Clean-install regressions; repository | PLANES2, NOGVA, libxedrv v15 icons fix, reproducible build |
-| 19 | 20 Oct, after the repository | Audit and new problems | MTL v11 byte bug → MTL18 (in test); display sleep; colour-profile panics |
+| 19 | 20 Oct, after the repository | Audit and new problems | MTL v11 byte bug → MTL18; display sleep; colour-profile panics |
 | 20 | 20 Oct evening → 21 Oct | Hardware video decode | H.264 decodes on VDBOX, bit-exact; HEVC plugin fixed |
 | 21 | 21 Oct | Stability, touch and E-cores | Fast shutdown, 16 threads, touchscreen gestures |
 | 22 | 21 Oct | Chrome blits, lock-screen clock, `w30r` | libxedrv v16 (blit ordering) and v17 (Stencil8 alignment); XR formats are Apple-silicon-only |
 | 23 | 21 Oct afternoon | Boot screen and boot speed | `Resolution=Max` + `gfxrst=1` + XE-BOOTHOLD: clean boot, no 20 s stall |
 | 24 | 21–22 Oct | Wi-Fi, haptics, sleep, power, side investigations | Native Wi-Fi; vibration strength; no system sleep, lid → display off |
 | 25 | 21–22 Oct | Internal speakers (AudShim M1 → M6) | SOF firmware, SoundWire and RT1316 from our own kext; speakers are a macOS output device |
+| 26 | 22–24 Oct | GPU idle power and hang recovery | XE-RC6FW (RC6 again); XE-GPUREC v1 → v2: a GPU hang no longer freezes the screen |
+| 27 | 23 Oct | Green/black images, black login wallpaper | XE-BLITFIX (#6); libxedrv v18 (wide-pitch IOSurfaces) |
+| 28 | 23–24 Oct | 80 EU parts | XE-TOPO; `ngreen-eu=80 ngreen-l3=6` removes the artifacts (#3) |
+| 29 | 24 Oct | H.264 hardware encode | first GPU-encoded frames (VDENC, low latency); research paused, nothing installed |
+| 30 | 25 Oct | Metal leak and Dock badges | MTL17 patch v18 frees the per-command-buffer POSH block (#12); libxedrv v19 mip levels (#10) |
+| 31 | 24–25 Oct | System sleep experiments | S0 deep idle entered and RTC wake works; lid/button wake and panel relight do not; paused |
 
 ---
 
@@ -1014,8 +1023,8 @@ what it claimed:
   MTL12–MTL17. What the two fields control was not established.
 
 **MTL18** = MTL17 with those two bytes restored to `0x88` (only the real L3 immediate keeps `0xd0`). The repository's
-`macos/mtl17-patches.json` now excludes the two corrupting entries, so `patch-mtl17.py` produces MTL18. **MTL18 is being
-tested**; whether it changes any of the open problems is not known yet.
+`macos/mtl17-patches.json` now excludes the two corrupting entries, so `patch-mtl17.py` produces MTL18. Every bundle
+built since then is MTL18 (from 25 Oct plus the leak fix, Phase 30); no effect on the open problems was isolated.
 
 ### 19.2 Display does not wake after display sleep
 
@@ -1209,6 +1218,93 @@ switches to bisect them later; it never needed bisecting.
 neither. `audctl gen-header` turns them into `AudShimData.h` (firmware payload, IPC messages, SoundWire parameters, the
 RT1316 init table), which the kext compiles in.
 
+---
+
+## Phase 26 — GPU idle power and hang recovery (22–24 Oct)
+
+- **XE-RC6FW (22 Oct).** The GPU no longer reached RC6 when idle (RC6 0 %, GT ~5 W): an unbalanced `SafeForceWake`
+  kept forcewake held forever. The route keeps Apple's algorithm with the count clamped at 0 and releases a held
+  context after 500 ms of idle engines (`ngreenfwidle`). Measured RC6 87.5 %, GT 1.4 W.
+- **XE-GPUREC v1 (22 Oct).** Any hang on the render or compute engine (often Photos' `mediaanalysisd`) ended in a
+  restart loop and a WindowServer watchdog panic. RCS and CCS share the render reset domain (GDRST bit 1), but Apple's
+  `resetGraphicsEngine` restores and replays only the engine that hung, so the other came back with execlists off. v1
+  restores the sibling's registers and replays its scheduler reset too. Three hangs on 23 Oct were reset without a
+  restart, but the screen still froze.
+- **XE-GPUREC v2 (23 Oct).** The render-domain reset also clears `RCU_MODE` (0x14800) bit 0, the CCS enable, which only
+  `initModeRegisters` writes at boot/wake; WindowServer's compute channels then never completed. v2 re-enables the
+  compute engine (RCU_MODE, CCS `FORCE_TO_NONPRIV0`, `0xce90`, CCS IMR/HWSTAM) right after the reset, before Apple's
+  replay. **Confirmed 24 Oct**: three real render-engine hangs (media kernels during the encode experiments, Phase 29)
+  were recovered with the screen still running (`xe-rec-exfix` 3, `xe-rec-rcu` 1). Off: `-ngreennogpurecex` (v2 part),
+  `-ngreennogpurec` (all).
+
+---
+
+## Phase 27 — Green/black images and the black login wallpaper (23 Oct)
+
+- **XE-BLITFIX ([#6](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/6)).** Apple Music artwork
+  and some images (a 642-px JPEG in WhatsApp) came out green (YUV) or black (RGB). IOSurface copies between memory and
+  the GPU's tiled copy with a row pitch that is not a multiple of 64 bytes and larger than 128 KB still went to the
+  Blit3D path, which does nothing on this GPU, so the GPU read zeros (XE-BLITALIGN v2 only caught misaligned
+  addresses). They now use XY_SRC_COPY_BLT on the copy engine; 64-aligned copies are unchanged. Off: `-ngreennoblitfix`.
+- **libxedrv v18.** With an Aerial wallpaper the login screen was black. macOS renders it as a half-float frame ≥4096 px
+  wide, ≥32768 bytes per row, and the kernel's 2D blit only takes linear pitches up to 0x7ffe; wider ones fell to the
+  same broken 3D blit. v18 aliases such IOSurface planes as linear textures over the surface's own memory, so no kernel
+  copy happens ([METAL.md](METAL.md) §3 item 8). Off: `XE_NOWIDEPITCH=1`.
+
+---
+
+## Phase 28 — 80 EU parts: XE-TOPO (23–24 Oct)
+
+Users with 80 EU chips (i5-1340P, i5-1334U) saw rendering artifacts
+([#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3),
+[#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)): NootedGreen hard-codes the 96 EU
+topology (12 subslices × 8 EU, 8 L3 banks). The first builds read the fuses and hung the boot; the cause was a
+patch-table bug (writable replace arrays picked the wrong `LookupPatchPlus` constructor, the patch failed and
+`PANIC_COND` stopped the boot), not the fuse reads. **XE-TOPO** takes the topology from boot-args instead:
+`ngreen-eu=80` (or 64/48) and optional `ngreen-l3=N`; without them nothing changes. With `ngreen-l3` left at 8 the
+artifacts stayed; **`ngreen-eu=80 ngreen-l3=6`** (6 L3 banks, read from fuse register `0x9118` on the affected
+machines) removed them, confirmed by two users on 24 Oct.
+
+---
+
+## Phase 29 — H.264 hardware encode research (24 Oct, paused)
+
+The encode path of the same VA plugin was brought up as far as the first GPU-encoded frames (VDENC, low-latency
+sessions: 720p, 60/60 frames, 52.8 dB, no hang). Found and fixed on the way: the FrameChecksum and WeightEstimate EU
+kernels that hang the render engine (capabilities hidden), the Gen9/11 VCS status registers, and the VDENC surface
+format. It is **not installed**: the VPHAL patches it needs also enable GPU pixel transfers for every app, which break
+1080p transfers elsewhere, and P frames still hang the video engine. Patches and notes:
+[macos/vadriver/encode-experimental](../macos/vadriver/encode-experimental/README.md).
+
+---
+
+## Phase 30 — Metal leak and Dock badges (25 Oct)
+
+- **MTL17 patch v18 ([#12](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/12)).** A user found
+  WindowServer growing by gigabytes: `-[MTLIGAccelCommandBuffer dealloc]` never freed the 96 KB POSH block of a command
+  buffer that was the queue's only active buffer, the usual case. The `jne` at `0x07ed87` is NOPed; the queue's shared
+  POSH pointer is never set, so every buffer owns its block. A test program creating 3000 command buffers leaves 0
+  blocks (before: one per buffer).
+- **libxedrv v19 ([#10](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/10)).** Dock badge
+  numbers were invisible. For trilinear-filtered layers Core Animation creates the zero-copy texture with a full mip
+  chain (`newTiledTextureWithBytesNoCopy`, 108×108 → 7 levels); the driver never fills levels 1+. v19 makes its own
+  copy with level 0 uploaded and the other levels generated. Reproduced in-process with `CARenderer`. Off:
+  `XE_MIP_NATIVO=1`.
+
+---
+
+## Phase 31 — System sleep experiments (24–25 Oct, paused)
+
+- **S0 deep idle.** An SSDT enabling S0 deep idle (`\_SB.LPS0=1`, `\_GPE.LXEN=1`) made macOS report
+  `IOPMDeepIdleSupported=Yes`. The first sleep panicked on entry: `AppleIntelBaseController::hwSaveNVRAM` calls a vtable
+  slot that is reserved on Tahoe. A NootedGreen route that skips `hwSaveNVRAM` removed the panic, and the machine
+  entered S0 deep idle.
+- **Wake.** An RTC alarm wakes it (25 Oct). The lid and the power button do not.
+- **Display after wake.** The eDP panel is not relit: the link does not retrain, the screen stays black and
+  WindowServer's watchdog panics after ~120 s. The retraining investigation found that a NootedGreen platform flag
+  limits the eDP link rate to HBR (the panel and UEFI use HBR3×4), and that Apple's PHY drive levels differ from the
+  ones UEFI programs. Paused; nothing of it is shipped. The default stays no system sleep plus `xe-lid` (Phase 24).
+
 ## Version index
 
 ### Metal driver (`AppleIntelTGLGraphicsMTLDriver.bundle`)
@@ -1233,7 +1329,8 @@ RT1316 init table), which the kext compiles in.
 | MTL15 | 13:19 | IOSurface compression flag zeroed (0x18c28) | first desktop login; not causal |
 | MTL16 | 13:42 | `programClearPipeline` always emits disabled VS (0x67c27) | RCS hangs gone; empty windows |
 | MTL17 | 13:53 | VS marked dirty after a clear (0x67c5c `jne`→`jmp`) | windows with content; release build 20 Oct |
-| MTL18 | 20 Oct | MTL17 with 0x7ff77 and 0x80253 restored to `0x88` | in test |
+| MTL18 | 20 Oct | MTL17 with 0x7ff77 and 0x80253 restored to `0x88` | built by `patch-mtl17.py` since 20 Oct; no effect isolated |
+| MTL17 patch v18 | 25 Oct | MTL18 + 0x7ed87 `jne` → NOP in `-[MTLIGAccelCommandBuffer dealloc]` | frees the 96 KB POSH block per command buffer (#12); current |
 
 ### libxedrv
 
@@ -1247,7 +1344,9 @@ RT1316 init table), which the kext compiles in.
 | v14 | 20 Oct 16:25 | pipeline-creation logging |
 | v15 | 20 Oct 16:37 | **NOCOPY**: copy textures whose zero-copy offset is not 256-byte aligned (`XE_NOCOPY_ZERO=1` disables) |
 | v16 | 21 Oct | buffer fills and aligned buffer copies moved off the driver's 2D blit path (not ordered against later 3D work in the same command buffer): the Chrome fix (`XE_FILL_NATIVO=1`, `XE_COPIA_NATIVA=1` disable) |
-| v17 | 21 Oct | private render-target Stencil8 textures re-created 64 KB-aligned: the lock-screen clock fix (`XE_STENCIL_NATIVO=1` disables) — current |
+| v17 | 21 Oct | private render-target Stencil8 textures re-created 64 KB-aligned: the lock-screen clock fix (`XE_STENCIL_NATIVO=1` disables) |
+| v18 | 23 Oct | IOSurface planes with ≥32768 bytes per row aliased as linear textures: the black login wallpaper fix (`XE_NOWIDEPITCH=1` disables) |
+| v19 | 25 Oct | mip levels generated for zero-copy textures with `mipmapLevelCount > 1`: the Dock badge fix, #10 (`XE_MIP_NATIVO=1` disables) — current |
 
 There were no libxedrv v10/v11 (MTL v10/v11 bundle v9).
 
@@ -1265,7 +1364,8 @@ V99 off, POOL, POOLALIGN, FLIPDIAG, SCHEDDIAG, `ngreenV142=3`, V193 off, BLITDIA
 EVALDIAG, FWREF, FWHOLD, FWSUBMIT, ELSQ, V509 logs, POSH, ELSQWAIT, NOPOSH, ELSQDELAY, ELSQIDLE (IDLW), ELSQRETRY,
 NOPREEMPT, POSHCTX, IDLEANY, NOAUX, NOTCF, NOTCF2, BLIT16, BLITSCRATCH, LOGQUIET, BLITSCRATCH2, PLANES, QUIETLOG,
 CSBGUARD, CSBGUARD2, NOPAGE, PAGEONGUARD, RPCS, SAMETAIL, POOL2, BLR, NODEPTH, RESFREE, GTFREQ, NOORPHAN, PLANES2,
-NOGVA, FBDPMS, BLITALIGN (v1, v2), PAGESYNC, GVAID, GVAHEVC, IDLEBOUND, RCPOLICY, csbresync, BOOTDIAG, BOOTHOLD (v1–v4).
+NOGVA, FBDPMS, BLITALIGN (v1, v2), PAGESYNC, GVAID, GVAHEVC, IDLEBOUND, RCPOLICY, csbresync, BOOTDIAG, BOOTHOLD (v1–v4),
+RC6FW, GPUREC (v1, v2), BLITFIX, TOPO.
 Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2 and [KERNEL-PATCHES.md](KERNEL-PATCHES.md).
 
 ### Audio (`tools/AudShim`, `tools/audctl`, `tools/XeSpeakers`)
@@ -1329,18 +1429,21 @@ Their current defaults are in [CATALOG.md](CATALOG.md) §1 and §3.2 and [KERNEL
 
 ## Open items
 
-- System Settings › Displays and colour-profile changes panic in GPU memory management; some mode switches go black
-  until reboot (use `xe-res`).
+- System Settings › Displays and colour-profile changes: fixed in practice (no panics since 21 Oct, re-tested 22 Oct),
+  root cause never isolated; some mode switches go black until reboot (use `xe-res`).
 - "corrupt list" panic at shutdown (`IOAccelSysMemory::free → IOAccelOrphanedMemoryPool::addMemory`), rare.
-- Occasional WindowServer hang before login / on UI-scale changes (csbresync in testing); the c01dbead Blit3D hang was
-  never root-caused.
+- The c01dbead Blit3D hang was never root-caused (reported on another machine when opening System Settings › Displays,
+  Trackpad or Photo Booth); since XE-GPUREC v2 a GPU hang is recovered instead of freezing the screen.
 - Video: Safari cannot load the VA plugin (WebKit GPU-process sandbox) and decodes on the CPU; the root patch that would
-  fix it is prepared but not applied. Hardware encode untested.
+  fix it is prepared but not applied. `-ngreengva` breaks FairPlay (Apple Music). Hardware encode: research paused
+  (Phase 29).
 - Brightness keys and lid events: on some boots the EC/Dell SMM does not report the sun keys or the lid (firmware state);
   `xe-brilho daemon` covers F6/F7, nothing covers the lid on those boots.
-- No system sleep (Modern Standby firmware, eDP retraining); hibernation-only is the untested next experiment.
-- Audio: no speaker protection (−6 dB cap instead); the DSP stays powered while a device is open; power cost not measured.
+- No system sleep: S0 deep idle can be entered, but lid/power-button wake and relighting the panel (eDP retraining) do
+  not work (Phase 31, paused); hibernation-only and an injected `_S3` remain untried.
+- Audio: no speaker protection (gain cap −3 dB since AudShim 0.9.1 instead); the DSP stays powered while a device is
+  open; power cost not measured.
 - 6.5 s accelerator stamp-3 wait at every boot (shortcut built, not tested); SMCProcessor does not attach (Lilu does not
   know CPU model 0xBA).
-- Camera (OV01A10 + Intel VSC + IPU6) and fingerprint reader not started; `w30r`/BGR10_XR stays Apple-silicon-only.
-- MTL18 verification; a fixed GPU frequency floor (1500 MHz request) instead of a real governor.
+- Camera (OV01A10 + Intel VSC + IPU6) not started; `w30r`/BGR10_XR stays Apple-silicon-only.
+- A fixed GPU frequency floor (1500 MHz request) instead of a real governor.

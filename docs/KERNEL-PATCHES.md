@@ -22,8 +22,9 @@ line short.
 **More detail.** This page lists the patches that matter for a working system. The full list — every `XE-*` patch
 including diagnostics and opt-in experiments, the upstream V-numbered patches, byte patterns and all boot-args — is in
 [CATALOG.md](CATALOG.md). **Version history:** the order in which these patches were found, with the evidence for each,
-is in [HISTORY.md](HISTORY.md) (phases 1–2 display, 9–16 scheduler/memory, 17–18 power and video), and the patches that
-were tried and dropped are in [EXPERIMENTS.md](EXPERIMENTS.md).
+is in [HISTORY.md](HISTORY.md) (phases 1–2 display, 9–16 scheduler/memory, 17–18 power and video, 26–28 hang
+recovery, image corruption and topology), and the patches that were tried and dropped are in
+[EXPERIMENTS.md](EXPERIMENTS.md).
 
 ## Display (display engine 13)
 
@@ -49,6 +50,8 @@ The GuC firmware is disabled (`-disablegfxfirmware`), so the driver runs its hos
 | ELSQ idle wait | submissions while the ELSP was busy | wait up to 5 ms for idle | `-ngreennoelsqidle` |
 | XE-NOPOSH | RPL has no POSH pipe | clear the POSH bit in `MI_BATCH_BUFFER_START` | opt-in `-ngreennoposh` |
 | QUIET LOG | log flood and a Lilu log deadlock in interrupt context | events only with `-ngreenevlog` | — |
+| **XE-GPUREC** (v1) | a hang on the render or compute engine ended in a restart loop and a WindowServer watchdog panic: RCS and CCS share the render reset domain (GDRST bit 1), but Apple's `resetGraphicsEngine` restores and replays only the engine that hung, so the other came back with execlists off | route `resetGraphicsEngine`: snapshot both engines' register lists, restore the sibling's after Apple's reset and replay its scheduler reset too; byte signatures checked first; counters `xe-rec-*` | `-ngreennogpurec` |
+| **XE-GPUREC v2** | after v1 the screen still froze: the render-domain reset also clears `RCU_MODE` (0x14800) bit 0, the CCS enable, which Apple writes only at boot/wake, so WindowServer's compute channels never completed | route `processGPUReset`: re-enable the compute engine (`RCU_MODE`, CCS `FORCE_TO_NONPRIV0`, `0xce90`, CCS IMR/HWSTAM) right after the reset, before Apple's replay. Confirmed 2026-10-24 (three real hangs, screen kept running); ioreg `xe-rec-exfix`, `xe-rec-rcu` | `-ngreennogpurecex` (v2 only) |
 
 ## Memory and resources
 
@@ -81,10 +84,18 @@ Gen12 render compression needs the AUX translation table, which the TGL driver d
 | **VADIAG** | hardware decode returned empty frames and the cause was hidden in the kext | log-only hook on `IGAccelVideoContext::bind_resource`: logs the first 48 failures with the reason (lookup, bindResource/prepare, `get_tex_data` pitch 0). It found the sideband payload-header bug fixed in `macos/vadriver/patch_payloadhdr.py` | `-ngreennovadiag` |
 | **gvaboard** | NootedGreen inherited NootedRed's iMacPro1,1 `hwgva-id` for AppleGVA; on that board-id AppleGVA only accepts AMD plugins | `hwgva-id` = the real board-id (Mac-5F9802EFE386AA28, MacBookPro16,2) | — |
 | **XE-BLITALIGN** | IOSurface planes whose offset is not a multiple of 64 (CoreVideo's 420v uses 32 / 2073632) read as zeros and lost writes: the copy between the IOSurface and the driver's device cache was routed to the 3D blit, which does not work here | `blit2d_common_supported`: address mask `0x3f`→`0x0f` (source and destination); large non-fast linear copies go to `blt2d_source_copy` (copy engine) instead of 3D **only when the source or destination is not 64-byte aligned** (v2; v1 rerouted every large copy and made Chrome icons disappear) | `-ngreennoblitalign` |
+| **XE-BLITFIX** | IOSurface copies with a row pitch that is not a multiple of 64 bytes and larger than 128 KB still went to the broken 3D blit → the GPU read zeros (green YUV / black RGB images: Apple Music artwork, some JPEGs; #6) | in the BLITALIGN v2 block of `submitBlit`: copies with `(srcPitch\|dstPitch) & 0x3f` go to `blt2d_source_copy` (XY_SRC_COPY_BLT, copy engine); 64-aligned copies unchanged. ioreg `xe-blitfix-*` | `-ngreennoblitfix` |
 | **XE-PAGESYNC** | `pageon`/`pageoff` copies run on the copy engine and the render/compute work did not wait for them (our `barrierSubmission` replacement skips Apple's cross-engine semaphore) → half-copied textures, mixed write-backs, flicker | after `IGAccelResource::pageon`/`pageoff`, CPU-wait the copy's event with `IOAccelEventMachineFast2::finishEvent` | `-ngreennopagesync` |
 | **XE-FBDPMS** | display sleep tore down pipe A, TRANS_DDI_FUNC_CTL_A, DDI_BUF_CTL_A and the scaler; wake re-enabled the panel and plane but never the eDP link → display stayed dark | `setFramebufferPowerState` on FB0: Wake→Doze/Sleep only clears `BLC_CTL` bit 31; back to Wake only sets it | `-ngreenfbdpms` |
+| **XE-RC6FW** | a leaked/unbalanced `SafeForceWake` kept forcewake held forever: GPU never in RC6 when idle (RC6 0 %, GT ~5 W) | route `IntelAccelerator::SafeForceWake`: same algorithm with the count clamped at 0; a held context is released after `ngreenfwidle` ms (default 500) of idle engines. Measured RC6 87.5 %, GT 1.4 W | `-ngreennorc6fw` (`-ngreenrc6fwnodrop`: no idle release) |
 | **XE-GTFREQ** | without GuC the frequency policy object returns 0 → GPU stuck at 100 MHz (RPn) | `setGTFrequencyMMIO` never requests less than `ngreengtfreq` MHz (default 1500 = RP0; under load the PCU grants ~1300 because of the PL4/IccMax package limit). Idle GPU still enters RC6 | `ngreengtfreq=0` |
-| **XE-NOGVA** | the TGL personality advertises hardware video decode (`IOGVACodec`, HEVC caps). Without the patched VA plugin the decoder can't be created and decode sessions that request an output format fail with `-6680` → YouTube "an error occurred" | remove the `IOGVA*` properties → VideoToolbox uses software decode. Boot with `-ngreengva` once the patched plugin (`macos/vadriver/`) is installed: H.264 then decodes on the GPU. HEVC additionally needs `IOGVAHEVCDecode` = "2" on the accelerator (prepared as XE-GVAHEVC, not in this tree yet) | `-ngreengva` |
+| **XE-NOGVA** | the TGL personality advertises hardware video decode (`IOGVACodec`, HEVC caps). Without the patched VA plugin the decoder can't be created and decode sessions that request an output format fail with `-6680` → YouTube "an error occurred" | remove the `IOGVA*` properties → VideoToolbox uses software decode. Boot with `-ngreengva` once the patched plugin (`macos/vadriver/`) is installed: H.264 then decodes on the GPU. HEVC additionally needs `IOGVAHEVCDecode` = "2" on the accelerator, set by XE-GVAHEVC with `-ngreengva` (confirmed 2026-10-21). `-ngreengva` breaks FairPlay (Apple Music, #11) | `-ngreengva` |
+
+## GPU topology (80 EU parts)
+
+| Patch | Problem | Fix | Boot-args |
+|---|---|---|---|
+| **XE-TOPO** | NootedGreen hard-codes the 96 EU topology (12 subslices × 8 EU, 8 L3 banks); 80 EU chips (i5-1340P, i5-1334U) showed rendering artifacts (#3, #4) | the RPL `NumSubSlices` / `L3BankCount` byte-patch immediates and the `getGPUInfo` values come from boot-args; without them nothing changes. ioreg `xe-topo` = EU<<8 \| L3 | `ngreen-eu=80` (or 48/64/96), `ngreen-l3=N` (even, 2–16). **80 EU parts: `ngreen-eu=80 ngreen-l3=6`** (confirmed by two users; with L3 left at 8 the artifacts stay) |
 
 ## Tahoe facts used by these patches (25G241)
 

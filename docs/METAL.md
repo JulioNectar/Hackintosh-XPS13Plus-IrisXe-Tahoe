@@ -3,10 +3,11 @@
 Everything here is built by `macos/build-all.sh` from Apple's 16.0.32 bundles plus the sources in `macos/src`, and
 installed by `macos/install-macos.sh`.
 
-**Version history.** The Metal driver went through builds v1–v12 and MTL13–MTL17 (18–19 Oct); **MTL18** (20 Oct, in
-test) is MTL17 with two bytes restored — see the L3 row below. libxedrv went through v7–v18 and the LLVM bridge through
-v1–v2. Every build, with its evidence and result, is in [HISTORY.md](HISTORY.md) and [CATALOG.md](CATALOG.md) §4;
-abandoned approaches are in [EXPERIMENTS.md](EXPERIMENTS.md).
+**Version history.** The Metal driver went through builds v1–v12 and MTL13–MTL17 (18–19 Oct); **MTL18** (20 Oct) is
+MTL17 with two bytes restored (see below), and **MTL17 patch v18** (25 Oct, the name `patch-mtl17.py` uses) adds the
+command-buffer leak fix at `0x07ed87`. The two "18"s are different changes; the bundle built today contains both.
+libxedrv went through v7–v19 and the LLVM bridge through v1–v2. Every build, with its evidence and result, is in
+[HISTORY.md](HISTORY.md) and [CATALOG.md](CATALOG.md) §4; abandoned approaches are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 ```
 /Library/Extensions/AppleIntelTGLGraphics*.kext, *.bundle      Apple 16.0.32 (accelerator Info.plist edited)
@@ -28,8 +29,9 @@ abandoned approaches are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 ## 2. Metal driver patches (MTL17)
 
-`macos/patch-mtl17.py` + `mtl17-patches.json` turn the stock binary into MTL17 byte for byte (verified: zero
-differences outside the code signature).
+`macos/patch-mtl17.py` + `mtl17-patches.json` turn the stock binary into the current build: MTL17 (verified byte for byte
+against the 19 Oct build, zero differences outside the code signature) minus the two MTL18 bytes, plus the
+`0x07ed87` leak fix (patch v18). The table lists what is applied today.
 
 | Offset | Change | Reason |
 |---|---|---|
@@ -41,12 +43,15 @@ differences outside the code signature).
 | `0x018c28` | `mov ecx,[rax+0x18]` → `xor ecx,ecx` (MTL15) | ignore the kernel's IOSurface compression flag |
 | `0x067c27` | `je` → NOP in `programClearPipeline` (MTL16) | a clear always emits a disabled VS (it inherited the previous VS → hangs) |
 | `0x067c5c` | `jne` → `jmp` (MTL17) | after a clear the VS is marked dirty, so the next draw re-emits its own |
+| `0x07ed87` | `jne` → NOP in `-[MTLIGAccelCommandBuffer dealloc]` (patch v18, 25 Oct, [#12](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/12)) | the buffer's 96 KB POSH block was never freed when it was the queue's only active buffer (the usual case), so WindowServer grew by GBs. The queue's shared POSH pointer is never set, so every buffer owns its block and freeing it is safe. Test program: 3000 command buffers leave 0 blocks (before: 1 per buffer) |
 | Info.plist | `Development.PoshDisable = 1` | no POSH pipe on RPL |
 
 **MTL18.** v11 originally replaced the same byte at `0x07ff77` and `0x080253` too, but those are not L3 values: in
 `IntelState::IntelState()` the byte is the opcode of `movb %al,0x110(%rdi)` / `movb %cl,0x8e0(%rbx)`, which the patch
-turned into `rolb`/`rorb`. The repository's `mtl17-patches.json` now **excludes those two bytes**, so `patch-mtl17.py`
-builds MTL18 (MTL17 minus the corruption; being tested). Details: [CATALOG.md](CATALOG.md) §6.1.
+turned into `rolb`/`rorb`. The repository's `mtl17-patches.json` **excludes those two bytes** (since 20 Oct), so every
+bundle `patch-mtl17.py` has built since then is MTL18 plus, from 25 Oct, the `0x07ed87` leak fix. No problem has been
+attributed to the change, but no test isolating its effect was recorded either. (The docstring of `patch-mtl17.py` still
+lists `0x07ff77`/`0x080253`; `mtl17-patches.json` is what is applied.) Details: [CATALOG.md](CATALOG.md) §6.1.
 
 ## 3. libxedrv (macos/src/libxedrv.m)
 
@@ -104,9 +109,16 @@ An ObjC dylib loaded into every Metal client (WindowServer included) by the driv
    the IOSurface's own memory, so no copy is needed (log line `PITCH LARGO`). Repro: 18 of 136 pitch cases failed
    before, 3 after (the remaining 3 use a pitch that is not 256-byte aligned and keep the old path).
 
+9. **Mip levels for zero-copy textures (v19, the Dock badge digits, [#10](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/10))**:
+   for layers with `minificationFilter = trilinear` Core Animation creates the zero-copy texture with
+   `newTiledTextureWithBytesNoCopy` and `mipmapLevelCount > 1` (108×108 → 7 levels) over image memory that only holds
+   level 0. The 16.0.32 driver never fills levels 1+, so the trilinear sample read empty levels and the layer (Dock badge
+   numbers, other downscaled images) was invisible. v19 creates its own texture, uploads level 0 and generates the
+   others with `generateMipmapsForTexture:` before returning it. Reproduced in-process with `CARenderer`.
+
 Environment switches: `XE_COMPRESSAO=1` keeps compression, `XE_NOCOPY_ZERO=1` disables fix 4, `XE_FILL_NATIVO=1`
 disables fix 6, `XE_COPIA_NATIVA=1` keeps aligned buffer copies on the 2D path (fills stay fixed),
-`XE_STENCIL_NATIVO=1` disables fix 7, `XE_NOWIDEPITCH=1` disables fix 8.
+`XE_STENCIL_NATIVO=1` disables fix 7, `XE_NOWIDEPITCH=1` disables fix 8, `XE_MIP_NATIVO=1` disables fix 9.
 
 ## 4. Shader compiler (xe.bundle)
 
@@ -150,7 +162,10 @@ has it, the TGL one doesn't; without it HEVC fails with `-12906`). Safari can't 
 ## 6. Known gaps in this layer
 
 - `BGR10_XR` / `w30r` (extended-range 10-bit) is not available on any Intel/AMD Mac: Metal's format validation requires the Apple1 GPU family, CoreAnimation only maps `w30r`/`w40a` for Apple2+ devices, and the 16.0.32 driver/Gen12 hardware have no XR surface format. Forcing CoreAnimation's Apple2 bit makes 10-bit 4:2:2/4:2:0 video use Apple-only multi-plane formats (crash), so it stays unsupported.
-- Hardware video decode needs `-ngreengva` and the plugin above (section 5); Safari still decodes on the CPU, and
-  hardware encode is untested. Without `-ngreengva` (XE-NOGVA) VideoToolbox decodes and converts in software.
+- Hardware video decode needs `-ngreengva` and the plugin above (section 5); Safari still decodes on the CPU. Without
+  `-ngreengva` (XE-NOGVA) VideoToolbox decodes and converts in software.
+- Hardware encode: H.264 low-latency encode through VDENC works in tests, but P frames hang the video engine and the
+  VPHAL patches it needs break 1080p pixel transfers in other apps. Research paused on 2026-10-24, nothing installed:
+  [macos/vadriver/encode-experimental/README.md](../macos/vadriver/encode-experimental/README.md).
 - Chrome's own GPU path (ANGLE/Metal) draws blank windows.
 - Chrome (Graphite/Dawn) rendering with a populated GPU cache: fixed in libxedrv v16 (item 6 above).
