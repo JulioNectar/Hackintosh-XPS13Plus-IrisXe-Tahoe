@@ -1,4 +1,4 @@
-// libxedrv v17 — injetado no driver Metal TGL 16.0.32 (LC_LOAD_DYLIB). Adapta o driver (era Big Sur) ao Metal do Tahoe 25G241. v16: escritas em buffer pelo caminho 3D (ver "v16"). v17: stencil fora do bloco de 64 KB de outro render target (ver "v17").
+// libxedrv v19 — injetado no driver Metal TGL 16.0.32 (LC_LOAD_DYLIB). Adapta o driver (era Big Sur) ao Metal do Tahoe 25G241. v16: escritas em buffer pelo caminho 3D (ver "v16"). v17: stencil fora do bloco de 64 KB de outro render target (ver "v17"). v19: mipmaps das texturas zero-copy (ver "v19").
 // Mudanças em relação à v7 (xe/build/llvm-bridge/xedrv.m), comparando com o adaptador do IntelIGPU-Tahoe (25G83) e com o layout medido:
 //  1. _descriptorPrivate: o deslocamento de 0x10 começa em 0xa8 (o driver antigo também tem shaderValidation em 0xa0; a v7 punha
 //     textureWriteRoundingMode ali). Layout antigo lido da codificação de tipo do próprio driver:
@@ -497,13 +497,47 @@ static id nc_copia(id dev, void* ptr, MTLTextureDescriptor* d, NSUInteger off, N
       (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)off, (unsigned long)bpr, n);
   return t;
 }
+// v19 (25/10): BADGE DO DOCK SEM NÚMERO (#10). Para camadas com minificationFilter trilinear o CoreAnimation pede a
+// mesma textura zero-copy com mipmapLevelCount > 1 (108x108 -> 7 níveis) sobre a memória da imagem, que só tem o nível 0;
+// o driver 16.0.32 não gera os outros níveis e a amostragem trilinear lê níveis vazios -> camada invisível (o número do
+// badge, qualquer imagem reduzida com filtro trilinear). Provado com ~/xe/build/badge/trace.m (CARenderer: trilinear =
+// cor do fundo, linear/nearest = imagem). Correção: textura própria (managed) com os mesmos níveis, nível 0 copiado e
+// os demais gerados com generateMipmapsForTexture: numa fila própria antes de devolver. XE_MIP_NATIVO=1 desliga.
+static long g_mip_n; static int g_mip_off = -1;
+static const void* kXeMipQ = &kXeMipQ;
+static pthread_mutex_t g_mipm = PTHREAD_MUTEX_INITIALIZER;
+static BOOL nc_mip(MTLTextureDescriptor* d) {
+  if (g_mip_off < 0) g_mip_off = getenv("XE_MIP_NATIVO") != NULL;
+  return !g_mip_off && d.mipmapLevelCount > 1 && d.textureType == MTLTextureType2D && d.arrayLength == 1 && d.sampleCount == 1;
+}
+static id nc_copia_mip(id dev, void* ptr, MTLTextureDescriptor* d, NSUInteger off, NSUInteger bpr) {
+  MTLTextureDescriptor* c = [[d copy] autorelease]; c.storageMode = MTLStorageModeManaged;
+  c.usage = c.usage | MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+  id<MTLTexture> t = [dev newTextureWithDescriptor:c];
+  if (!t) return nil;
+  [t replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:(uint8_t*)ptr + off bytesPerRow:bpr];
+  pthread_mutex_lock(&g_mipm);
+  id<MTLCommandQueue> q = objc_getAssociatedObject(dev, kXeMipQ);
+  if (!q) { q = [dev newCommandQueue]; if (q) { objc_setAssociatedObject(dev, kXeMipQ, q, OBJC_ASSOCIATION_RETAIN); [q release]; } }
+  pthread_mutex_unlock(&g_mipm);
+  id<MTLCommandBuffer> cb = [q commandBuffer];
+  id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+  if (!cb || !e) { [t release]; return nil; }
+  [e generateMipmapsForTexture:t]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+  long n = __sync_add_and_fetch(&g_mip_n, 1);
+  if (n <= 4 || (n & (n - 1)) == 0) LOG("MIP textura %lux%lu fmt=%lu níveis=%lu off=0x%lx -> cópia com mipmaps gerados (n=%ld, cb=%ld)",
+      (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)d.mipmapLevelCount,
+      (unsigned long)off, n, (long)cb.status);
+  return t;
+}
 static id w_nc3(id s, SEL c, void* ptr, NSUInteger len, MTLTextureDescriptor* d, NSUInteger off, NSUInteger bpr) {
+  if (nc_mip(d)) { id t = nc_copia_mip(s, ptr, d, off, bpr); if (t) return t; }
   if (nc_precisa(d, off)) { id t = nc_copia(s, ptr, d, off, bpr); if (t) return t; }
   return ((id(*)(id, SEL, void*, NSUInteger, id, NSUInteger, NSUInteger))g_nc3)(s, c, ptr, len, d, off, bpr);
 }
 static id w_nc4(id s, SEL c, void* ptr, NSUInteger len, id dealloc, MTLTextureDescriptor* d, NSUInteger off, NSUInteger bpr) {
-  if (nc_precisa(d, off)) {
-    id t = nc_copia(s, ptr, d, off, bpr);
+  if (nc_mip(d) || nc_precisa(d, off)) {
+    id t = nc_mip(d) ? nc_copia_mip(s, ptr, d, off, bpr) : nc_copia(s, ptr, d, off, bpr);
     if (t) {
       if (dealloc) { XeDeallocV15* x = [[XeDeallocV15 alloc] initWithBlock:dealloc ptr:ptr len:len]; objc_setAssociatedObject(t, kNcDealloc, x, OBJC_ASSOCIATION_RETAIN); [x release]; }
       return t;
