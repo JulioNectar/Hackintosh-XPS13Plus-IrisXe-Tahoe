@@ -7,7 +7,7 @@ Target: Dell XPS 13 Plus 9320, i7-1360P, Iris Xe 8086:A7A0, **macOS Tahoe 26.7.1
 Alder Lake laptops may work with their own EFI, but the patches were only tested here. NootedGreen describes
 every non-Tiger-Lake GPU as 96 EU (12 subslices × 8 EU, 8 L3 banks, MCR steering to DSS0). On an **80 EU part**
 (e.g. i5-1334U, i5-1340P, i5-12500H) add **`ngreen-eu=80 ngreen-l3=6`** to the boot-args: it removes the rendering
-artifacts (confirmed on an i5-1340P and an i5-1334U, issue [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3)). `ioreg -rc IntelAccelerator -d1 | grep xe-topo`
+artifacts (confirmed on an i5-1340P and an i5-1334U, issue [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3), and on an Alder Lake-P i5-1240P / 46A6, [#16](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/16)). `ioreg -rc IntelAccelerator -d1 | grep xe-topo`
 then shows 20486 (80 EU, 6 L3 banks) instead of 24584. To check another chip, read the fuses from a Linux live USB:
 `sseu_topology` (number of DSS × 16 = EU) and register `0x9118` (low 4 bits = L3 bank **pairs** fused off; banks =
 2 × (4 − number of set bits)), see [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3), [#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4).
@@ -55,6 +55,11 @@ to register them. It goes to `/Library/Extensions` (step 5), not to the EFI.
 
 Put `build/NootedGreen.kext` in `EFI/OC/Kexts/` and switch back to the accelerated `config.plist` (keep the boot-args
 from the repository).
+
+**Own config.plist or reused NVRAM:** OpenCore only writes `NVRAM > Add > boot-args` if the variable is also listed
+under `NVRAM > Delete` for the same GUID (`7C436110-AB2A-4BBB-A880-FE41995C9F82`); otherwise the OpenCore log shows
+`ignored, exists` and the old boot-args stay. The repository's configs already list it. Without it the Xe boot-args
+are missing and the boot stops right after the accelerator starts (`didn't find dpmicro`, no panic), see [#16](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/16).
 
 ## 5. User-space side
 

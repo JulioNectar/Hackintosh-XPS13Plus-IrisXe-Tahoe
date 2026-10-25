@@ -98,11 +98,16 @@ Not verified here: I only have the XPS 13 Plus 9320.
       machine has a plain UVC webcam, so the camera path runs. The reporter ruled out the 48 Hz mode and mode switching.
     - Occasional screen corruption when viewing screenshots.
 - **i5-1334U / i5-1340P** (80 EU): rendering artifacts ([#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3)).
+- **HP ProBook 450 G9** (i5-1240P, Iris Xe 46A6, 80 EU, 1080p panel, macOS 26.7.1): **works** with the shipped stack plus
+  `ngreen-eu=80 ngreen-l3=6`: Metal, Liquid Glass, Mission Control, no artifacts after several hours ([#16](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/16)).
+  First Alder Lake-P report.
+- **HP Elite Dragonfly G2** (native Tiger Lake i5-1135G7, 9A49, 80 EU): the artifacts went away with 6 L3 banks
+  instead of 8 (the reporter's own build, fuse `0x9118 = 0x88`), [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3).
 - **ASUS VivoBook K3502ZA** (i5-12500H, Iris Xe 46A6, 80 EU): boot stall with the acceleration stack ([#4](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/4)).
 
 The 80 EU reports match a known limit: NootedGreen describes every non-Tiger-Lake GPU as 96 EU. Since 2026-10-24 the
 boot-args `ngreen-eu=80 ngreen-l3=6` describe these chips correctly (5 DSS × 16 EU, 6 L3 banks, from Linux fuse data in #3 and
-#4) and **remove the artifacts** (confirmed on an i5-1340P and an i5-1334U); see [INSTALL.md](INSTALL.md). Issues and PRs from other machines are welcome.
+#4) and **remove the artifacts** (confirmed on an i5-1340P, an i5-1334U, an i5-1240P and a native i5-1135G7); see [INSTALL.md](INSTALL.md). Issues and PRs from other machines are welcome.
 
 ## iServices
 

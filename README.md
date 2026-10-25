@@ -121,7 +121,7 @@ Other hardware (other Raptor Lake / Alder Lake laptops): the user-space part is 
 EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTALL.md](docs/INSTALL.md).
 NootedGreen describes every non-Tiger-Lake GPU as 96 EU (12 subslices × 8 EU, 8 L3 banks) unless told otherwise.
 **80 EU parts** (e.g. i5-1334U, i5-1340P, i5-12500H): add **`ngreen-eu=80 ngreen-l3=6`** to the boot-args. This removes
-the rendering artifacts (confirmed by two users on an i5-1340P and an i5-1334U, [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3)); these chips have 6 L3 banks
+the rendering artifacts (confirmed on an i5-1340P and an i5-1334U, [#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3), on an i5-1240P / 46A6, [#16](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/16), and on a native Tiger Lake i5-1135G7 with 80 EU); these chips have 6 L3 banks
 (fuse register `0x9118`), not 8. Check: `ioreg -rc IntelAccelerator -d1 | grep xe-topo` shows 20486.
 
 ## Credits
