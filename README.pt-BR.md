@@ -19,7 +19,8 @@ Se o projeto já roda no seu notebook, para atualizar (as novidades estão no [C
    zsh install.sh          # recompila e reinstala o NootedGreen, o driver Metal, o libxedrv e o compilador de shaders
    ```
 3. Copie o novo `build/NootedGreen.kext` por cima de `EFI/OC/Kexts/NootedGreen.kext` na EFI de onde você liga.
-4. Reinicie e confira: `kmutil showloaded | grep NootedGreen`.
+4. Reinicie e confira: `kmutil showloaded | grep NootedGreen`. Desde 25/10, `ioreg -rc IntelAccelerator -d1 | grep rowchk`
+   também mostra `xe-rowchk-post` (a correção da GPU para os tracinhos no Pré-Visualização/Fotos, #9).
 
 Não rode o `make-efi.sh` de novo para atualizar: ele gera **novos** números de série (SMBIOS), e isso desconecta o
 iCloud/iMessage. Mantenha a sua EFI e troque só o kext.

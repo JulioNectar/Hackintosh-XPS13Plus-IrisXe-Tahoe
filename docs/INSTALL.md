@@ -123,7 +123,8 @@ Fixes land in the repository as they are confirmed (see [CHANGELOG.md](../CHANGE
    compare `config.plist` with the repository's if the CHANGELOG entry says boot-args or kexts changed; keep your
    own serials. Do not run `make-efi.sh` again: it generates new SMBIOS serials (iCloud/iMessage sign-out).
 4. Reboot, then check that the new kext is loaded: `kmutil showloaded | grep NootedGreen` and
-   `system_profiler SPDisplaysDataType | grep Metal`.
+   `system_profiler SPDisplaysDataType | grep Metal`. Builds from 25 Oct on also publish `xe-rowchk-post` in
+   `ioreg -rc IntelAccelerator -d1` (XE-ROWCHK; its low 16 bits should be 0xc000).
 5. Optional parts are updated separately with their own scripts: speakers/microphones
    (`zsh tools/audio/install-audio.sh build`, then `kext`, then `hal`), fingerprint (`tools/fingerprint`), etc.
 

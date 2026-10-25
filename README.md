@@ -20,7 +20,8 @@ If the stack already runs on your machine, update it like this (latest changes i
    zsh install.sh          # rebuilds and reinstalls NootedGreen, the Metal driver, libxedrv and the shader compiler
    ```
 3. Copy the new `build/NootedGreen.kext` over `EFI/OC/Kexts/NootedGreen.kext` on the EFI you boot from.
-4. Reboot and check: `kmutil showloaded | grep NootedGreen`.
+4. Reboot and check: `kmutil showloaded | grep NootedGreen`. Since 25 Oct, `ioreg -rc IntelAccelerator -d1 | grep rowchk`
+   also shows `xe-rowchk-post` (the GPU fix for the dash artifacts in Preview/Photos, #9).
 
 Don't run `make-efi.sh` again to update: it generates **new** serial numbers (SMBIOS), which signs you out of
 iCloud/iMessage. Keep your EFI and only replace the kext.
