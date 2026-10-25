@@ -96,7 +96,9 @@ Not verified here: I only have the XPS 13 Plus 9320.
     - GPU hangs (context 5, `WAIT_ON_SCANLINE` in the gpuRestart report) when opening System Settings › Displays,
       System Settings › Trackpad or Photo Booth: the render engine (RCS) hangs on the dummy page `0xc01dbead`. That
       machine has a plain UVC webcam, so the camera path runs. The reporter ruled out the 48 Hz mode and mode switching.
-    - Occasional screen corruption when viewing screenshots.
+    - Occasional screen corruption when viewing screenshots: short faint dashes when zooming images in Preview/Photos
+      (#9). Fixed on 25 Oct by XE-ROWCHK (Gen12 register-read workarounds that were never set); the scaled-mode problem
+      in the same issue went away with the Metal fixes from #10/#12.
 - **i5-1334U / i5-1340P** (80 EU): rendering artifacts ([#3](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/3)).
 - **HP ProBook 450 G9** (i5-1240P, Iris Xe 46A6, 80 EU, 1080p panel, macOS 26.7.1): **works** with the shipped stack plus
   `ngreen-eu=80 ngreen-l3=6`: Metal, Liquid Glass, Mission Control, no artifacts after several hours ([#16](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/16)).

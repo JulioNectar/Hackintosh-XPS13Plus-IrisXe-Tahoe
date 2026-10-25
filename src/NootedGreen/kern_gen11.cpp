@@ -35,10 +35,17 @@ static void xeTopoArgs() {
 	if (PE_parse_boot_argn("ngreen-l3", &l3, sizeof(l3)) && l3 >= 2 && l3 <= 16 && !(l3 & 1)) gTopoL3 = l3;
 }
 static void *volatile gTopoAcc = nullptr;
+static volatile uint32_t gRc2Pre = 0xFFFFFFFFU, gRc2Post = 0xFFFFFFFFU, gRc2N = 0;   // xe/rowchk: 0xe4f4 before/after (last start)
 static void xeTopoPublish(thread_call_param_t, thread_call_param_t) {
 	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gTopoAcc));
 	if (svc) svc->setProperty("xe-topo", (gTopoSs * 8) << 8 | gTopoL3, 32);
+	if (svc && gRc2N) {
+		svc->setProperty("xe-rowchk-pre", gRc2Pre, 32);
+		svc->setProperty("xe-rowchk-post", gRc2Post, 32);
+		svc->setProperty("xe-rowchk-n", gRc2N, 32);
+	}
 }
+static thread_call_t gTopoTc = nullptr;
 
 // ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
 //trivial
@@ -6423,10 +6430,9 @@ void Gen11::getGPUInfo(void *that)
 	IOLog("XeNG TOPO: subslices=%u eu/ss=%u eu=%u l3=%u%s\n", numSubSlices, maxEUPerSubSlice, totalEU, gTopoL3,
 	      (numSubSlices == 12 && gTopoL3 == 8) ? " (default)" : " (boot-arg)");
 	// published later from a thread_call, not from inside getGPUInfo
-	static thread_call_t tc = nullptr;
 	gTopoAcc = that;
-	if (!tc) tc = thread_call_allocate(xeTopoPublish, nullptr);
-	if (tc) thread_call_enter(tc);
+	if (!gTopoTc) gTopoTc = thread_call_allocate(xeTopoPublish, nullptr);
+	if (gTopoTc) thread_call_enter(gTopoTc);
 
 }
 
@@ -7178,6 +7184,24 @@ unsigned long Gen11::startGraphicsEngine(void *that)
 		SYSLOG("ngreen", "V163: startGraphicsEngine post-clear FF_SLICE_CS_CHICKEN1=0x%08x (ret=%lu)",
 			NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1), ret);
 		xeLrcaRepair("post-start");
+		// xe/rowchk (25/10, #9): Wa_1606931601 + Wa_1508744258 (i915 rcs_engine_wa_init, tgl/adl-p): GEN8_ROW_CHICKEN2
+		// (0xe4f4, masked) bits 14|15 = GEN12_DISABLE_EARLY_READ | GEN12_DISABLE_READ_SUPPRESSION. Upstream NootedGreen has
+		// them in dead code after a return and Apple only sets bits 0/1/8. Without them SIMD32 kernels read one stale GRF
+		// (lanes 8-15, .x channel): non-deterministic results in kernels with private arrays, the short dashes of Core Image's
+		// Lanczos (Preview/Photos zoom). Written after Apple's start, with the render well held awake through our own
+		// FORCEWAKE_RENDER requester bit (5) so Apple's references stay untouched; without forcewake the write is lost.
+		// Readback in ioreg xe-rowchk-* (post bit 31 = forcewake acked). -ngreennorowchk turns it off.
+		if (xeFixEnabled() && !checkKernelArgument("-ngreennorowchk")) {
+			auto *cb = NGreen::callback;
+			cb->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 21) | (1u << 5));
+			for (int i = 0; i < 500 && !(cb->readReg32(FORCEWAKE_ACK_RENDER_GEN9) & (1u << 5)); i++) IODelay(100);
+			gRc2Pre = cb->readReg32(GEN8_ROW_CHICKEN2);
+			cb->writeReg32(GEN8_ROW_CHICKEN2, (0xC000u << 16) | 0xC000u);
+			gRc2Post = cb->readReg32(GEN8_ROW_CHICKEN2) | (cb->readReg32(FORCEWAKE_ACK_RENDER_GEN9) & (1u << 5) ? 0x80000000u : 0);
+			cb->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 21));
+			gRc2N++;
+			if (gTopoTc) thread_call_enter(gTopoTc);
+		}
 	}
 
 	return ret;
