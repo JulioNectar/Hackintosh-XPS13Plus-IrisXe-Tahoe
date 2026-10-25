@@ -36,9 +36,41 @@ static void xeTopoArgs() {
 }
 static void *volatile gTopoAcc = nullptr;
 static volatile uint32_t gRc2Pre = 0xFFFFFFFFU, gRc2Post = 0xFFFFFFFFU, gRc2N = 0;   // xe/rowchk: 0xe4f4 before/after (last start)
+// xe/auxbl (#15): backlight over eDP AUX for panels that ignore the PWM pin (OLED). Off by default.
+//   ngreenauxbl=1  VESA eDP (DPCD 0x720-0x723, like Linux drm_edp_backlight); =2 same and PWM duty pinned at 100% (test)
+//   ngreenauxbl=3  Intel HDR TCON (Linux intel_dp_aux_hdr_*: 0x344 bit 4 AUX enable, nits at 0x354); =4 same + PWM pinned
+//   ngreenauxnits=N  panel maximum in nits for 3/4 (default 400, minimum sent 2)
+// Apple's duty write (BLC_PWM_PCH_CTL2) sets the level; the AUX writes run on a thread call with Apple's own
+// AppleIntelPort::readAUX/writeAUX. Arms only if the panel advertises the interface: VESA needs 0x701 bit 2 and 0x702
+// bit 1, Intel HDR needs 0x341 bit 4. ioreg on IntelAccelerator: xe-dpcd700-0..3 / xe-dpcd340 (caps, little-endian),
+// xe-auxbl-n (writes), -ret, -lvl (last level or nits), -rb (read back).
+static volatile uint32_t gXeDpcd700[4] = {0, 0, 0, 0}, gXeDpcd700Ret = 0xFFFFFFFFU, gXeDpcd340 = 0, gXeDpcd340Ret = 0xFFFFFFFFU;
+static void *volatile gXeAuxBlPort = nullptr;
+static mach_vm_address_t gXeAuxBlWr = 0, gXeAuxBlRd = 0;
+static thread_call_t gXeAuxBlTc = nullptr;
+static volatile uint32_t gXeAuxBlLevel = 0, gXeAuxBlN = 0, gXeAuxBlRet = 0xFFFFFFFFU, gXeAuxBlRb = 0, gXeAuxBlDone = 0;
+static int xeAuxBlMode() {
+	static int m = -1;
+	if (m < 0) { int v = 0; m = PE_parse_boot_argn("ngreenauxbl", &v, sizeof(v)) && v > 0 && v < 5 ? v : 0; }
+	return m;
+}
+static bool xeAuxBlHdr() { return xeAuxBlMode() >= 3; }
 static void xeTopoPublish(thread_call_param_t, thread_call_param_t) {
 	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gTopoAcc));
 	if (svc) svc->setProperty("xe-topo", (gTopoSs * 8) << 8 | gTopoL3, 32);
+	if (svc && gXeDpcd700Ret != 0xFFFFFFFFU) {
+		char k[20];
+		for (int i = 0; i < 4; i++) { snprintf(k, sizeof(k), "xe-dpcd700-%d", i); svc->setProperty(k, gXeDpcd700[i], 32); }
+		svc->setProperty("xe-dpcd700-ret", gXeDpcd700Ret, 32);
+		svc->setProperty("xe-dpcd340", gXeDpcd340, 32);
+		svc->setProperty("xe-dpcd340-ret", gXeDpcd340Ret, 32);
+	}
+	if (svc && gXeAuxBlN) {
+		svc->setProperty("xe-auxbl-n", gXeAuxBlN, 32);
+		svc->setProperty("xe-auxbl-ret", gXeAuxBlRet, 32);
+		svc->setProperty("xe-auxbl-lvl", gXeAuxBlDone, 32);
+		svc->setProperty("xe-auxbl-rb", gXeAuxBlRb, 32);
+	}
 	if (svc && gRc2N) {
 		svc->setProperty("xe-rowchk-pre", gRc2Pre, 32);
 		svc->setProperty("xe-rowchk-post", gRc2Post, 32);
@@ -1343,6 +1375,10 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		};
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
 		gTglFbRoutesDone++;
+		if (xeAuxBlMode()) {
+			gXeAuxBlWr = patcher.solveSymbol(index, "__ZN14AppleIntelPort8writeAUXEjPvj", address, size);
+			patcher.clearError();
+		}
 		if (checkKernelArgument("-ngreenfixbootmode")) {
 			SolveRequestPlus crtcSolve[] = {
 				{"__ZN24AppleIntelBaseController35hwCRTCToIODetailedTimingInformationEP21AppleIntelFramebufferP29IODetailedTimingInformationV2", gHwCrtcToTimingAddr},
@@ -3428,9 +3464,63 @@ void Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, co
 		cached = hwLanes;
 }
 
+using XeAuxFn = uint32_t (*)(void *, uint32_t, void *, uint32_t);
+static void xeAuxBlApply(thread_call_param_t, thread_call_param_t) {
+	void *port = gXeAuxBlPort;
+	if (!port || !gXeAuxBlWr || !gXeAuxBlRd) return;
+	auto wr = [&](uint32_t a, void *b, uint32_t n) { return reinterpret_cast<XeAuxFn>(gXeAuxBlWr)(port, a, b, n); };
+	auto rd = [&](uint32_t a, void *b, uint32_t n) { return reinterpret_cast<XeAuxFn>(gXeAuxBlRd)(port, a, b, n); };
+	const uint32_t lvl = gXeAuxBlLevel;
+	uint32_t ret, rb = 0, done;
+	if (xeAuxBlHdr()) {
+		static int maxNits = 0;
+		if (!maxNits && (!PE_parse_boot_argn("ngreenauxnits", &maxNits, sizeof(maxNits)) || maxNits < 10 || maxNits > 2000)) maxNits = 400;
+		uint32_t nits = lvl ? (uint32_t)(((uint64_t)lvl * (uint32_t)maxNits + 0x7FFF) / 0xFFFF) : 0;
+		if (lvl && nits < 2) nits = 2;
+		uint8_t c = 0;
+		ret = rd(0x344, &c, 1);
+		if (!ret && !(c & 0x10)) { c |= 0x10; ret = wr(0x344, &c, 1); }   // brightness AUX enable
+		uint8_t pkt[4] = {(uint8_t)nits, (uint8_t)(nits >> 8), 0, 0};
+		if (!ret) ret = wr(0x354, pkt, 4);
+		uint8_t c2 = 0;
+		rd(0x354, &rb, 4);
+		rd(0x344, &c2, 1);
+		rb = (rb & 0xFFFF) | ((uint32_t)c2 << 24);
+		done = nits;
+	} else {
+		const bool wide = (gXeDpcd700[0] >> 16) & 0x4;   // 0x702 bit 2: 16-bit level
+		uint8_t v[2] = {(uint8_t)(lvl >> 8), (uint8_t)lvl};
+		ret = wr(0x722, v, wide ? 2 : 1);
+		uint8_t m = 0, c = 0;
+		if (!ret && !(ret = rd(0x721, &m, 1)) && (m & 3) != 2) { m = (uint8_t)((m & ~3U) | 2); ret = wr(0x721, &m, 1); }   // DPCD mode
+		if (!ret && !(ret = rd(0x720, &c, 1)) && !(c & 1)) { c |= 1; ret = wr(0x720, &c, 1); }                             // backlight enable
+		rd(0x720, &rb, 4);
+		done = lvl;
+	}
+	gXeAuxBlRet = ret; gXeAuxBlRb = rb; gXeAuxBlDone = done;
+	if (OSIncrementAtomic(&gXeAuxBlN) < 8) IOLog("XeNG AUXBL: mode %d level 0x%x ret 0x%x rb 0x%08x\n", xeAuxBlMode(), done, ret, rb);
+	xeTopoPublish(nullptr, nullptr);
+}
+
 IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
 
 	IOReturn retVal = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, address, buffer, length);
+	if (retVal == kIOReturnSuccess && address == 0 && buffer && length >= 16 && gXeDpcd700Ret == 0xFFFFFFFFU) {
+		// xe/auxbl: eDP backlight caps, read once next to Apple's first sink-caps read (read only)
+		uint32_t caps[4] = {0, 0, 0, 0}, hdr = 0;
+		gXeDpcd700Ret = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, 0x700, caps, 16);
+		for (int i = 0; i < 4; i++) gXeDpcd700[i] = caps[i];
+		gXeDpcd340Ret = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, 0x340, &hdr, 4);
+		gXeDpcd340 = hdr;
+		const bool vesaOk = gXeDpcd700Ret == 0 && ((caps[0] >> 8) & 0x4) && ((caps[0] >> 16) & 0x2);
+		const bool hdrOk = gXeDpcd340Ret == 0 && ((hdr >> 8) & 0x10);
+		if (xeAuxBlMode() && gXeAuxBlWr && (xeAuxBlHdr() ? hdrOk : vesaOk)) {
+			gXeAuxBlRd = callback->orgICLReadAUX;
+			gXeAuxBlTc = thread_call_allocate(xeAuxBlApply, nullptr);
+			if (gXeAuxBlTc) gXeAuxBlPort = that;
+		}
+		IOLog("XeNG AUXBL: caps 0x700 %08x 0x340 %08x mode %d armed %d\n", caps[0], hdr, xeAuxBlMode(), gXeAuxBlPort ? 1 : 0);
+	}
 
 	// V97AUX: log first ~40 AUX reads to diagnose eDP link training failures.
 	static int auxLogCount = 0;
@@ -3890,6 +3980,12 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 					val = v > gBlHwFreq ? gBlHwFreq : (uint32_t)v;
 				}
 				gBlLastOut = val;
+				if (xeAuxBlMode() && gXeAuxBlTc && gBlHwFreq && gBlHwFreq != 0xFFFFFFFF) {   // xe/auxbl
+					uint64_t l = (uint64_t)val * 0xFFFF / gBlHwFreq;
+					gXeAuxBlLevel = l > 0xFFFF ? 0xFFFF : (uint32_t)l;
+					thread_call_enter(gXeAuxBlTc);
+					if ((xeAuxBlMode() == 2 || xeAuxBlMode() == 4) && val) val = gBlHwFreq;
+				}
 			}
 		}
 	}
