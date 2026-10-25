@@ -24,6 +24,9 @@ What the byte patches do (offsets are file offsets in the x86_64 binary):
   - 0x065f12 / 0x07ff77 / 0x080253: L3 allocation dword 0x20000088 -> 0x200000d0 (v11)
   - 0x067c27: `je +0x5c` -> NOP (v16, fast clear off)
   - 0x067c5c: `jne` -> `jmp` (v17, clear always disables the VS stage)
+  - 0x07ed87: `jne` -> NOP in -[MTLIGAccelCommandBuffer dealloc] (v18, #12): the per-buffer POSH block
+    (96 KB) was never freed for the "only active" command buffer. The queue's shared POSH pointer is never set
+    (only zeroed at queue init), so every command buffer owns its block and freeing it is safe.
 """
 import json, os, shutil, subprocess, sys
 
