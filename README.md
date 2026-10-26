@@ -21,16 +21,19 @@ macOS power management (XCPM) predates Intel's hybrid CPUs, and on 12th/13th-gen
   don't have, so cores never sleep deeper than C6.
 
 The NootedGreen **XE-PM** profile fixes all of this, 20 s after boot. It is **on in this repo's `config.plist`**
-(boot-arg `-ngreenpm`). Measured on the XPS 13 Plus (i7-1360P):
+as `ngreenpm=22`: the profile plus a sustained power limit (PL1) of 22 W instead of the 17.5 W the BIOS leaves without
+Dell's Windows thermal software (`-ngreenpm` alone keeps the BIOS PL1). Measured on the XPS 13 Plus (i7-1360P):
 
 | | Before | With `-ngreenpm` |
 |---|---|---|
 | Geekbench 7 single-core | 1269 | **1697 (+34 %)** |
-| Geekbench 7 multi-core | 5859 | 6148 (+5 %, limited by the 17.5 W PL1 and the thin chassis) |
+| Geekbench 7 multi-core | 5859 | 6148 (+5 %, with the 17.5 W PL1) |
+| 45 s all-core load | 7079 (17.5 W, 75 °C) | **8423–8706 (+19–23 %, 22 W, ~85 °C)**; 25–28 W reach 93–94 °C and run slower |
 | One-thread clock | 3.3–3.8 GHz | 4.3–4.85 GHz |
 | Idle package power | ~4.6 W | ~3.3 W |
 
 Other Alder Lake / Raptor Lake hybrid machines on this stack should see the same turbo fix; add `-ngreenpm` to try it
+(PL1 is only changed with `ngreenpm=W`; pick it for your cooling)
 (**keep a backup EFI**; it patches XCPM and only applies on macOS 26.7.1 25G241, where the code was checked byte for
 byte). EPP: `ngreenpmepp=N` at boot (default 0, max performance) or `sudo sysctl -w debug.xepm.epp=64` live.
 Status: `sysctl debug.xepm`. Details in [CHANGELOG.md](CHANGELOG.md).

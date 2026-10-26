@@ -16,11 +16,15 @@
 //     only if the three entries carry exactly those hints.
 //  5. D3hot for PCI functions macOS has no driver for (IPU camera, GNA, ISH, DPTF participant, Thunderbolt/USB4 DMA),
 //     by device id, only when nothing is attached (or only a client that never matched).
+//  6. Optional sustained power limit: ngreenpm=W (profile + PL1) or ngreenpmpl1=W writes PL1 in the MCHBAR RAPL register (0x59A0; the MSR 0x610 PL1
+//     is already higher on these machines and the lower of the two applies). Left alone without the boot-arg. On the
+//     XPS 13 Plus, 22 W gave +23 % on a 45 s all-core load at ~85 C; 25 W and 28 W reached 93-94 C and ran slower.
 //  Measured on a Dell XPS 13 Plus 9320 (i7-1360P): Geekbench 7 single-core 1269 -> 1697, multi-core 5859 -> 6148,
 //  one-thread clock 3.3 -> 4.3-4.85 GHz, idle package ~4.6 -> ~3.3 W.
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/thread_call.h>
 #include <sys/sysctl.h>
@@ -105,13 +109,47 @@ static int xpD3() {
 	return n;
 }
 
+// ─── 6: MCHBAR PL1 ───────────────────────────────────────────────────────────────────────────────────────────────
+static int gXpPl1 = 0, gXpPl1Set = 0;   // requested watts, written value (1/8 W units) read back
+static void xpPl1() {
+	if (gXpPl1 <= 0) return;
+	uint64_t mch = 0;
+	OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+	if (!it) return;
+	while (auto *o = it->getNextObject()) {
+		auto *d = OSDynamicCast(IOPCIDevice, o);
+		if (d && !d->getBusNumber() && !d->getDeviceNumber() && !d->getFunctionNumber()) {
+			const uint64_t v = ((uint64_t)d->configRead32(0x4C) << 32) | d->configRead32(0x48);
+			if (v & 1) mch = v & 0x7FFFFE0000ULL;
+			break;
+		}
+	}
+	it->release();
+	if (!mch) return;
+	const uint32_t unit = (uint32_t)(xpRdmsr(0x606) & 0xF);   // power unit 1/2^n W (3 -> 1/8 W)
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(mch + 0x5000, 0x1000, kIODirectionInOut);
+	if (!md) return;
+	if (IOMemoryMap *mm = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache)) {
+		auto *lo = reinterpret_cast<volatile uint32_t *>(mm->getVirtualAddress() + 0x9A0);
+		auto *hi = reinterpret_cast<volatile uint32_t *>(mm->getVirtualAddress() + 0x9A4);
+		if (!(*hi & 0x80000000U)) {   // lock bit 63
+			const uint32_t want = (uint32_t)gXpPl1 << unit;
+			if (want && want <= 0x7FFF && (*lo & 0x7FFF) != want) *lo = (*lo & ~0x7FFFU) | want | 0x8000U;   // + enable
+			gXpPl1Set = (int)(*lo & 0x7FFF);
+		} else gXpPl1Set = -1;
+		mm->release();
+	}
+	md->release();
+}
+
 static void xpApply(thread_call_param_t, thread_call_param_t) {
+	xpPl1();
 	gXpCst = xpCstFix();
 	gXpD3 += xpD3();
 	if (!gXpEet) { mp_rendezvous_no_intrs(xpEetOne, nullptr); gXpEet = (int)((xpRdmsr(0x1FC) >> 19) & 1); }
 	if (gXpOrgSetMult) gXpHwp = 1;   // takes effect at XCPM's next request on each CPU
-	IOLog("XeNG PM: profile on: HWP rescale %d (route %d), EPP %d, EE turbo off %d, C8/C10 %d, D3 %d\n",
-	      gXpHwp, gXpRoute, gXpEpp, gXpEet, gXpCst, gXpD3);
+	IOLog("XeNG PM: profile on: HWP rescale %d (route %d), EPP %d, EE turbo off %d, C8/C10 %d, D3 %d, PL1 %d W (0x%x)\n",
+	      gXpHwp, gXpRoute, gXpEpp, gXpEet, gXpCst, gXpD3, gXpPl1, gXpPl1Set);
 }
 
 SYSCTL_NODE(_debug, OID_AUTO, xepm, CTLFLAG_RW, 0, "NootedGreen XE-PM");
@@ -121,12 +159,19 @@ SYSCTL_INT(_debug_xepm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
 SYSCTL_INT(_debug_xepm, OID_AUTO, cst, CTLFLAG_RD, &gXpCst, 0, "1 = C8/C10 on");
 SYSCTL_INT(_debug_xepm, OID_AUTO, d3, CTLFLAG_RD, &gXpD3, 0, "");
 SYSCTL_INT(_debug_xepm, OID_AUTO, route, CTLFLAG_RD, &gXpRoute, 0, "1 = HWP route installed");
+SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_w, CTLFLAG_RD, &gXpPl1, 0, "requested PL1 (ngreenpmpl1)");
+SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_set, CTLFLAG_RD, &gXpPl1Set, 0, "MCHBAR PL1 field after the write, -1 = locked");
 
 void xePmInstall(KernelPatcher &patcher) {
-	if (!checkKernelArgument("-ngreenpm")) return;
+	int pmw = 0;   // ngreenpm=W: the profile plus PL1 = W watts (one boot-arg; -ngreenpm alone leaves PL1 alone)
+	const bool pmVal = PE_parse_boot_argn("ngreenpm", &pmw, sizeof(pmw));
+	if (!checkKernelArgument("-ngreenpm") && !pmVal) return;
 	gXpOn = true;
 	int e = 0;
 	gXpEpp = (PE_parse_boot_argn("ngreenpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 0;
+	int w = 0;
+	if (PE_parse_boot_argn("ngreenpmpl1", &w, sizeof(w)) && w >= 5 && w <= 64) gXpPl1 = w;
+	else if (pmVal && pmw >= 5 && pmw <= 64) gXpPl1 = pmw;
 	gXpCstPtr = patcher.solveSymbol(KernelPatcher::KernelID, "_xcpm_cstate_table");
 	patcher.clearError();
 	const mach_vm_address_t base = patcher.solveSymbol(KernelPatcher::KernelID, "_xcpm_enable_pstate_ctrs");
@@ -152,6 +197,8 @@ void xePmInstall(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_xepm_cst);
 	sysctl_register_oid(&sysctl__debug_xepm_d3);
 	sysctl_register_oid(&sysctl__debug_xepm_route);
+	sysctl_register_oid(&sysctl__debug_xepm_pl1_w);
+	sysctl_register_oid(&sysctl__debug_xepm_pl1_set);
 	uint64_t dl;
 	thread_call_t t20 = thread_call_allocate(xpApply, nullptr), t60 = thread_call_allocate(xpApply, nullptr);
 	clock_interval_to_deadline(20, kSecondScale, &dl);
