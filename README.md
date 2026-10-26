@@ -26,8 +26,8 @@ Dell's Windows thermal software (`-ngreenpm` alone keeps the BIOS PL1). Measured
 
 | | Before | With `-ngreenpm` |
 |---|---|---|
-| Geekbench 7 single-core | 1269 | **1697 (+34 %)** |
-| Geekbench 7 multi-core | 5859 | 6148 (+5 %, with the 17.5 W PL1) |
+| Geekbench 7 single-core | 1269 | **1682–1697 (+33 %)** |
+| Geekbench 7 multi-core | 5859 | **6772 (+16 %)** with `ngreenpm=22` (6148 with the 17.5 W PL1) |
 | 45 s all-core load | 7079 (17.5 W, 75 °C) | **8423–8706 (+19–23 %, 22 W, ~85 °C)**; 25–28 W reach 93–94 °C and run slower |
 | One-thread clock | 3.3–3.8 GHz | 4.3–4.85 GHz |
 | Idle package power | ~4.6 W | ~3.3 W |

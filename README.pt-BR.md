@@ -27,8 +27,8 @@ BIOS deixa sem o software térmico da Dell no Windows (`-ngreenpm` sozinho mant�
 
 | | Antes | Com `-ngreenpm` |
 |---|---|---|
-| Geekbench 7 single-core | 1269 | **1697 (+34 %)** |
-| Geekbench 7 multi-core | 5859 | 6148 (+5 %, com PL1 de 17,5 W) |
+| Geekbench 7 single-core | 1269 | **1682–1697 (+33 %)** |
+| Geekbench 7 multi-core | 5859 | **6772 (+16 %)** com `ngreenpm=22` (6148 com PL1 de 17,5 W) |
 | Carga de 45 s em todos os núcleos | 7079 (17,5 W, 75 °C) | **8423–8706 (+19–23 %, 22 W, ~85 °C)**; 25–28 W chegam a 93–94 °C e rendem menos |
 | Frequência com 1 thread | 3,3–3,8 GHz | 4,3–4,85 GHz |
 | Consumo do pacote parado | ~4,6 W | ~3,3 W |
