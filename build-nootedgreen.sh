@@ -41,7 +41,7 @@ __private_extern__ kmod_stop_func_t *_antimain = 0;
 __private_extern__ int _kext_apple_cc = __APPLE_CC__;
 EOC
 clang $FLAGS -c $TMP/info.c -o $TMP/info.o
-for s in DisplayMergeNub DYLDPatches Firmware FirmwareADLP HDMI IntelDPLinkTraining kern_gen11 kern_genx kern_green kern_patcherplus kern_start; do
+for s in DisplayMergeNub DYLDPatches Firmware FirmwareADLP HDMI IntelDPLinkTraining kern_gen11 kern_genx kern_green kern_patcherplus kern_start kern_xepm; do
   clang++ $FLAGS -std=gnu++17 -nostdinc++ -fno-exceptions -fno-rtti -fapple-kext \
     -Wno-deprecated-declarations -Wno-inconsistent-missing-override -Wno-unused-parameter -c $SRC/$s.cpp -o $TMP/$s.o
 done

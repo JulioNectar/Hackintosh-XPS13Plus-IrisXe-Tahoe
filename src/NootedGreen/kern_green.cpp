@@ -171,6 +171,7 @@ void NGreen::init() {
 
 
 void NGreen::processPatcher(KernelPatcher &patcher) {
+	{ extern void xePmInstall(KernelPatcher &); xePmInstall(patcher); }   // XE-PM (kern_xepm.cpp), -ngreenpm
 	// Hook _cs_validate_page FIRST — before DeviceInfo which blocks
 	// for >60s polling PEGP (NVIDIA dGPU) disable via processSwitchOff.
 	// Without this, WindowServer starts before the hook is established

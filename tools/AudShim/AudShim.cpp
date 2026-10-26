@@ -596,6 +596,14 @@ public:
     bool drvLinger = false;                    // STOP received, stream kept running silent until drvLingerUntil
     uint64_t drvLingerUntil = 0;
     uint32_t drvLingerMs = 5000;               // like the DAPM pmdown_time; boot-arg audshimlingerms=0..60000
+    // 0.9.2 idle power: READY with no stream for drvIdleOffMs tears the DSP, SoundWire links and controller state down
+    // (Linux SOF runtime-suspends after 2 s; the next START brings everything up again, ~1-2 s). Boot-arg
+    // audshimidleoffms=0..600000 (0 = never). And after the firmware boots, DSP clock/power gating is re-enabled as
+    // hda_dsp_post_fw_run does (it was left off: ADSPPGD=1, ADSPDCGE=0); -audshimnopg keeps the old behaviour.
+    uint32_t drvIdleOffMs = 30000, drvIdleOffs = 0;
+    uint64_t drvIdleUntil = 0;
+    bool drvPg = true;
+    void drvArmIdle();
     uint32_t drvStarts = 0, drvBringUps = 0, drvNotes = 0, drvDmaErr = 0, drvLastUpMs = 0;
     volatile uint32_t drvXruns = 0, drvGen = 0;
     volatile uint64_t drvRunHost = 0;
@@ -786,6 +794,10 @@ bool AudShim::start(IOService *provider) {
         uint32_t lg = 5000;
         if (PE_parse_boot_argn("audshimlingerms", &lg, sizeof lg) && lg > 60000) lg = 60000;
         drvLingerMs = lg;
+        uint32_t io = 30000;
+        if (PE_parse_boot_argn("audshimidleoffms", &io, sizeof io) && io > 600000) io = 600000;
+        drvIdleOffMs = io;
+        drvPg = !PE_parse_boot_argn("-audshimnopg", dummy, sizeof dummy);
     }
 
     pci->findPCICapability(kIOPCIPowerManagementCapability, &pmCap);
@@ -3498,6 +3510,7 @@ bool AudShim::drvBringUp() {
     if (!drvFwReadyOk()) { drvCall(kM3OpTdAck, 0, 0, o); drvFail(19, 0, "S19 FW_READY content"); goto fail; }
     DCALL(20, kM3OpTdAck, 0, "S20 FW_READY ack");
     if (!drvSdw()) goto fail;
+    if (drvPg) DCALL(21, kM3OpPostFwRun, 0, "S21 post_fw_run (DSP clock/power gating on)");   // hda.c hda_dsp_post_fw_run
     if (!drvAmpStatic()) goto fail;
     if (drvCall(kM5OpSAlloc, (uint64_t)(uintptr_t)gZeroRing, kM5Buf, o) != kM2Ok) { drvFail(45, o[0], "S45 playback ring"); goto fail; }
     drvTopo = true;   // from here the teardown frees the widgets
@@ -3509,6 +3522,7 @@ bool AudShim::drvBringUp() {
     drvLastUpMs = (uint32_t)((nowUs() - t0) / 1000);
     IOLog("AudShim DRV: READY after %u ms (bring-up #%u): firmware running, links up, RT1316 x2 initialised (muted, PS3), "
           "pipeline set up\n", drvLastUpMs, drvBringUps);
+    drvArmIdle();
     return true;
 fail:
     drvRollback("bring-up failure");
@@ -3546,6 +3560,7 @@ bool AudShim::drvStartSeq() {
     OSIncrementAtomic((volatile SInt32 *)&drvGen);
     if (!drvIpc(kDrvTrigStart, false, 0)) { drvFail(67, drvFailCode, "STREAM_TRIG_START"); return false; }
     drvState = kDrvStRunning;
+    drvIdleUntil = 0;
     if (!drvSetGain(drvMuted ? 0 : drvGainReq)) { drvFail(68, drvFailCode, "PGA ramp up"); return false; }
     drvStarts++;
     if (drvTimer) drvTimer->setTimeoutMS(50);
@@ -3579,7 +3594,15 @@ bool AudShim::drvStopSeq() {
     drvState = kDrvStReady;
     IOLog("AudShim DRV: stopped in %llu us%s (xrun notifications %u, DMA errors %u)\n", nowUs() - t0,
           ok ? "" : " WITH ERRORS", drvXruns, drvDmaErr);
+    drvArmIdle();
     return ok;
+}
+
+// READY and no capture: power everything down after drvIdleOffMs (drvTimerFired). Re-armed on every return to READY.
+void AudShim::drvArmIdle() {
+    if (!drvIdleOffMs || drvState != kDrvStReady || capState == kCapStRunning || !drvTimer) { drvIdleUntil = 0; return; }
+    drvIdleUntil = nowUs() + (uint64_t)drvIdleOffMs * 1000;
+    drvTimer->setTimeoutMS(drvIdleOffMs);
 }
 
 void AudShim::drvRollback(const char *why) {
@@ -3655,7 +3678,23 @@ void AudShim::drvService() {
 
 void AudShim::drvTimerFired(OSObject *owner, IOTimerEventSource *sender) {
     AudShim *s = OSDynamicCast(AudShim, owner);
-    if (!s || (s->drvState != kDrvStRunning && s->capState != kCapStRunning)) return;
+    if (!s) return;
+    if (s->drvIdleUntil && s->drvState == kDrvStReady && s->capState != kCapStRunning) {   // 0.9.2 idle power-down
+        if (nowUs() + 1000 < s->drvIdleUntil) { sender->setTimeoutMS((uint32_t)((s->drvIdleUntil - nowUs()) / 1000) + 1); return; }
+        if (!IOLockTryLock(s->drvLock)) { sender->setTimeoutMS(1000); return; }
+        if (s->drvIdleUntil && s->drvState == kDrvStReady && s->capState != kCapStRunning) {
+            s->drvKSrc = true;
+            gQuiet = !s->drvVerbose;
+            s->drvIdleUntil = 0;
+            s->drvIdleOffs++;
+            IOLog("AudShim DRV: idle for %u ms, powering the DSP down (#%u)\n", s->drvIdleOffMs, s->drvIdleOffs);
+            s->drvTeardown("idle");   // drvClient is kept: the next START/OPEN brings it up again
+            s->drvKSrc = false;
+        }
+        IOLockUnlock(s->drvLock);
+        return;
+    }
+    if (s->drvState != kDrvStRunning && s->capState != kCapStRunning) return;
     if (IOLockTryLock(s->drvLock)) {   // never wait behind a start/stop/volume sequence
         if (s->drvState == kDrvStRunning || s->capState == kCapStRunning) s->drvService();
         if (s->drvState == kDrvStRunning && s->drvLinger && nowUs() >= s->drvLingerUntil) {
@@ -4171,6 +4210,7 @@ void AudShim::capOp(AudShimUserClient *c, uint64_t op, uint64_t *o) {
             capFail(81, 0, "capture stop");
         }
         capClient = nullptr;
+        drvArmIdle();
         return;
     }
     // CAP_START

@@ -9,6 +9,32 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 > see [CHANGELOG.md](CHANGELOG.md) for what changed and what is still being tested, and the
 > [releases](../../releases) for the stable points.
 
+## New: full CPU turbo and lower idle power (`-ngreenpm`, 26 Oct)
+
+macOS power management (XCPM) predates Intel's hybrid CPUs, and on 12th/13th-gen laptops it holds the CPU back:
+
+- **P-cores stuck at ~3.8 GHz.** XCPM writes the HWP turbo limit in 100 MHz units, but hybrid P-cores count HWP
+  performance in ~78.7 MHz units, so "5.0 GHz" becomes ~3.9 GHz. On top of that, its default EPP (128) clips
+  one-core turbo on Alder/Raptor Lake mobile parts (an Intel-documented behaviour), and energy-efficient turbo holds
+  the top bins.
+- **Deep idle states off.** XCPM's idle table for the spoofed CPU has C8/C10 disabled and uses C3, which these CPUs
+  don't have, so cores never sleep deeper than C6.
+
+The NootedGreen **XE-PM** profile fixes all of this, 20 s after boot. It is **on in this repo's `config.plist`**
+(boot-arg `-ngreenpm`). Measured on the XPS 13 Plus (i7-1360P):
+
+| | Before | With `-ngreenpm` |
+|---|---|---|
+| Geekbench 7 single-core | 1269 | **1697 (+34 %)** |
+| Geekbench 7 multi-core | 5859 | 6148 (+5 %, limited by the 17.5 W PL1 and the thin chassis) |
+| One-thread clock | 3.3–3.8 GHz | 4.3–4.85 GHz |
+| Idle package power | ~4.6 W | ~3.3 W |
+
+Other Alder Lake / Raptor Lake hybrid machines on this stack should see the same turbo fix; add `-ngreenpm` to try it
+(**keep a backup EFI**; it patches XCPM and only applies on macOS 26.7.1 25G241, where the code was checked byte for
+byte). EPP: `ngreenpmepp=N` at boot (default 0, max performance) or `sudo sysctl -w debug.xepm.epp=64` live.
+Status: `sysctl debug.xepm`. Details in [CHANGELOG.md](CHANGELOG.md).
+
 ## Already installed? Update
 
 If the stack already runs on your machine, update it like this (latest changes in [CHANGELOG.md](CHANGELOG.md)):
@@ -42,7 +68,7 @@ entry. Details: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
 | Desktop, Dock, windows, Liquid Glass blur | ✅ GPU-accelerated through Metal |
 | Native panel resolution (3840×2400) and HiDPI scaling (1280–1920 pt wide) | ✅ switch with `tools/xe-res`, not System Settings (a brief glitch during the switch is cosmetic) |
 | GPU clock | ✅ ~1300 MHz under load (requests RP0 1500 MHz; the CPU package power limit PL4/IccMax caps it at ~1300), idles in RC6 |
-| CPU | ✅ **all 16 threads (4 P-cores with HT + 8 E-cores)** — the E-cores used to hang the boot; fixed with one byte in `Cpuid1Data` (see [STATUS](docs/STATUS.md)). CpuTopologyRebuild 2.0.2 (default mode) groups them as 4 P-cores with 4 threads each, so heavy work lands on P-cores; System Information shows 12 cores |
+| CPU | ✅ **full turbo (up to ~4.85 GHz on one P-core) with `-ngreenpm`** (XE-PM, see above) · ✅ **all 16 threads (4 P-cores with HT + 8 E-cores)** — the E-cores used to hang the boot; fixed with one byte in `Cpuid1Data` (see [STATUS](docs/STATUS.md)). CpuTopologyRebuild 2.0.2 (default mode) groups them as 4 P-cores with 4 threads each, so heavy work lands on P-cores; System Information shows 12 cores |
 | HEIC / YUV images (wallpapers, photos) | ✅ |
 | App icons, Finder icons, image thumbnails | ✅ (the 10-bit extended-range layer format `w30r`/`BGR10_XR` is Apple-silicon-only: real Intel Macs don't render it either) |
 | Hardware video decode | ✅ **H.264 on the GPU** (bit-exact vs. software) for apps that use VideoToolbox: QuickTime, Photos, video editors, conversions. Needs `-ngreengva` and the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed by hand for now) · ✅ **HEVC** too (NootedGreen XE-GVAHEVC) · ⚠️ Safari decodes on the CPU: its WebKit GPU process may not load drivers from `/Library/GPUBundles` · ⚠️ with `-ngreengva` FairPlay content (Apple Music, probably Apple TV+) does not play: the VA plugin takes the hardware key-exchange path and fails with "ME not loaded" ([#11](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/11)); remove the boot-arg if you need it |
@@ -53,7 +79,7 @@ entry. Details: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
 | Brightness | ✅ `tools/xe-brilho` (the macOS slider now covers the full panel range with `ngreenblmax=17777`) · ⚠️ the sun keys depend on a Dell firmware state that changes from boot to boot; F6/F7 always work through `xe-brilho daemon` |
 | Shutdown / restart | ✅ fast (XE-IDLEBOUND; used to stall ~3 min and panic) |
 | Boot screen | ✅ sharp Apple logo from the first frame, no garbage flash (OpenCore `Resolution=Max` + `gfxrst=1` + XE-BOOTHOLD) |
-| Internal speakers | ✅ our own `AudShim` kext runs Intel's SOF firmware on the audio DSP, SoundWire and both RT1316 amplifiers; `XeSpeakers` makes them a normal macOS output (volume, mute). Capped at −3 dB (AudShim 0.9.1), no speaker protection · ✅ internal microphones (RT714) as **"Microfone interno"** |
+| Internal speakers | ✅ our own `AudShim` kext runs Intel's SOF firmware on the audio DSP, SoundWire and both RT1316 amplifiers; `XeSpeakers` makes them a normal macOS output (volume, mute). Capped at −3 dB (AudShim 0.9.1), no speaker protection · AudShim 0.9.2 powers the DSP down after 30 s of silence (`audshimidleoffms=N`, 0 = never); the first sound after that takes ~1–2 s · ✅ internal microphones (RT714) as **"Microfone interno"** |
 | Wi-Fi, Bluetooth | ✅ native Wi-Fi menu via AirportItlwm-Tahoe (no HeliPort) · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
 | Touchpad haptics | ✅ click-vibration strength with `tools/xe-haptic` / the `xe-hapticbar` menu-bar slider · ❌ no on-demand pulse (Force Touch feedback) |
 | Fingerprint reader | ✅ for `sudo` (Goodix 27C6:63BC via libfprint, PAM module in `sudo_local`; `tools/fingerprint`) · ❌ login, screen unlock and Touch ID prompts (no Secure Enclave) |

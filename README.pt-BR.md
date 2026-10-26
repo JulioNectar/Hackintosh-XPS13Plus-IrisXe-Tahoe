@@ -8,6 +8,33 @@ A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a 
 > no próprio XPS 13 Plus do autor, e cada correção entra aqui depois de confirmada no hardware real. Atualizações
 > frequentes; veja o [CHANGELOG.md](CHANGELOG.md) (o que mudou e o que ainda está em teste).
 
+## Novidade: turbo completo da CPU e menos consumo parado (`-ngreenpm`, 26/10)
+
+O gerenciamento de energia do macOS (XCPM) é anterior aos processadores híbridos da Intel e, nos notebooks de
+12ª/13ª geração, segura a CPU:
+
+- **Núcleos P presos em ~3,8 GHz.** O XCPM grava o limite de turbo do HWP em passos de 100 MHz, mas nos núcleos P
+  híbridos a unidade do HWP é ~78,7 MHz: "5,0 GHz" vira ~3,9 GHz. Além disso, o EPP padrão dele (128) corta o turbo
+  de um núcleo nos Alder/Raptor Lake mobile (comportamento documentado pela Intel), e o energy-efficient turbo segura
+  as frequências mais altas.
+- **Estados de repouso profundos desligados.** A tabela de idle do XCPM para a CPU identificada tem C8/C10 desligados
+  e usa C3, que esses processadores não têm: os núcleos nunca dormem além de C6.
+
+O perfil **XE-PM** do NootedGreen corrige tudo isso, 20 s depois do boot. Ele vem **ligado no `config.plist` deste
+repositório** (boot-arg `-ngreenpm`). Medido no XPS 13 Plus (i7-1360P):
+
+| | Antes | Com `-ngreenpm` |
+|---|---|---|
+| Geekbench 7 single-core | 1269 | **1697 (+34 %)** |
+| Geekbench 7 multi-core | 5859 | 6148 (+5 %, limitado pelo PL1 de 17,5 W e pelo chassi fino) |
+| Frequência com 1 thread | 3,3–3,8 GHz | 4,3–4,85 GHz |
+| Consumo do pacote parado | ~4,6 W | ~3,3 W |
+
+Outros Alder Lake / Raptor Lake híbridos com esta pilha devem ter a mesma correção do turbo: adicione `-ngreenpm`
+para testar (**tenha uma EFI de reserva**; ele altera o XCPM e só aplica no macOS 26.7.1 25G241, onde o código foi
+conferido byte a byte). EPP: `ngreenpmepp=N` no boot (padrão 0, desempenho máximo) ou `sudo sysctl -w debug.xepm.epp=64`
+ao vivo. Estado: `sysctl debug.xepm`. Detalhes no [CHANGELOG.md](CHANGELOG.md).
+
 ## Já tem instalado? Atualize
 
 Se o projeto já roda no seu notebook, para atualizar (as novidades estão no [CHANGELOG.md](CHANGELOG.md)):
@@ -37,7 +64,7 @@ Detalhes: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
 | Mesa, Dock, janelas, desfoque "Liquid Glass" | ✅ acelerado pela GPU (Metal) |
 | Resolução nativa (3840×2400) e escala HiDPI | ✅ troque com `tools/xe-res`, não pelos Ajustes (um glitch rápido na troca é só visual) |
 | Frequência da GPU | ✅ ~1300 MHz sob carga (pede 1500 MHz; o limite de energia do processador, PL4/IccMax, segura em ~1300), repouso em RC6 |
-| Processador | ✅ **os 16 threads (4 núcleos P com HT + 8 núcleos E)**: os núcleos E travavam o boot; corrigido com um byte no `Cpuid1Data`. O CpuTopologyRebuild 2.0.2 (modo padrão) agrupa como 4 núcleos P com 4 threads cada, então o trabalho pesado vai para os núcleos P; Informações do Sistema mostra 12 núcleos |
+| Processador | ✅ **turbo completo (até ~4,85 GHz em um núcleo P) com `-ngreenpm`** (XE-PM, veja acima) · ✅ **os 16 threads (4 núcleos P com HT + 8 núcleos E)**: os núcleos E travavam o boot; corrigido com um byte no `Cpuid1Data`. O CpuTopologyRebuild 2.0.2 (modo padrão) agrupa como 4 núcleos P com 4 threads cada, então o trabalho pesado vai para os núcleos P; Informações do Sistema mostra 12 núcleos |
 | Imagens HEIC/YUV (papéis de parede, fotos) | ✅ |
 | Ícones de apps, Finder, miniaturas | ✅ (o formato de 10 bits com faixa estendida `w30r`/`BGR10_XR` é exclusivo dos chips Apple: nem os Macs Intel de verdade o desenham) |
 | Decodificação de vídeo por hardware | ✅ **H.264 na GPU** (idêntico ao software) para apps que usam o VideoToolbox: QuickTime, Fotos, editores, conversões. Precisa de `-ngreengva` e do plugin VA corrigido (`macos/vadriver/build-vadriver.sh`, instalação manual por enquanto) · ✅ **HEVC** também (XE-GVAHEVC no NootedGreen) · ⚠️ o Safari decodifica na CPU: o processo GPU do WebKit não pode carregar drivers de `/Library/GPUBundles` · ⚠️ com `-ngreengva` conteúdo FairPlay (Apple Music, provavelmente Apple TV+) não toca: o plugin VA tenta a troca de chaves por hardware e falha com "ME not loaded" ([#11](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/11)); tire o boot-arg se precisar |
@@ -48,7 +75,7 @@ Detalhes: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
 | Brilho | ✅ `tools/xe-brilho` (o slider do macOS agora cobre toda a faixa do painel com `ngreenblmax=17777`) · ⚠️ as teclas de sol dependem de um estado do firmware da Dell que muda de um boot para outro; F6/F7 sempre funcionam pelo `xe-brilho daemon` |
 | Desligar / reiniciar | ✅ rápido (XE-IDLEBOUND; antes travava ~3 min e dava panic) |
 | Tela de boot | ✅ logo da Apple nítido desde o início, sem lixo na tela (OpenCore `Resolution=Max` + `gfxrst=1` + XE-BOOTHOLD) |
-| Alto-falantes internos | ✅ o nosso kext `AudShim` roda o firmware SOF da Intel no DSP de áudio, o SoundWire e os dois amplificadores RT1316; o `XeSpeakers` vira uma saída de som normal do macOS (volume, mudo). Limitado a −3 dB (AudShim 0.9.1), sem proteção dos alto-falantes · ✅ microfones internos (RT714) como **"Microfone interno"** |
+| Alto-falantes internos | ✅ o nosso kext `AudShim` roda o firmware SOF da Intel no DSP de áudio, o SoundWire e os dois amplificadores RT1316; o `XeSpeakers` vira uma saída de som normal do macOS (volume, mudo). Limitado a −3 dB (AudShim 0.9.1), sem proteção dos alto-falantes · a AudShim 0.9.2 desliga o DSP depois de 30 s sem som (`audshimidleoffms=N`, 0 = nunca); o primeiro som depois disso demora ~1–2 s · ✅ microfones internos (RT714) como **"Microfone interno"** |
 | Wi-Fi, Bluetooth | ✅ Wi-Fi nativo (menu do macOS) com o AirportItlwm-Tahoe, sem HeliPort · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
 | Vibração do trackpad | ✅ intensidade do clique com `tools/xe-haptic` / o controle `xe-hapticbar` na barra de menus · ❌ sem pulso sob demanda (resposta do Force Touch) |
 | Leitor de digitais | ✅ para o `sudo` (Goodix 27C6:63BC via libfprint, módulo PAM no `sudo_local`; `tools/fingerprint`) · ❌ login, desbloqueio da tela e Touch ID (sem Secure Enclave) |
