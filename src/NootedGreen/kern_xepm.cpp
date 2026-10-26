@@ -30,6 +30,7 @@
 #include <sys/sysctl.h>
 
 extern "C" void mp_rendezvous_no_intrs(void (*fn)(void *), void *arg);
+extern "C" int cpu_number(void);
 
 static inline uint64_t xpRdmsr(uint32_t m) { uint32_t lo, hi; asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(m)); return ((uint64_t)hi << 32) | lo; }
 static inline void xpWrmsr(uint32_t m, uint64_t v) { asm volatile("wrmsr" : : "c"(m), "a"((uint32_t)v), "d"((uint32_t)(v >> 32))); }
@@ -38,6 +39,7 @@ static bool gXpOn = false;
 static int gXpHwp = 0, gXpEpp = -1;                 // sysctl debug.xepm.hwp / .epp (root)
 static int gXpEet = 0, gXpCst = 0, gXpD3 = 0, gXpRoute = 0;   // status
 static mach_vm_address_t gXpOrgSetMult = 0, gXpCstPtr = 0;
+static bool gXpCstWant = true;   // ngreenpmcst=0 keeps XCPM's idle table (coil whine from deep C-state transitions)
 
 // ─── 1/2: XCPM HWP request ───────────────────────────────────────────────────────────────────────────────────────
 static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3) {   // only edi is used by Apple
@@ -66,18 +68,21 @@ static void xpEetOne(void *) {
 }
 
 // ─── 4: XCPM idle table ──────────────────────────────────────────────────────────────────────────────────────────
-static int xpCstFix() {
+// on = C8/C10 enabled, C3 disabled; !on = XCPM's own table back. Returns 1 (fix on), 0 (stock), 2-4 errors.
+static int xpCstSet(bool on) {
 	uint8_t *tab = gXpCstPtr ? *reinterpret_cast<uint8_t **>(gXpCstPtr) : nullptr;
 	if (!tab) return 2;
 	auto hint = [&](int i) { return *reinterpret_cast<volatile uint32_t *>(tab + i * 24 + 4); };
 	auto en = [&](int i) { return reinterpret_cast<volatile uint32_t *>(tab + i * 24 + 8); };
 	if (hint(0) != 0x60 || hint(2) != 0x40 || hint(6) != 0x10) return 3;
-	if (*en(0) == 1 && *en(2) == 1 && *en(6) == 0) return 1;
+	const uint32_t want = on ? 1 : 0;
+	if (*en(0) == want && *en(2) == want && *en(6) == !want) return on ? 1 : 0;
 	if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) return 4;
-	*en(0) = 1; *en(2) = 1; *en(6) = 0;
+	*en(0) = want; *en(2) = want; *en(6) = !want;
 	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-	return 1;
+	return on ? 1 : 0;
 }
+static int xpCstFix() { return xpCstSet(gXpCstWant); }
 
 // ─── 5: D3hot for driverless functions ───────────────────────────────────────────────────────────────────────────
 static int xpD3() {
@@ -152,11 +157,52 @@ static void xpApply(thread_call_param_t, thread_call_param_t) {
 	      gXpHwp, gXpRoute, gXpEpp, gXpEet, gXpCst, gXpD3, gXpPl1, gXpPl1Set);
 }
 
+// ─── sensors (always registered, read only): debug.xepm.sensors ──────────────────────────────────────────────────
+// The stack has no working CPU temperature source (SMCProcessor finds no instances), so the menu-bar tool reads this:
+// struct { u32 version 1, ncpu, tjmax, pkg_temp_c; u8 core_temp_c[32]; u8 core_type[32] (0x40 P, 0x20 E);
+//          u32 energy_unit_bits; u32 pad; u64 pkg_energy (0x611), ia_energy (0x639), gt_energy (0x641) }.
+// Temperatures are TjMax minus the digital readout of IA32_THERM_STATUS / IA32_PACKAGE_THERM_STATUS.
+struct XpSensors { uint32_t ver, ncpu, tjmax, pkg; uint8_t core[32], type[32]; uint32_t eunit, pad; uint64_t epkg, eia, egt; };
+static XpSensors gXpSens;
+static void xpSensOne(void *) {
+	const int c = cpu_number();
+	if (c < 0 || c >= 32) return;
+	const uint32_t tj = (uint32_t)(xpRdmsr(0x1A2) >> 16) & 0xff, dro = (uint32_t)(xpRdmsr(0x19C) >> 16) & 0x7f;
+	gXpSens.core[c] = (uint8_t)(tj > dro ? tj - dro : 0);
+	uint32_t r[4];
+	asm volatile("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(0x1A), "c"(0));
+	gXpSens.type[c] = (uint8_t)(r[0] >> 24);
+	__sync_fetch_and_add(&gXpSens.ncpu, 1);
+}
+static int xpSensors SYSCTL_HANDLER_ARGS {
+	bzero(&gXpSens, sizeof(gXpSens));
+	gXpSens.ver = 1;
+	mp_rendezvous_no_intrs(xpSensOne, nullptr);
+	gXpSens.tjmax = (uint32_t)(xpRdmsr(0x1A2) >> 16) & 0xff;
+	const uint32_t pd = (uint32_t)(xpRdmsr(0x1B1) >> 16) & 0x7f;
+	gXpSens.pkg = gXpSens.tjmax > pd ? gXpSens.tjmax - pd : 0;
+	gXpSens.eunit = (uint32_t)(xpRdmsr(0x606) >> 8) & 0x1f;
+	gXpSens.epkg = xpRdmsr(0x611) & 0xffffffffULL;
+	gXpSens.eia = xpRdmsr(0x639) & 0xffffffffULL;
+	gXpSens.egt = xpRdmsr(0x641) & 0xffffffffULL;
+	return SYSCTL_OUT(req, &gXpSens, sizeof(gXpSens));
+}
+
 SYSCTL_NODE(_debug, OID_AUTO, xepm, CTLFLAG_RW, 0, "NootedGreen XE-PM");
+SYSCTL_PROC(_debug_xepm, OID_AUTO, sensors, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0, xpSensors, "S", "temperatures and RAPL energy");
 SYSCTL_INT(_debug_xepm, OID_AUTO, hwp, CTLFLAG_RW, &gXpHwp, 0, "HWP rescale on hybrid P-cores");
 SYSCTL_INT(_debug_xepm, OID_AUTO, epp, CTLFLAG_RW, &gXpEpp, 0, "EPP override, -1 = XCPM's");
 SYSCTL_INT(_debug_xepm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
-SYSCTL_INT(_debug_xepm, OID_AUTO, cst, CTLFLAG_RD, &gXpCst, 0, "1 = C8/C10 on");
+static int xpCstCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.xepm.cst=0|1 (live)
+	int v = gXpCst;
+	int err = SYSCTL_OUT(req, &v, sizeof(v));
+	if (err || !req->newptr) return err;
+	if ((err = SYSCTL_IN(req, &v, sizeof(v)))) return err;
+	gXpCstWant = v != 0;
+	gXpCst = xpCstSet(gXpCstWant);
+	return gXpCst >= 2 ? EIO : 0;
+}
+SYSCTL_PROC(_debug_xepm, OID_AUTO, cst, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpCstCtl, "I", "1 = C8/C10 on (write 0/1, root)");
 SYSCTL_INT(_debug_xepm, OID_AUTO, d3, CTLFLAG_RD, &gXpD3, 0, "");
 SYSCTL_INT(_debug_xepm, OID_AUTO, route, CTLFLAG_RD, &gXpRoute, 0, "1 = HWP route installed");
 SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_w, CTLFLAG_RD, &gXpPl1, 0, "requested PL1 (ngreenpmpl1)");
@@ -165,10 +211,14 @@ SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_set, CTLFLAG_RD, &gXpPl1Set, 0, "MCHBAR PL
 void xePmInstall(KernelPatcher &patcher) {
 	int pmw = 0;   // ngreenpm=W: the profile plus PL1 = W watts (one boot-arg; -ngreenpm alone leaves PL1 alone)
 	const bool pmVal = PE_parse_boot_argn("ngreenpm", &pmw, sizeof(pmw));
+	sysctl_register_oid(&sysctl__debug_xepm);           // the sensors are always there (menu-bar temperature tool)
+	sysctl_register_oid(&sysctl__debug_xepm_sensors);
 	if (!checkKernelArgument("-ngreenpm") && !pmVal) return;
 	gXpOn = true;
 	int e = 0;
 	gXpEpp = (PE_parse_boot_argn("ngreenpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 0;
+	int cw = 1;
+	if (PE_parse_boot_argn("ngreenpmcst", &cw, sizeof(cw))) gXpCstWant = cw != 0;
 	int w = 0;
 	if (PE_parse_boot_argn("ngreenpmpl1", &w, sizeof(w)) && w >= 5 && w <= 64) gXpPl1 = w;
 	else if (pmVal && pmw >= 5 && pmw <= 64) gXpPl1 = pmw;
@@ -190,7 +240,6 @@ void xePmInstall(KernelPatcher &patcher) {
 		}
 		gXpRoute = gXpOrgSetMult ? 1 : (ok ? 5 : 3);
 	} else gXpRoute = 2;
-	sysctl_register_oid(&sysctl__debug_xepm);
 	sysctl_register_oid(&sysctl__debug_xepm_hwp);
 	sysctl_register_oid(&sysctl__debug_xepm_epp);
 	sysctl_register_oid(&sysctl__debug_xepm_eet_off);
