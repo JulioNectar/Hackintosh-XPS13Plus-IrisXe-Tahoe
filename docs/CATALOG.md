@@ -546,7 +546,7 @@ prod PANICs on failure of `patchesp`; dbg PANICs on failure of `patches`.
 | **fork** `-ngreenxtile` | Keep X-tile PLANE_CTL, stride srcW*4/512 (in place of the V408 linear forcing) | off |
 | **fork** `ngreenstride=N` | Override PLANE_STRIDE (struct and MMIO 0x70188) | 0 (none) |
 | **fork** `-ngreennoblr`, `ngreenblmax=N` | Backlight rescale off / reference duty | rescale on / 0 |
-| **fork** `-ngreenpm` / `ngreenpm=W`, `ngreenpmepp=N`, `ngreenpmpl1=W` | XE-PM: hybrid P-core HWP rescale, EPP, energy-efficient turbo off, XCPM C8/C10, D3 for driverless devices, optional MCHBAR PL1 = W watts (20 s after boot); status `sysctl debug.xepm` | off / EPP 0 / PL1 unchanged (repo config: `ngreenpm=22`) |
+| **fork** `-ngreenpm` / `ngreenpm=W`, `ngreenpmepp=N`, `ngreenpmpl1=W` | XE-PM: hybrid P-core HWP rescale, EPP, energy-efficient turbo off, XCPM C8/C10 (`ngreenpmcst=0` keeps XCPM's idle table; live `sudo sysctl -w debug.xepm.cst=0\|1`), D3 for driverless devices, optional MCHBAR PL1 = W watts (20 s after boot); status `sysctl debug.xepm`. Always registered, even without `-ngreenpm`: read-only `debug.xepm.sensors` (112-byte struct: per-thread and package temperatures, P/E core type, RAPL energy package/IA/GPU and unit; used by `tools/xe-temp`) | off / EPP 0 / PL1 unchanged (repo config: `ngreenpm=22`) |
 | **fork** `ngreenauxbl=N`, `ngreenauxnits=N` | XE-AUXBL: backlight over eDP AUX (1 VESA, 3 Intel HDR nits; 2/4 also pin the PWM at 100% for testing) / panel maximum in nits | off / 400 |
 | **fork** `-ngreenengineinert` | Drop Apple writes to the engine MMIO blocks | off |
 | **fork** `-ngreennoposh` | NOPOSH byte patch | off |
@@ -1312,6 +1312,7 @@ All are zsh unless noted; most require `sudo`. "EFI" = the OpenCore partition mo
 | `tools/sleep/` | `10-pmset-safe.sh` (no system sleep, display sleep only), `90-pmset-revert.sh`, `xe-lid.c` + `local.xe.lid.plist` template + `install-xe-lid.sh` (lid close → `pmset displaysleepnow`, open → user activity). |
 | `tools/xe-haptic.c` | Elan haptic touchpad: `list`/`dump` feature reports, `set <intensity> <byte1>` on report 0x09 (logged). |
 | `tools/xe-hapticbar.m`, `tools/build-xe-hapticbar.sh` | Menu-bar slider app that runs the bundled `xe-haptic set N 100` at login and on change. |
+| `tools/xe-temp/` (`XeTemp.swift`, `build.sh`) | Menu-bar app (SwiftUI `MenuBarExtra`, 26 Oct): package temperature in the menu bar; panel with a 3-minute history, package/CPU/GPU watts (RAPL deltas), P-core and E-core temperatures, battery temperature. Reads `debug.xepm.sensors`, no root. |
 | `EFI/OC/Kexts/AirportItlwm.kext` | laobamac AirportItlwm-Tahoe 2.4.0-alpha (GPL-2.0, source at github.com/laobamac/itlwm, commit 738d4c6). |
 
 ### 5.2 `xectl/` — direct-hardware bring-up through the XeShim kext (15–16 Oct, before the Apple-driver approach)

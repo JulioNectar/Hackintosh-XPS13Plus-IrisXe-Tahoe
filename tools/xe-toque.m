@@ -52,6 +52,36 @@ static CFMachPortRef tapRef;
 
 static double agora(void) { return CACurrentMediaTime(); }
 static BOOL opt(NSString *k) { return [ud boolForKey:k]; }
+
+// Hide the pointer while the touchscreen is used, show it again on the first trackpad/mouse event (as on an iPad).
+// CGDisplayHideCursor only works for the active app; the SetsCursorInBackground connection property lets this
+// agent (LSUIElement) hide it while another app is in front.
+extern int _CGSDefaultConnection(void);
+extern int CGSSetConnectionProperty(int, int, CFStringRef, CFTypeRef);
+static volatile BOOL gCursorHidden = NO;
+static void xlog(NSString *fmt, ...);
+static void cursorHide(void) {
+    if (!opt(@"hideCursor")) return;
+    static double lastTry = 0;   // touch frames arrive ~100/s: re-check at most 10 times a second
+    if (gCursorHidden && agora() - lastTry < 0.1) return;
+    lastTry = agora();
+    if (gCursorHidden && !CGCursorIsVisible()) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        int cid = _CGSDefaultConnection();
+        int r = CGSSetConnectionProperty(cid, cid, CFSTR("SetsCursorInBackground"), kCFBooleanTrue);
+        xlog(@"cursor: SetsCursorInBackground on connection %d -> %d", cid, r);
+    });
+    CGError e = CGDisplayHideCursor(kCGDirectMainDisplay);
+    gCursorHidden = YES;
+    static int n = 0; if (n++ < 20) xlog(@"cursor: hide (touch) -> %d, visible now %d", e, CGCursorIsVisible());
+}
+static void cursorShow(void) {
+    if (!gCursorHidden) return;
+    for (int i = 0; i < 16 && !CGCursorIsVisible(); i++) CGDisplayShowCursor(kCGDirectMainDisplay);   // undo every hide
+    gCursorHidden = NO;
+    static int n = 0; if (n++ < 20) xlog(@"cursor: show (trackpad/mouse)");
+}
 static double dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); }
 
 static void xlog(NSString *fmt, ...) {
@@ -664,6 +694,7 @@ static Slot *slotDe(IOHIDElementRef el) {
 
 static void valor(void *ctx, IOReturn r, void *snd, IOHIDValueRef v) {
     gLastHID = agora();
+    cursorHide();   // HID callback runs on the main run loop
     IOHIDElementRef el = IOHIDValueGetElement(v);
     uint32_t pg = IOHIDElementGetUsagePage(el), us = IOHIDElementGetUsage(el);
     CFIndex iv = IOHIDValueGetIntegerValue(v);
@@ -701,8 +732,12 @@ static CGEventRef cbTap(CGEventTapProxy p, CGEventType type, CGEventRef e, void 
     }
     if (type == kCGEventKeyUp || type == kCGEventFlagsChanged) return e;
     uint64_t s = (uint64_t)CGEventGetIntegerValueField(e, F_SENDER);
+    BOOL ts = s && gTS && s == gTS, mt = s && gTS && !ts && ehDescendente(s);
+    if (gCursorHidden && !ts && !mt && agora() - gLastHID > 0.3 &&
+        (type == kCGEventMouseMoved || type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown ||
+         type == kCGEventLeftMouseDragged || type == kCGEventScrollWheel))
+        dispatch_async(dispatch_get_main_queue(), ^{ cursorShow(); });   // the pointer comes back with the trackpad/mouse
     if (!s || !gTS) return e;
-    BOOL ts = s == gTS, mt = !ts && ehDescendente(s);
     if (!ts && !mt) return e;                       // trackpad, mouse, keyboard, synthetic: never touched
     double t = agora();
     if (t - gLastHID > 0.6 && t > gClaimUntil) return e;  // fail open when the touchscreen is idle
@@ -891,7 +926,8 @@ static void atualizarMenu(void) {
                     @[@"Edge swipes (right: Notifications, bottom: Mission Control)", @"edges"],
                     @[@"xe-toque handles 2–5 fingers (else macOS)", @"ownMulti"],
                     @[@"Magnifier (two-finger hold)", @"lupa"],
-                    @[@"Window buttons magnet (taps near close/minimize/zoom)", @"magnet"]];
+                    @[@"Window buttons magnet (taps near close/minimize/zoom)", @"magnet"],
+                    @[@"Hide the pointer while touching (trackpad brings it back)", @"hideCursor"]];
     for (NSArray *a in ts) add(m, a[0], @selector(alternar:), a[1], nil).state = opt(a[1]) ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:NSMenuItem.separatorItem];
     NSString *tt = [NSString stringWithFormat:@"Touch mode (larger UI, %ld pt wide)", (long)[ud integerForKey:@"touchWidth"]];
@@ -933,7 +969,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     // default xe-res: tools/build/xe-res, next to tools/xe-toque.app (docs/INSTALL.md step 6)
     NSString *xeResDef = [NSBundle.mainBundle.bundlePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"build/xe-res"];
     [ud registerDefaults:@{@"trail": @YES, @"ripple": @YES, @"scroll1": @YES, @"edges": @YES, @"ownMulti": @NO,
-                           @"lupa": @NO, @"magnet": @YES, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": xeResDef}];
+                           @"lupa": @NO, @"magnet": @YES, @"hideCursor": @YES, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": xeResDef}];
     gOwnMulti = opt(@"ownMulti");
     src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     rastros = [NSMutableArray array];

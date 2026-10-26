@@ -36,7 +36,9 @@ BIOS deixa sem o software térmico da Dell no Windows (`-ngreenpm` sozinho mant�
 Outros Alder Lake / Raptor Lake híbridos com esta pilha devem ter a mesma correção do turbo: adicione `-ngreenpm`
 para testar (o PL1 só muda com `ngreenpm=W`; escolha conforme a refrigeração) (**tenha uma EFI de reserva**; ele altera o XCPM e só aplica no macOS 26.7.1 25G241, onde o código foi
 conferido byte a byte). EPP: `ngreenpmepp=N` no boot (padrão 0, desempenho máximo) ou `sudo sysctl -w debug.xepm.epp=64`
-ao vivo. Estado: `sysctl debug.xepm`. Detalhes no [CHANGELOG.md](CHANGELOG.md).
+ao vivo. Estado: `sysctl debug.xepm`. A parte C8/C10 pode ser desligada ao vivo com `sudo sysctl -w debug.xepm.cst=0`
+(`=1` liga de novo) ou no boot com `ngreenpmcst=0`, enquanto um possível chiado de bobina (coil whine) parado é
+investigado. Detalhes no [CHANGELOG.md](CHANGELOG.md).
 
 ## Já tem instalado? Atualize
 
@@ -73,13 +75,14 @@ Detalhes: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
 | Decodificação de vídeo por hardware | ✅ **H.264 na GPU** (idêntico ao software) para apps que usam o VideoToolbox: QuickTime, Fotos, editores, conversões. Precisa de `-ngreengva` e do plugin VA corrigido (`macos/vadriver/build-vadriver.sh`, instalação manual por enquanto) · ✅ **HEVC** também (XE-GVAHEVC no NootedGreen) · ⚠️ o Safari decodifica na CPU: o processo GPU do WebKit não pode carregar drivers de `/Library/GPUBundles` · ⚠️ com `-ngreengva` conteúdo FairPlay (Apple Music, provavelmente Apple TV+) não toca: o plugin VA tenta a troca de chaves por hardware e falha com "ME not loaded" ([#11](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/11)); tire o boot-arg se precisar |
 | YouTube | ✅ Chrome com GPU, até 4K (VP9/AV1 decodificados na CPU) · ✅ Safari até 1080p H.264 (precisa de uma saída de áudio: os alto-falantes internos, Bluetooth ou o BlackHole virtual) |
 | Gravação de tela | ✅ |
-| Tela de toque | ✅ até 10 dedos pelo VoodooI2C; o `tools/xe-toque` acrescenta rolagem com um dedo, segurar = clique direito, gestos pela borda, caneta, lupa e modo toque |
+| Tela de toque | ✅ até 10 dedos pelo VoodooI2C; o `tools/xe-toque` acrescenta rolagem com um dedo, segurar = clique direito, gestos pela borda, caneta, lupa e modo toque, e esconde o ponteiro enquanto você toca (o trackpad traz de volta) |
 | Trackpad e teclado | ✅ trackpad e tela de toque por interrupção (sem os travamentos do polling) |
 | Brilho | ✅ `tools/xe-brilho` (o slider do macOS agora cobre toda a faixa do painel com `ngreenblmax=17777`) · ⚠️ as teclas de sol dependem de um estado do firmware da Dell que muda de um boot para outro; F6/F7 sempre funcionam pelo `xe-brilho daemon` |
 | Desligar / reiniciar | ✅ rápido (XE-IDLEBOUND; antes travava ~3 min e dava panic) |
 | Tela de boot | ✅ logo da Apple nítido desde o início, sem lixo na tela (OpenCore `Resolution=Max` + `gfxrst=1` + XE-BOOTHOLD) |
 | Alto-falantes internos | ✅ o nosso kext `AudShim` roda o firmware SOF da Intel no DSP de áudio, o SoundWire e os dois amplificadores RT1316; o `XeSpeakers` vira uma saída de som normal do macOS (volume, mudo). Limitado a −3 dB (AudShim 0.9.1), sem proteção dos alto-falantes · a AudShim 0.9.2 desliga o DSP depois de 30 s sem som (`audshimidleoffms=N`, 0 = nunca); o primeiro som depois disso demora ~1–2 s · ✅ microfones internos (RT714) como **"Microfone interno"** |
 | Wi-Fi, Bluetooth | ✅ Wi-Fi nativo (menu do macOS) com o AirportItlwm-Tahoe, sem HeliPort · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
+| Temperaturas da CPU | ✅ pacote, cada núcleo P e núcleo E, mais os watts do pacote/CPU/GPU, no app de barra de menus `tools/xe-temp` (lê o `debug.xepm.sensors` do NootedGreen, sem root; instalação no [INSTALL](docs/INSTALL.md#cpu-temperatures-xe-temp)) |
 | Vibração do trackpad | ✅ intensidade do clique com `tools/xe-haptic` / o controle `xe-hapticbar` na barra de menus · ❌ sem pulso sob demanda (resposta do Force Touch) |
 | Leitor de digitais | ✅ para o `sudo` (Goodix 27C6:63BC via libfprint, módulo PAM no `sudo_local`; `tools/fingerprint`) · ❌ login, desbloqueio da tela e Touch ID (sem Secure Enclave) |
 | Botão liga/desliga | ✅ um aperto curto bloqueia a tela (`tools/xe-pblock`) |

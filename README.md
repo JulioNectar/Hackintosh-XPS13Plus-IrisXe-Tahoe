@@ -36,7 +36,9 @@ Other Alder Lake / Raptor Lake hybrid machines on this stack should see the same
 (PL1 is only changed with `ngreenpm=W`; pick it for your cooling)
 (**keep a backup EFI**; it patches XCPM and only applies on macOS 26.7.1 25G241, where the code was checked byte for
 byte). EPP: `ngreenpmepp=N` at boot (default 0, max performance) or `sudo sysctl -w debug.xepm.epp=64` live.
-Status: `sysctl debug.xepm`. Details in [CHANGELOG.md](CHANGELOG.md).
+Status: `sysctl debug.xepm`. The C8/C10 part can be switched off live with `sudo sysctl -w debug.xepm.cst=0` (`=1`
+turns it back on) or at boot with `ngreenpmcst=0`, while a possible coil whine at idle is being investigated.
+Details in [CHANGELOG.md](CHANGELOG.md).
 
 ## Already installed? Update
 
@@ -77,13 +79,14 @@ entry. Details: [docs/INSTALL.md](docs/INSTALL.md#updating-an-existing-install).
 | Hardware video decode | ✅ **H.264 on the GPU** (bit-exact vs. software) for apps that use VideoToolbox: QuickTime, Photos, video editors, conversions. Needs `-ngreengva` and the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed by hand for now) · ✅ **HEVC** too (NootedGreen XE-GVAHEVC) · ⚠️ Safari decodes on the CPU: its WebKit GPU process may not load drivers from `/Library/GPUBundles` · ⚠️ with `-ngreengva` FairPlay content (Apple Music, probably Apple TV+) does not play: the VA plugin takes the hardware key-exchange path and fails with "ME not loaded" ([#11](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/11)); remove the boot-arg if you need it |
 | YouTube | ✅ Chrome with GPU compositing, up to 4K (VP9/AV1 decoded on the CPU) · ✅ Safari up to 1080p H.264 (needs an audio output: the internal speakers, Bluetooth, or the BlackHole virtual device) |
 | Screen recording | ✅ |
-| Touchscreen | ✅ up to 10 fingers via VoodooI2C; `tools/xe-toque` adds one-finger scroll, hold-for-right-click, edge swipes, pen, magnifier and a touch mode |
+| Touchscreen | ✅ up to 10 fingers via VoodooI2C; `tools/xe-toque` adds one-finger scroll, hold-for-right-click, edge swipes, pen, magnifier and a touch mode, and hides the pointer while you touch (the trackpad brings it back) |
 | Trackpad, keyboard | ✅ trackpad and touchscreen on GPIO/APIC interrupts (no polling freezes) |
 | Brightness | ✅ `tools/xe-brilho` (the macOS slider now covers the full panel range with `ngreenblmax=17777`) · ⚠️ the sun keys depend on a Dell firmware state that changes from boot to boot; F6/F7 always work through `xe-brilho daemon` |
 | Shutdown / restart | ✅ fast (XE-IDLEBOUND; used to stall ~3 min and panic) |
 | Boot screen | ✅ sharp Apple logo from the first frame, no garbage flash (OpenCore `Resolution=Max` + `gfxrst=1` + XE-BOOTHOLD) |
 | Internal speakers | ✅ our own `AudShim` kext runs Intel's SOF firmware on the audio DSP, SoundWire and both RT1316 amplifiers; `XeSpeakers` makes them a normal macOS output (volume, mute). Capped at −3 dB (AudShim 0.9.1), no speaker protection · AudShim 0.9.2 powers the DSP down after 30 s of silence (`audshimidleoffms=N`, 0 = never); the first sound after that takes ~1–2 s · ✅ internal microphones (RT714) as **"Microfone interno"** |
 | Wi-Fi, Bluetooth | ✅ native Wi-Fi menu via AirportItlwm-Tahoe (no HeliPort) · ❌ AirDrop/AWDL · ✅ Bluetooth (IntelBluetoothFirmware) |
+| CPU temperatures | ✅ package, every P-core and E-core, plus package/CPU/GPU watts, in the `tools/xe-temp` menu-bar app (reads NootedGreen's `debug.xepm.sensors`, no root; install in [INSTALL](docs/INSTALL.md#cpu-temperatures-xe-temp)) |
 | Touchpad haptics | ✅ click-vibration strength with `tools/xe-haptic` / the `xe-hapticbar` menu-bar slider · ❌ no on-demand pulse (Force Touch feedback) |
 | Fingerprint reader | ✅ for `sudo` (Goodix 27C6:63BC via libfprint, PAM module in `sudo_local`; `tools/fingerprint`) · ❌ login, screen unlock and Touch ID prompts (no Secure Enclave) |
 | Power button | ✅ a short press locks the screen (`tools/xe-pblock`) |
@@ -115,7 +118,7 @@ tools/                   xe-res (resolution/DPI), xe-brilho (brightness), xe-per
                          XeShim + xectl (register access), diagnostics/ (the test programs used to find bugs),
                          AudShim + audctl + XeSpeakers + audio/ (internal speakers), sleep/ (pmset + lid agent),
                          xe-haptic + xe-hapticbar (touchpad vibration), fingerprint/ (fingerprint for sudo: libfprint patch,
-                         xe-fp, PAM module), xe-pblock/ (power button locks the screen)
+                         xe-fp, PAM module), xe-pblock/ (power button locks the screen), xe-temp/ (menu-bar CPU temperature)
 docs/                    install guide, patch catalogs, status, debugging notes
 ```
 

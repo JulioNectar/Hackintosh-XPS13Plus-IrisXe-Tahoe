@@ -167,6 +167,8 @@ A hand icon in the menu bar holds the toggles (saved in `defaults read local.xe.
   *Clear drawing* wipes it), **Touch mode** (switches to a 1152-pt-wide HiDPI mode with `xe-res` and back
   to the previous mode). It uses `build/xe-res` next to the app (`tools/build/xe-res`, see step 6); if you moved the app,
   point it at the tool with `defaults write local.xe.toque xeRes /path/to/xe-res`.
+- **Hide the pointer while touching** (on by default): a touch on the screen hides the pointer; the first trackpad or
+  mouse move, click, drag or scroll shows it again.
 - Log: `~/Library/Logs/xe-toque/xe-toque.log`. Diagnostic: `xe-toque.app/Contents/MacOS/xe-toque --probe-events`.
 
 ## Internal speakers and microphones
@@ -287,6 +289,19 @@ The haptic touchpad clicks by itself; macOS can only change how strong the vibra
 `xe-haptic list` (read-only dump) or `xe-haptic set 60 100`. The value is lost at reboot. For a persistent setting,
 `zsh tools/build-xe-hapticbar.sh` and `open tools/xe-hapticbar.app` (add it to Login Items): a hand icon in the menu bar
 with a slider, applied at login and on every change.
+
+## CPU temperatures (xe-temp)
+
+macOS shows no CPU temperature on this machine (SMCProcessor finds nothing). NootedGreen exposes the sensors as
+`sysctl debug.xepm.sensors` on every boot, and `tools/xe-temp` shows them: the package temperature in the menu bar and,
+in its panel, a 3-minute graph, package/CPU/GPU watts, every P-core and E-core and the battery. No root needed:
+
+```sh
+zsh tools/xe-temp/build.sh && cp -R tools/build/xe-temp.app ~/Applications/
+open ~/Applications/xe-temp.app
+```
+
+Add it in System Settings › General › Login Items to start it at login.
 
 ## Fingerprint for sudo (optional)
 
