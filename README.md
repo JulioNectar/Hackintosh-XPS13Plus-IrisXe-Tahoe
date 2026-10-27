@@ -32,6 +32,8 @@ Dell's Windows thermal software (`-ngreenpm` alone keeps the BIOS PL1). Measured
 | One-thread clock | 3.3–3.8 GHz | 4.3–4.85 GHz |
 | Idle package power | ~4.6 W | ~3.3 W |
 
+Confirmed on a second machine: Dell Latitude 7430, i5-1245U (2P+8E), Geekbench 6 single-core 1370 → **1832 (+34 %)**,
+multi-core 4142 → 4550, idle package 6.2 → ~5.4 W ([#9](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/9)).
 Other Alder Lake / Raptor Lake hybrid machines on this stack should see the same turbo fix; add `-ngreenpm` to try it
 (PL1 is only changed with `ngreenpm=W`; pick it for your cooling)
 (**keep a backup EFI**; it patches XCPM and only applies on macOS 26.7.1 25G241, where the code was checked byte for

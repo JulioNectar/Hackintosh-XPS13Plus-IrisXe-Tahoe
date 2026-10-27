@@ -33,6 +33,8 @@ BIOS deixa sem o software térmico da Dell no Windows (`-ngreenpm` sozinho mant�
 | Frequência com 1 thread | 3,3–3,8 GHz | 4,3–4,85 GHz |
 | Consumo do pacote parado | ~4,6 W | ~3,3 W |
 
+Confirmado numa segunda máquina: Dell Latitude 7430, i5-1245U (2P+8E), Geekbench 6 single-core 1370 → **1832 (+34 %)**,
+multi-core 4142 → 4550, consumo parado 6,2 → ~5,4 W ([#9](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/issues/9)).
 Outros Alder Lake / Raptor Lake híbridos com esta pilha devem ter a mesma correção do turbo: adicione `-ngreenpm`
 para testar (o PL1 só muda com `ngreenpm=W`; escolha conforme a refrigeração) (**tenha uma EFI de reserva**; ele altera o XCPM e só aplica no macOS 26.7.1 25G241, onde o código foi
 conferido byte a byte). EPP: `ngreenpmepp=N` no boot (padrão 0, desempenho máximo) ou `sudo sysctl -w debug.xepm.epp=64`
