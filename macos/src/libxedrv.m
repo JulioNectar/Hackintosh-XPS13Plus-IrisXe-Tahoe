@@ -1,4 +1,4 @@
-// libxedrv v19 — injetado no driver Metal TGL 16.0.32 (LC_LOAD_DYLIB). Adapta o driver (era Big Sur) ao Metal do Tahoe 25G241. v16: escritas em buffer pelo caminho 3D (ver "v16"). v17: stencil fora do bloco de 64 KB de outro render target (ver "v17"). v19: mipmaps das texturas zero-copy (ver "v19").
+// libxedrv v20 — injetado no driver Metal TGL 16.0.32 (LC_LOAD_DYLIB). Adapta o driver (era Big Sur) ao Metal do Tahoe 25G241. v16: escritas em buffer pelo caminho 3D (ver "v16"). v17: stencil fora do bloco de 64 KB de outro render target (ver "v17"). v19: mipmaps das texturas zero-copy (ver "v19"). v20: o registrador de crash não toma o lugar dos sinais que o programa já trata (JVM, #20).
 // Mudanças em relação à v7 (xe/build/llvm-bridge/xedrv.m), comparando com o adaptador do IntelIGPU-Tahoe (25G83) e com o layout medido:
 //  1. _descriptorPrivate: o deslocamento de 0x10 começa em 0xa8 (o driver antigo também tem shaderValidation em 0xa0; a v7 punha
 //     textureWriteRoundingMode ali). Layout antigo lido da codificação de tipo do próprio driver:
@@ -285,12 +285,20 @@ static void crash_handler(int sig, siginfo_t* si, void* uc_) {
   signal(sig, SIG_DFL);
   if (sig == SIGABRT) raise(sig);   // nos outros, retornar refaz a instrução e o processo morre com o sinal original
 }
+// Only for signals the host process does not handle itself: runtimes such as the JVM use SIGSEGV/SIGBUS on purpose
+// (safepoint polls, implicit null checks) and install their handlers before AppKit loads this driver. Replacing
+// them turned those expected faults into crashes (IntelliJ "Bus error: 10", issue #20).
 static void install_crash(void) {
   struct sigaction sa; memset(&sa, 0, sizeof sa);
   sa.sa_sigaction = crash_handler; sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
   sigemptyset(&sa.sa_mask);
   int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGABRT};
-  for (unsigned i = 0; i < 4; i++) sigaction(sigs[i], &sa, NULL);
+  for (unsigned i = 0; i < 4; i++) {
+    struct sigaction old;
+    if (sigaction(sigs[i], NULL, &old) != 0) continue;
+    if ((old.sa_flags & SA_SIGINFO) || old.sa_handler != SIG_DFL) continue;   // the process has its own handler: leave it
+    sigaction(sigs[i], &sa, NULL);
+  }
 }
 
 // v12 (19/10): sem compressão de textura. O hang do RCS era um render-target FAST CLEAR (3DSTATE_PS com
