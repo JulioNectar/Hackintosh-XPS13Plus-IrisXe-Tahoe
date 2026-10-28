@@ -705,6 +705,20 @@ static NSMutableArray<NSNumber *> *tileColOf, *tileRowOf;         // cell of eac
 static NSMutableDictionary<NSNumber *, NSValue *> *tileLast;      // frame each window had after our last pass
 // (apps round their own size, e.g. Terminal to its character grid, so the cell itself is not a reliable reference)
 
+// A dock that replaces the macOS one hides the real Dock, so visibleFrame no longer leaves room for it. Such a dock can
+// announce its frame (Cocoa coordinates) with the distributed notification "local.xe.dock.frame" {x,y,w,h,hidden} and
+// keep the current one in the preferences domain local.xe.dock, key "frame" (absent = no such dock on screen).
+static double gDockTop;   // Cocoa y of the top of that dock, 0 = none / hidden
+static void dockOuvir(void) {
+    CFPreferencesAppSynchronize(CFSTR("local.xe.dock"));
+    NSString *fr = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("frame"), CFSTR("local.xe.dock")));
+    if ([fr isKindOfClass:NSString.class]) { NSRect r = NSRectFromString(fr); if (r.size.height > 0) gDockTop = NSMaxY(r); }
+    [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"local.xe.dock.frame" object:nil queue:NSOperationQueue.mainQueue
+                                                           usingBlock:^(NSNotification *n) {
+        NSDictionary *u = n.userInfo;
+        gDockTop = [u[@"hidden"] boolValue] || [u[@"h"] doubleValue] <= 0 ? 0 : [u[@"y"] doubleValue] + [u[@"h"] doubleValue];
+    }];
+}
 static CGRect tileArea(void) {   // the built-in screen minus the menu bar and the Dock (visibleFrame), with a margin
     const double gap = 8;
     CGRect v = CGRectMake(CGRectGetMinX(B), CGRectGetMinY(B) + 30, B.size.width, B.size.height - 30);
@@ -712,16 +726,10 @@ static CGRect tileArea(void) {   // the built-in screen minus the menu bar and t
     for (NSScreen *sc in NSScreen.screens) {
         NSRect f = sc.frame, vf = sc.visibleFrame;
         if (fabs(f.origin.x - CGRectGetMinX(B)) > 1 || fabs(f.size.width - B.size.width) > 1) continue;
-        v = CGRectMake(vf.origin.x, H - (vf.origin.y + vf.size.height), vf.size.width, vf.size.height);
+        double bottom = vf.origin.y;
+        if (gDockTop > 0) bottom = MAX(bottom, gDockTop + 14);   // our dock + room for the windows' shadows above it
+        v = CGRectMake(vf.origin.x, H - (vf.origin.y + vf.size.height), vf.size.width, vf.origin.y + vf.size.height - bottom);
         break;
-    }
-    // SwipeSwitcher's new Dock hides the system one, so visibleFrame no longer leaves room for it: use its frame
-    NSUserDefaults *ss = [[NSUserDefaults alloc] initWithSuiteName:@"local.swipeswitcher"];
-    NSString *nd = [ss boolForKey:@"newDock"] ? [ss stringForKey:@"newDockFrame"] : nil;
-    if (nd.length) {
-        NSRect d = NSRectFromString(nd);   // Cocoa coordinates
-        double topCG = H - NSMaxY(d);
-        if (d.size.height > 0 && topCG < CGRectGetMaxY(v)) v.size.height = topCG - v.origin.y;
     }
     return CGRectInset(v, gap, gap);
 }
@@ -794,6 +802,14 @@ static NSArray<NSNumber *> *tileVisiveis(void) {
 }
 static void tileTick(void) {
     if (mesaAMostra()) return;   // Show Desktop moves every window off screen: leave them alone
+    static double topVisto = -1;   // the dock moved/resized/hid: lay the grid out again in the new area
+    if (gDockTop != topVisto && tileIds.count) {
+        topVisto = gDockTop;
+        for (NSUInteger i = 0; i < tileIds.count; i++) tilePor(i);
+        tileLembrar(nil);
+        return;
+    }
+    topVisto = gDockTop;
     NSArray<NSNumber *> *vis = tileVisiveis();
     NSSet *agora_ = [NSSet setWithArray:vis];
     BOOL mudou = ![agora_ isEqualToSet:[NSSet setWithArray:tileIds]];
@@ -1478,6 +1494,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     if (!AXIsProcessTrusted()) AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge id)kAXTrustedCheckOptionPrompt: @YES});
 
     lerIDs();
+    dockOuvir();
     threadTap();
 
     IOHIDManagerRef m = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);

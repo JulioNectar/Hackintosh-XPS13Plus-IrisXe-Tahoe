@@ -180,7 +180,9 @@ A hand icon in the menu bar holds the toggles (saved in `defaults read local.xe.
   windows of the built-in screen are kept in a grid (1 full, 2 halves, 3 = one tall + two, 4 quarters, then columns ×
   rows, up to 12) inside the area between the menu bar and the Dock. New windows join, closed/minimized ones leave,
   resizing one moves the shared edge so the neighbours follow, and dropping a window dragged by its title bar onto
-  another cell swaps them.
+  another cell swaps them. A dock that replaces the macOS one (the real Dock hidden) is respected if it publishes its
+  frame: distributed notification `local.xe.dock.frame` {x, y, w, h, hidden} and preferences domain `local.xe.dock`,
+  key `frame` (Cocoa coordinates); windows then stop 14 pt above it, so their shadows don't fall behind it.
 - **Dragging with the desktop shown** (on by default): when Show Desktop is active (windows pushed to the edges), a
   one-finger drag is taken over by xe-toque, and a second finger brings the windows back without dropping what you
   carry, so you can drop a desktop file into a window.
