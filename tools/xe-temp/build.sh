@@ -14,8 +14,10 @@ cat > $OUT/Contents/Info.plist <<EOP
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>1.0</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSUIElement</key><true/>
 </dict></plist>
 EOP
-codesign -f -s - $OUT >/dev/null 2>&1 || true
+mkdir -p $OUT/Contents/Resources && cp $D/../icons/xe-temp.icns $OUT/Contents/Resources/AppIcon.icns
+codesign -f -s - -r='designated => identifier "local.xe.temp"' $OUT >/dev/null 2>&1 || true
 echo "built $OUT"

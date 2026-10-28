@@ -152,24 +152,58 @@ A hand icon in the menu bar holds the toggles (saved in `defaults read local.xe.
 - **One-finger scroll**: drag scrolls with momentum, tap clicks (double-tap works), hold 0.5 s = right click,
   hold then drag = left drag/selection. VoodooI2C's own pointer events for the touch are filtered out (CGEvent field 87 =
   sender registry ID of the touchscreen driver); the trackpad and mouse are never filtered.
-- **Window buttons magnet** (on by default; needs One-finger scroll, since it acts on xe-toque's own taps): a tap within
-  22 pt of a window's close / minimize / zoom button, inside the window's top 52 pt, presses the nearest of those buttons
+- **Window buttons magnet** (on by default): a tap within 36 pt of a window's close / minimize / zoom button, inside the
+  window's top 60 pt, presses the nearest of those buttons. With One-finger scroll off, a touch that lands near the
+  buttons is held back from macOS and decided on release (a drag there is replayed as a normal drag). It
   (Accessibility AXPress, falling back to a click at its centre) and flashes a blue ring on it. Not applied to taps that
   land on another control (toolbar button, tab, text field…), to full-screen windows, or to the trackpad/mouse. Each
   redirect is logged (`magnet: tap … -> close of …`). Check a point without clicking:
   `xe-toque.app/Contents/MacOS/xe-toque --test-magnet X Y` (global points, top-left origin).
 - **Edge swipes**: in from the right edge = Notification Center (presses the menu-bar clock via Accessibility),
   up from the bottom edge = Mission Control.
-- Two-, three- and four-finger gestures on the screen already reach macOS as trackpad gestures (VoodooI2C feeds them to an
-  emulated Magic Trackpad), so they follow System Settings › Trackpad. With **xe-toque handles 2–5 fingers** on,
+- Two- and three-finger gestures on the screen already reach macOS as trackpad gestures (VoodooI2C feeds them to an
+  emulated Magic Trackpad), so they follow System Settings › Trackpad (four and five fingers are xe-toque's, see below). With **xe-toque handles 2–5 fingers** on,
   xe-toque replaces them: 2 = scroll, 3 sideways = switch Space (ctrl+←/→), 5-finger pinch = Apps.
 - **Trail** / **Ripple** visual feedback, **Magnifier** (two-finger hold), **Pen mode** (draw on screen; Esc exits,
   *Clear drawing* wipes it), **Touch mode** (switches to a 1152-pt-wide HiDPI mode with `xe-res` and back
   to the previous mode). It uses `build/xe-res` next to the app (`tools/build/xe-res`, see step 6); if you moved the app,
   point it at the tool with `defaults write local.xe.toque xeRes /path/to/xe-res`.
+- **Lasso selection in Finder** (on by default): a one-finger drag that starts on empty space of the desktop or a Finder
+  window (icon or list view) draws a free-form lasso instead of the rectangle; on release the icons/rows inside it are
+  selected (Accessibility `AXSelectedChildren` / `AXSelectedRows`).
+- **Pinch out on a Finder file** (on by default): two fingers on a file, spread = Quick Look, pinch back in = close it.
+  Two fingers that move together still scroll.
+- **Four fingers on a window** (on by default): move it, spread/pinch to resize it (Accessibility position/size, ~40
+  updates per second). Four-finger touches are held back from macOS while you do it, so macOS's own four-finger Show
+  Desktop no longer fires. Option: let windows go past the screen edges (on) or keep them on screen.
+- **Five fingers**: spread = Show Desktop, pinch = Apps. **Five-finger double tap = tile mode on/off**: the visible
+  windows of the built-in screen are kept in a grid (1 full, 2 halves, 3 = one tall + two, 4 quarters, then columns ×
+  rows, up to 12) inside the area between the menu bar and the Dock. New windows join, closed/minimized ones leave,
+  resizing one moves the shared edge so the neighbours follow, and dropping a window dragged by its title bar onto
+  another cell swaps them.
+- **Dragging with the desktop shown** (on by default): when Show Desktop is active (windows pushed to the edges), a
+  one-finger drag is taken over by xe-toque, and a second finger brings the windows back without dropping what you
+  carry, so you can drop a desktop file into a window.
 - **Hide the pointer while touching** (on by default): a touch on the screen hides the pointer; the first trackpad or
   mouse move, click, drag or scroll shows it again.
 - Log: `~/Library/Logs/xe-toque/xe-toque.log`. Diagnostic: `xe-toque.app/Contents/MacOS/xe-toque --probe-events`.
+
+## Vulkan (MoltenVK, optional)
+
+Vulkan runs on top of the accelerated Metal driver through **MoltenVK** (Khronos/LunarG). Install the official
+[Vulkan SDK for macOS](https://vulkan.lunarg.com/sdk/home#mac) (notarized by LunarG; the core component is enough and
+it can live in your home folder, e.g. `~/VulkanSDK/<version>`, no sudo). Then:
+
+```sh
+source ~/VulkanSDK/<version>/setup-env.sh
+export VK_DRIVER_FILES=$VULKAN_SDK/share/vulkan/icd.d/MoltenVK_icd.json   # skip the arm64-only KosmicKrisp ICD
+vulkaninfo --summary            # GPU0: Intel(R) TGL, 0x9a49, driverName MoltenVK, Vulkan 1.4
+open ~/VulkanSDK/<version>/Applications/vkcube.app
+```
+
+Apps and games that bundle MoltenVK need nothing else. There is no geometry shader and no 64-bit float in shaders
+(Metal has neither). OpenGL stays software-only (see the README); OpenGL over Vulkan (Mesa Zink) would need a Mesa
+build and a window bridge and has not been done.
 
 ## Internal speakers and microphones
 

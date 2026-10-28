@@ -44,7 +44,7 @@ static CGEventSourceRef src;
 
 // shared with the event-tap thread
 static volatile double gLastHID = -10, gClaimUntil = 0;
-static volatile int gClaim, gDropMoves, gPen, gOwnMulti, gTapOK;
+static volatile int gClaim, gDropMoves, gPen, gOwnMulti, gTapOK, gWin3, gPinchQL, gMt4;   // gMt4: 4+ fingers, macOS gestures held back
 static volatile uint64_t gTS;           // touchscreen driver registry ID
 static volatile uint64_t gTSDesc[64];   // its registry descendants (emulated multitouch device etc.)
 static volatile int gNTSDesc;
@@ -158,6 +158,23 @@ static void centralNotificacoes(void) {
     });
 }
 static void missionControl(void) { abrirApp(@[@"/System/Applications/Mission Control.app"]); }
+extern void CoreDockSendNotification(CFStringRef, void *);
+// "Show Desktop" (clicking the wallpaper, F11) moves every window almost entirely off screen; the same Dock
+// notification toggles it back.
+static BOOL mesaAMostra(void) {
+    NSArray *ws = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    int pid = getpid(), vistas = 0;
+    for (NSDictionary *w in ws) {
+        if ([w[(id)kCGWindowLayer] intValue] != 0 || [w[(id)kCGWindowOwnerPID] intValue] == pid) continue;
+        CGRect r;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(id)kCGWindowBounds], &r) || r.size.width < 100 || r.size.height < 100) continue;
+        CGRect i = CGRectIntersection(r, B);
+        if (!CGRectIsNull(i) && i.size.width * i.size.height > 0.15 * r.size.width * r.size.height) return NO;
+        vistas++;
+    }
+    return vistas > 0;
+}
+static void mesaAlternar(void) { CoreDockSendNotification(CFSTR("com.apple.showdesktop.awake"), NULL); }
 static void appsLaunchpad(void) { abrirApp(@[@"/System/Applications/Apps.app", @"/System/Applications/Launchpad.app"]); }
 static void trocarEspaco(int dir) {  // +1 = Space to the right (ctrl+→), -1 = left
     tecla(dir > 0 ? 124 : 123, kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad);
@@ -168,6 +185,7 @@ static void trocarEspaco(int dir) {  // +1 = Space to the right (ctrl+→), -1 =
 static NSMutableArray<NSBezierPath *> *tracos;            // pen strokes
 static NSMutableDictionary<NSNumber *, NSBezierPath *> *tracoAtual;
 static BOOL lupaOn; static CGPoint lupaC; static CGImageRef lupaImg;
+static NSMutableData *lassoPts;   // lasso points, global coordinates (see the lasso section)
 
 static CGPoint local(CGPoint g) { return CGPointMake(g.x - B.origin.x, g.y - B.origin.y); }
 static void onda(CGPoint g, int tipo) {
@@ -221,6 +239,18 @@ static void onda(CGPoint g, int tipo) {
         [[c colorWithAlphaComponent:0.8 * (1 - a)] setStroke]; [b stroke];
     }
     ondas.length = k * sizeof(Onda);
+    // lasso
+    if (lassoPts.length >= 2 * sizeof(CGPoint)) {
+        const CGPoint *v = lassoPts.bytes; NSUInteger m = lassoPts.length / sizeof(CGPoint);
+        NSBezierPath *b = [NSBezierPath bezierPath];
+        [b moveToPoint:local(v[0])];
+        for (NSUInteger i = 1; i < m; i++) [b lineToPoint:local(v[i])];
+        [b closePath];
+        [[NSColor.systemBlueColor colorWithAlphaComponent:0.12] setFill]; [b fill];
+        CGFloat dash[2] = {7, 5}; [b setLineDash:dash count:2 phase:fmod(t * 30, 12)];
+        b.lineWidth = 2.5; b.lineJoinStyle = NSLineJoinStyleRound;
+        [[NSColor.systemBlueColor colorWithAlphaComponent:0.9] setStroke]; [b stroke];
+    }
     // pen
     if (gPen || tracos.count) {
         [[NSColor.systemRedColor colorWithAlphaComponent:0.9] setStroke];
@@ -305,7 +335,7 @@ static void lupaEsconder(void) {
 
 // ---------------------------------------------------------------- gesture engine
 
-enum { IDLE, PEND, SCROLL, HOLD, DRAG, EDGER, EDGEB, NATIVE, MULTI, DONE };
+enum { IDLE, PEND, SCROLL, HOLD, DRAG, EDGER, EDGEB, NATIVE, MULTI, DONE, LASSO };
 static int est = IDLE, maxN;
 static CGPoint p0, pUlt;
 static double t0g;
@@ -368,8 +398,8 @@ static void cliqueDireito(CGPoint p) {
 // A touchscreen tap within IMA_R pt of a window's close / minimize / zoom button (and inside the window's top IMA_BAND pt)
 // presses the nearest of those buttons (AXPress, fallback: click at its centre). Lookup runs off the main thread.
 
-#define IMA_R 22.0
-#define IMA_BAND 52.0
+#define IMA_R 36.0
+#define IMA_BAND 60.0
 
 typedef struct { BOOL ok; CGPoint centro; CGRect frame; AXUIElementRef botao; NSString *nome, *janela, *motivo, *hit; pid_t pid; } Ima;
 
@@ -507,22 +537,398 @@ static double espalhamento(Contato *c, int n, CGPoint m) {
     double s = 0; for (int i = 0; i < n; i++) s += dist(c[i].p, m); return n ? s / n : 0;
 }
 
+static BOOL qlVisto, qlAberto, gImaPend;   // gImaPend: one-finger scroll off, but this touch belongs to the magnet   // per two-finger gesture: Finder item checked / Quick Look opened by us
 static void entrarMulti(Contato *c, int n, CGPoint m, double t) {
     est = MULTI; mN = n; mC0 = m; mS0 = espalhamento(c, n, m); mT0 = t; mScroll = NO; mFired = NO; pUlt = m; nam = 0;
-    gDropMoves = 1;
+    gDropMoves = 1; qlVisto = NO; qlAberto = NO;
 }
 
+// ---------------------------------------------------------------- lasso (Finder desktop / Finder windows)
+// Press-and-hold then drag that starts on empty space of the desktop or a Finder window draws a free-form lasso
+// instead of the app's rectangle; on release the icons (icon view, desktop) or rows (list view) whose centre is inside
+// the lasso are selected through Accessibility (AXSelectedChildren / AXSelectedRows). Anywhere else: normal drag.
+static AXUIElementRef lassoCont;          // container to select in
+static int lassoKind;                     // 1 AXSelectedChildren, 2 AXSelectedRows
+static NSString *lxStr(AXUIElementRef e, CFStringRef a) {
+    CFTypeRef v = NULL; if (AXUIElementCopyAttributeValue(e, a, &v) || !v) return @""; NSString *s = [(__bridge id)v description]; CFRelease(v); return s;
+}
+static BOOL axHas(AXUIElementRef e, NSString *attr) {
+    CFArrayRef n = NULL; if (AXUIElementCopyAttributeNames(e, &n) || !n) return NO;
+    BOOL r = [(__bridge NSArray *)n containsObject:attr]; CFRelease(n); return r;
+}
+static CGRect lxFrame(AXUIElementRef e) {
+    CFTypeRef pv = NULL, sv = NULL; CGPoint p = CGPointZero; CGSize z = CGSizeZero;
+    if (!AXUIElementCopyAttributeValue(e, kAXPositionAttribute, &pv) && pv) { AXValueGetValue(pv, kAXValueCGPointType, &p); CFRelease(pv); }
+    if (!AXUIElementCopyAttributeValue(e, kAXSizeAttribute, &sv) && sv) { AXValueGetValue(sv, kAXValueCGSizeType, &z); CFRelease(sv); }
+    return (CGRect){p, z};
+}
+// The touch point is a lasso start if the element under it is a Finder selection container itself (empty space),
+// not one of its items.
+static BOOL lassoInicio(CGPoint g) {
+    if (!opt(@"lasso")) return NO;
+    static AXUIElementRef sys; if (!sys) sys = AXUIElementCreateSystemWide();
+    AXUIElementRef e = NULL;
+    if (AXUIElementCopyElementAtPosition(sys, g.x, g.y, &e) || !e) return NO;
+    pid_t pid = 0; AXUIElementGetPid(e, &pid);
+    NSRunningApplication *a = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    static int nlog = 0;
+    if (nlog++ < 30) xlog(@"lasso: hit at %.0f,%.0f -> %@ role %@ (pid %d)", g.x, g.y, a.bundleIdentifier, lxStr(e, kAXRoleAttribute), pid);
+    BOOL ok = NO;
+    if ([a.bundleIdentifier isEqual:@"com.apple.finder"]) {
+        NSString *role = lxStr(e, kAXRoleAttribute);
+        if (([role isEqual:@"AXGroup"] || [role isEqual:@"AXList"]) && axHas(e, @"AXSelectedChildren")) { ok = YES; lassoKind = 1; }
+        else if ([role isEqual:@"AXOutline"] && axHas(e, @"AXSelectedRows")) { ok = YES; lassoKind = 2; }
+        else if ([role isEqual:@"AXScrollArea"]) {   // empty space of the desktop / an icon view: use its selectable child
+            CFArrayRef k = NULL;
+            if (!AXUIElementCopyAttributeValue(e, kAXChildrenAttribute, (CFTypeRef *)&k) && k) {
+                for (id c in (__bridge NSArray *)k) {
+                    AXUIElementRef ce = (__bridge AXUIElementRef)c;
+                    if (axHas(ce, @"AXSelectedChildren")) { CFRelease(e); e = (AXUIElementRef)CFRetain(ce); ok = YES; lassoKind = 1; break; }
+                    if (axHas(ce, @"AXSelectedRows")) { CFRelease(e); e = (AXUIElementRef)CFRetain(ce); ok = YES; lassoKind = 2; break; }
+                }
+                CFRelease(k);
+            }
+        }
+    }
+    if (!ok) { CFRelease(e); return NO; }
+    if (lassoCont) CFRelease(lassoCont);
+    lassoCont = e;
+    if (!lassoPts) lassoPts = [NSMutableData data];
+    lassoPts.length = 0;
+    return YES;
+}
+static BOOL dentro(CGPoint q, const CGPoint *v, NSUInteger n) {   // even-odd ray casting
+    BOOL in = NO;
+    for (NSUInteger i = 0, j = n - 1; i < n; j = i++)
+        if (((v[i].y > q.y) != (v[j].y > q.y)) && (q.x < (v[j].x - v[i].x) * (q.y - v[i].y) / (v[j].y - v[i].y) + v[i].x)) in = !in;
+    return in;
+}
+static void lassoFim(void) {
+    NSUInteger n = lassoPts.length / sizeof(CGPoint);
+    const CGPoint *v = lassoPts.bytes;
+    if (lassoCont && n >= 3) {
+        CFStringRef itemsAttr = lassoKind == 2 ? kAXRowsAttribute : kAXChildrenAttribute;
+        CFArrayRef k = NULL;
+        if (!AXUIElementCopyAttributeValue(lassoCont, itemsAttr, (CFTypeRef *)&k) && k) {
+            NSMutableArray *sel = [NSMutableArray array], *itens = [NSMutableArray array];
+            for (id c in (__bridge NSArray *)k) {   // icon view: list -> AXSectionList -> items; flatten the sections
+                if (lassoKind == 1 && [lxStr((__bridge AXUIElementRef)c, kAXRoleAttribute) isEqual:@"AXList"]) {
+                    CFArrayRef g = NULL;
+                    if (!AXUIElementCopyAttributeValue((__bridge AXUIElementRef)c, kAXChildrenAttribute, (CFTypeRef *)&g) && g) {
+                        [itens addObjectsFromArray:(__bridge NSArray *)g]; CFRelease(g);
+                    }
+                } else [itens addObject:c];
+            }
+            for (id c in itens) {
+                CGRect f = lxFrame((__bridge AXUIElementRef)c);
+                if (f.size.width <= 0) continue;
+                CGPoint ctr = CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f));
+                if (lassoKind == 2) ctr.x = MIN(CGRectGetMidX(f), f.origin.x + 120);   // rows: the name column, not the row centre
+                if (dentro(ctr, v, n)) [sel addObject:c];
+            }
+            AXError err = AXUIElementSetAttributeValue(lassoCont, lassoKind == 2 ? kAXSelectedRowsAttribute : CFSTR("AXSelectedChildren"),
+                                                       (__bridge CFArrayRef)sel);
+            xlog(@"lasso: %lu points, %lu items selected (err %d)", (unsigned long)n, (unsigned long)sel.count, err);
+            CFRelease(k);
+        }
+    }
+    lassoPts.length = 0;
+    if (lassoCont) { CFRelease(lassoCont); lassoCont = NULL; }
+    tela.needsDisplay = YES;
+}
+
+// ---------------------------------------------------------------- four-finger window move / resize
+// Four fingers on a window: moving them moves the window, spreading / pinching scales it (aspect kept, centre
+// follows the fingers). Accessibility kAXPosition / kAXSize on the window under the fingers; macOS does not see these
+// four-finger touches while a window is held. Touchscreen only (the trackpad's gestures are untouched).
+static AXUIElementRef w3Win;
+static CGRect w3F0; static double w3T;
+static BOOL w3Inicio(CGPoint g) {
+    if (!opt(@"win3")) return NO;
+    static AXUIElementRef sys; if (!sys) sys = AXUIElementCreateSystemWide();
+    AXUIElementRef e = NULL, w = NULL;
+    if (AXUIElementCopyElementAtPosition(sys, g.x, g.y, &e) || !e) return NO;
+    NSString *role = lxStr(e, kAXRoleAttribute);
+    if ([role isEqual:@"AXWindow"]) w = (AXUIElementRef)CFRetain(e);
+    else AXUIElementCopyAttributeValue(e, kAXWindowAttribute, (CFTypeRef *)&w);
+    CFRelease(e);
+    if (!w) return NO;
+    Boolean sizeOK = false, posOK = false;
+    AXUIElementIsAttributeSettable(w, kAXSizeAttribute, &sizeOK);
+    AXUIElementIsAttributeSettable(w, kAXPositionAttribute, &posOK);
+    if (!posOK) { CFRelease(w); return NO; }
+    if (w3Win) CFRelease(w3Win);
+    w3Win = w; w3F0 = lxFrame(w); w3T = 0;
+    if (!sizeOK) w3F0.size.width = -w3F0.size.width;   // remember: move only
+    return YES;
+}
+static void w3Passo(double escala, CGPoint delta, double t) {
+    if (!w3Win || t - w3T < 1.0 / 40) return;   // AX calls are slow: ~40 updates per second
+    w3T = t;
+    BOOL moveOnly = w3F0.size.width < 0;
+    CGSize z0 = CGSizeMake(fabs(w3F0.size.width), w3F0.size.height);
+    CGSize z = z0;
+    if (!moveOnly && fabs(escala - 1) > 0.04) {
+        z.width = MIN(MAX(z0.width * escala, 320), B.size.width);
+        z.height = MIN(MAX(z0.height * escala, 220), B.size.height);
+    }
+    CGPoint ctr = CGPointMake(w3F0.origin.x + z0.width / 2 + delta.x, w3F0.origin.y + z0.height / 2 + delta.y);
+    // keep the whole window on the built-in screen (below the menu bar), whatever the fingers do
+    const double top = CGRectGetMinY(B) + 30;
+    z.width = MIN(z.width, B.size.width); z.height = MIN(z.height, CGRectGetMaxY(B) - top);
+    CGPoint o = CGPointMake(ctr.x - z.width / 2, ctr.y - z.height / 2);
+    if (!opt(@"win3Free")) {   // option off: the whole window stays on screen
+        o.x = MIN(MAX(o.x, CGRectGetMinX(B)), CGRectGetMaxX(B) - z.width);
+        o.y = MIN(MAX(o.y, top), CGRectGetMaxY(B) - z.height);
+    } else o.y = MAX(o.y, top);   // only the title bar has to stay below the menu bar
+    if (!moveOnly) { AXValueRef zv = AXValueCreate(kAXValueCGSizeType, &z); AXUIElementSetAttributeValue(w3Win, kAXSizeAttribute, zv); CFRelease(zv); }
+    AXValueRef ov = AXValueCreate(kAXValueCGPointType, &o); AXUIElementSetAttributeValue(w3Win, kAXPositionAttribute, ov); CFRelease(ov);
+}
+static void w3Fim(void) {
+    gWin3 = 0;
+    if (w3Win) { CFRelease(w3Win); w3Win = NULL; }
+}
+
+// ---------------------------------------------------------------- tile mode (five-finger double tap)
+// On: the visible standard windows of the built-in screen are kept in a grid (columns of stacked rows; 1 = full,
+// 2 = halves, 3 = one tall + two, 4 = quarters, ...). New windows join, closed/minimized ones leave. Resizing a window
+// moves the shared edge, so its neighbours follow; dropping a moved window onto another cell swaps the two.
+// The same gesture turns it off. Accessibility only, polled 5x a second while on.
+extern AXError _AXUIElementGetWindow(AXUIElementRef, CGWindowID *);
+static BOOL gTile;
+static NSTimer *tileTimer;
+static NSMutableArray<NSNumber *> *tileIds;                       // managed windows, in cell order
+static NSMutableDictionary<NSNumber *, id> *tileAX;               // CGWindowID -> AXUIElementRef
+static NSMutableArray<NSNumber *> *tileColX;                      // column boundaries, fractions 0..1 (cols+1)
+static NSMutableArray<NSMutableArray<NSNumber *> *> *tileRowY;    // per column: row boundaries 0..1
+static NSMutableArray<NSNumber *> *tileColOf, *tileRowOf;         // cell of each managed window
+static NSMutableDictionary<NSNumber *, NSValue *> *tileLast;      // frame each window had after our last pass
+// (apps round their own size, e.g. Terminal to its character grid, so the cell itself is not a reliable reference)
+
+static CGRect tileArea(void) {   // the built-in screen minus the menu bar and the Dock (visibleFrame), with a margin
+    const double gap = 8;
+    CGRect v = CGRectMake(CGRectGetMinX(B), CGRectGetMinY(B) + 30, B.size.width, B.size.height - 30);
+    double H = NSScreen.screens.firstObject.frame.size.height;   // Cocoa (bottom-left) -> CG (top-left) flip
+    for (NSScreen *sc in NSScreen.screens) {
+        NSRect f = sc.frame, vf = sc.visibleFrame;
+        if (fabs(f.origin.x - CGRectGetMinX(B)) > 1 || fabs(f.size.width - B.size.width) > 1) continue;
+        v = CGRectMake(vf.origin.x, H - (vf.origin.y + vf.size.height), vf.size.width, vf.size.height);
+        break;
+    }
+    // SwipeSwitcher's new Dock hides the system one, so visibleFrame no longer leaves room for it: use its frame
+    NSUserDefaults *ss = [[NSUserDefaults alloc] initWithSuiteName:@"local.swipeswitcher"];
+    NSString *nd = [ss boolForKey:@"newDock"] ? [ss stringForKey:@"newDockFrame"] : nil;
+    if (nd.length) {
+        NSRect d = NSRectFromString(nd);   // Cocoa coordinates
+        double topCG = H - NSMaxY(d);
+        if (d.size.height > 0 && topCG < CGRectGetMaxY(v)) v.size.height = topCG - v.origin.y;
+    }
+    return CGRectInset(v, gap, gap);
+}
+static void tileReset(void) {   // equal grid for the current count: extra windows go to the rightmost columns
+    NSUInteger n = tileIds.count, cols = MAX((NSUInteger)1, (NSUInteger)ceil(sqrt((double)n)));
+    if (n == 3) cols = 2;
+    tileColX = [NSMutableArray array]; tileRowY = [NSMutableArray array];
+    tileColOf = [NSMutableArray array]; tileRowOf = [NSMutableArray array];
+    for (NSUInteger c = 0; c <= cols; c++) [tileColX addObject:@((double)c / cols)];
+    NSUInteger base = n / cols, extra = n % cols, k = 0;
+    for (NSUInteger c = 0; c < cols; c++) {
+        NSUInteger rows = base + (c >= cols - extra ? 1 : 0);
+        NSMutableArray *ry = [NSMutableArray array];
+        for (NSUInteger r = 0; r <= rows; r++) [ry addObject:@(rows ? (double)r / rows : 0)];
+        [tileRowY addObject:ry];
+        for (NSUInteger r = 0; r < rows; r++, k++) { [tileColOf addObject:@(c)]; [tileRowOf addObject:@(r)]; }
+    }
+}
+static CGRect tileCell(NSUInteger i) {
+    CGRect A = tileArea(); const double g = 8;
+    NSUInteger c = tileColOf[i].unsignedIntegerValue, r = tileRowOf[i].unsignedIntegerValue;
+    double x0 = A.origin.x + tileColX[c].doubleValue * (A.size.width + g), x1 = A.origin.x + tileColX[c + 1].doubleValue * (A.size.width + g) - g;
+    NSArray *ry = tileRowY[c];
+    double y0 = A.origin.y + [ry[r] doubleValue] * (A.size.height + g), y1 = A.origin.y + [ry[r + 1] doubleValue] * (A.size.height + g) - g;
+    return CGRectMake(round(x0), round(y0), round(x1 - x0), round(y1 - y0));
+}
+static void tilePor(NSUInteger i) {
+    AXUIElementRef w = (__bridge AXUIElementRef)tileAX[tileIds[i]];
+    if (!w) return;
+    CGRect c = tileCell(i), f = lxFrame(w);
+    if (fabs(f.origin.x - c.origin.x) < 2 && fabs(f.origin.y - c.origin.y) < 2 && fabs(f.size.width - c.size.width) < 2 && fabs(f.size.height - c.size.height) < 2) return;
+    CGPoint o = c.origin; CGSize z = c.size;
+    AXValueRef ov = AXValueCreate(kAXValueCGPointType, &o), zv = AXValueCreate(kAXValueCGSizeType, &z);
+    AXUIElementSetAttributeValue(w, kAXPositionAttribute, ov);   // move first, so the new size fits on screen
+    AXUIElementSetAttributeValue(w, kAXSizeAttribute, zv);
+    AXUIElementSetAttributeValue(w, kAXPositionAttribute, ov);
+    CFRelease(ov); CFRelease(zv);
+}
+static void tileLembrar(NSNumber *exceto) {   // exceto: the window still being dragged keeps its pre-drag reference
+    for (NSNumber *wid in tileIds) { id w = tileAX[wid]; if (w && w != (id)kCFNull && ![wid isEqual:exceto]) tileLast[wid] = [NSValue valueWithRect:NSRectFromCGRect(lxFrame((__bridge AXUIElementRef)w))]; }
+}
+// Visible standard windows on the built-in screen, front to back.
+static NSArray<NSNumber *> *tileVisiveis(void) {
+    NSArray *ws = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    NSMutableArray *out = [NSMutableArray array];
+    pid_t eu = getpid();
+    for (NSDictionary *w in ws) {
+        if ([w[(id)kCGWindowLayer] intValue] != 0 || [w[(id)kCGWindowOwnerPID] intValue] == eu) continue;
+        CGRect r;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(id)kCGWindowBounds], &r) || r.size.width < 200 || r.size.height < 120) continue;
+        if (!CGRectIntersectsRect(r, B)) continue;
+        NSNumber *wid = w[(id)kCGWindowNumber];
+        if (!tileAX[wid]) {   // find its AX element (and drop panels, sheets, etc.)
+            pid_t pid = [w[(id)kCGWindowOwnerPID] intValue];
+            AXUIElementRef app = AXUIElementCreateApplication(pid);
+            CFTypeRef v = NULL; AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &v); CFRelease(app);
+            for (id a in (v ? (__bridge NSArray *)v : @[])) {
+                CGWindowID x = 0;
+                if (_AXUIElementGetWindow((__bridge AXUIElementRef)a, &x) == kAXErrorSuccess && x == wid.unsignedIntValue &&
+                    [lxStr((__bridge AXUIElementRef)a, kAXSubroleAttribute) isEqual:@"AXStandardWindow"]) { tileAX[wid] = a; break; }
+            }
+            if (v) CFRelease(v);
+            if (!tileAX[wid]) { tileAX[wid] = (id)kCFNull; continue; }
+        }
+        if (tileAX[wid] == (id)kCFNull) continue;
+        [out addObject:wid];
+        if (out.count >= 12) break;
+    }
+    return out;
+}
+static void tileTick(void) {
+    if (mesaAMostra()) return;   // Show Desktop moves every window off screen: leave them alone
+    NSArray<NSNumber *> *vis = tileVisiveis();
+    NSSet *agora_ = [NSSet setWithArray:vis];
+    BOOL mudou = ![agora_ isEqualToSet:[NSSet setWithArray:tileIds]];
+    if (mudou) {   // keep the order of the windows we had, newcomers at the end (front-most first)
+        NSMutableArray *ids = [NSMutableArray array];
+        for (NSNumber *x in tileIds) if ([agora_ containsObject:x]) [ids addObject:x];
+        for (NSNumber *x in vis) if (![ids containsObject:x]) [ids addObject:x];
+        for (NSNumber *k in tileAX.allKeys) if (![agora_ containsObject:k] && tileAX[k] != (id)kCFNull) [tileAX removeObjectForKey:k];
+        tileIds = ids; tileReset();
+        for (NSUInteger i = 0; i < tileIds.count; i++) tilePor(i);
+        tileLembrar(nil);
+        return;
+    }
+    // a window is being dragged or pinched (mouse button held, or our four-finger gesture): it settles on release
+    BOOL botao = CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft) || gWin3;
+    for (NSUInteger i = 0; i < tileIds.count; i++) {
+        AXUIElementRef w = (__bridge AXUIElementRef)tileAX[tileIds[i]];
+        CGRect f = lxFrame(w), c = tileCell(i);
+        // reference: the frame it had after our last pass (its offset from the cell is the app's own rounding)
+        NSValue *lv = tileLast[tileIds[i]];
+        CGRect l = lv ? NSRectToCGRect(lv.rectValue) : c;
+        BOOL dx0 = fabs(f.origin.x - l.origin.x) > 3, dx1 = fabs(CGRectGetMaxX(f) - CGRectGetMaxX(l)) > 3;
+        BOOL dy0 = fabs(f.origin.y - l.origin.y) > 3, dy1 = fabs(CGRectGetMaxY(f) - CGRectGetMaxY(l)) > 3;
+        if (!dx0 && !dx1 && !dy0 && !dy1) continue;
+        BOOL moveu = fabs(f.size.width - l.size.width) <= 3 && fabs(f.size.height - l.size.height) <= 3;
+        if (moveu) {   // dragged by the title bar: on release swap with the cell under its centre, or snap back
+            if (botao) return;
+            CGPoint m = CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f));
+            for (NSUInteger j = 0; j < tileIds.count; j++)
+                if (j != i && CGRectContainsPoint(tileCell(j), m)) { [tileIds exchangeObjectAtIndex:i withObjectAtIndex:j]; tilePor(j); break; }
+            tilePor(i);
+            tileLembrar(nil);
+            return;
+        }
+        // resized: move the shared edges to where the user put them; the neighbours follow
+        CGRect A = tileArea(); const double g = 8;
+        NSUInteger col = tileColOf[i].unsignedIntegerValue, row = tileRowOf[i].unsignedIntegerValue, cols = tileColX.count - 1;
+        NSMutableArray *ry = tileRowY[col]; NSUInteger rows = ry.count - 1;
+        double minW = 240.0 / (A.size.width + g), minH = 160.0 / (A.size.height + g);
+        if (dx0 && col > 0) { double v = (f.origin.x - A.origin.x) / (A.size.width + g);
+            tileColX[col] = @(MIN(MAX(v, [tileColX[col - 1] doubleValue] + minW), [tileColX[col + 1] doubleValue] - minW)); }
+        if (dx1 && col + 1 < cols) { double v = (CGRectGetMaxX(f) + g - A.origin.x) / (A.size.width + g);
+            tileColX[col + 1] = @(MIN(MAX(v, [tileColX[col] doubleValue] + minW), [tileColX[col + 2] doubleValue] - minW)); }
+        if (dy0 && row > 0) { double v = (f.origin.y - A.origin.y) / (A.size.height + g);
+            ry[row] = @(MIN(MAX(v, [ry[row - 1] doubleValue] + minH), [ry[row + 1] doubleValue] - minH)); }
+        if (dy1 && row + 1 < rows) { double v = (CGRectGetMaxY(f) + g - A.origin.y) / (A.size.height + g);
+            ry[row + 1] = @(MIN(MAX(v, [ry[row] doubleValue] + minH), [ry[row + 2] doubleValue] - minH)); }
+        for (NSUInteger j = 0; j < tileIds.count; j++) if (j != i || !botao) tilePor(j);   // the one being dragged settles on release
+        tileLembrar(botao ? tileIds[i] : nil);
+        return;
+    }
+}
+static void tileAlternar(void) {
+    gTile = !gTile;
+    [tileTimer invalidate]; tileTimer = nil;
+    tileIds = [NSMutableArray array]; tileAX = [NSMutableDictionary dictionary]; tileLast = [NSMutableDictionary dictionary];
+    if (gTile) {
+        tileTick();
+        tileTimer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *t) { tileTick(); }];
+    }
+    xlog(@"tile mode %@ (%lu window(s))", gTile ? @"on" : @"off", (unsigned long)tileIds.count);
+}
+
+// ---------------------------------------------------------------- pinch a Finder file: Quick Look
+// Two fingers landing on a file in Finder (desktop, icon view, list view) are held back from macOS: spreading them
+// selects the file (Accessibility) and sends Space to Finder (Quick Look); pinching in closes it again. If the two
+// fingers move together instead (a scroll), the gesture goes back to macOS.
+static AXUIElementRef qlCont, qlItem; static int qlKind; static pid_t qlPid;
+static void qlLimpar(void) {
+    if (qlCont) { CFRelease(qlCont); qlCont = NULL; }
+    if (qlItem) { CFRelease(qlItem); qlItem = NULL; }
+}
+static AXUIElementRef axPai(AXUIElementRef e) { CFTypeRef p = NULL; AXUIElementCopyAttributeValue(e, kAXParentAttribute, &p); return (AXUIElementRef)p; }
+static BOOL qlItemEm(CGPoint g) {
+    qlLimpar();
+    static AXUIElementRef sys; if (!sys) sys = AXUIElementCreateSystemWide();
+    AXUIElementRef e = NULL;
+    if (AXUIElementCopyElementAtPosition(sys, g.x, g.y, &e) || !e) return NO;
+    pid_t pid = 0; AXUIElementGetPid(e, &pid);
+    if (![[NSRunningApplication runningApplicationWithProcessIdentifier:pid].bundleIdentifier isEqual:@"com.apple.finder"]) { CFRelease(e); return NO; }
+    AXUIElementRef cur = e;   // owned
+    for (int up = 0; up < 5 && cur; up++) {
+        NSString *role = lxStr(cur, kAXRoleAttribute);
+        AXUIElementRef pai = axPai(cur);
+        if ([role isEqual:@"AXRow"]) {   // list view: the row's outline takes AXSelectedRows
+            if (pai && axHas(pai, @"AXSelectedRows")) { qlItem = cur; qlCont = pai; qlKind = 2; qlPid = pid; return YES; }
+        } else if (pai) {
+            NSString *pr = lxStr(pai, kAXRoleAttribute), *psr = lxStr(pai, kAXSubroleAttribute);
+            if ([pr isEqual:@"AXList"] && [psr isEqual:@"AXSectionList"]) {   // icon view: select through the outer list
+                AXUIElementRef avo = axPai(pai);
+                CFRelease(pai);
+                if (avo && axHas(avo, @"AXSelectedChildren")) { qlItem = cur; qlCont = avo; qlKind = 1; qlPid = pid; return YES; }
+                if (avo) CFRelease(avo);
+                pai = NULL;
+            } else if (axHas(pai, @"AXSelectedChildren") && ![pr isEqual:@"AXToolbar"] && ![role isEqual:@"AXList"]) {   // desktop icons
+                qlItem = cur; qlCont = pai; qlKind = 1; qlPid = pid; return YES;
+            }
+        }
+        CFRelease(cur);
+        cur = pai;
+    }
+    if (cur) CFRelease(cur);
+    return NO;
+}
+static void qlAbrir(void) {
+    if (!qlItem || !qlCont) return;
+    NSArray *um = @[(__bridge id)qlItem];
+    AXUIElementSetAttributeValue(qlCont, qlKind == 2 ? kAXSelectedRowsAttribute : CFSTR("AXSelectedChildren"), (__bridge CFArrayRef)um);
+    [[NSRunningApplication runningApplicationWithProcessIdentifier:qlPid] activateWithOptions:0];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ tecla(49, 0); });   // Space
+    xlog(@"pinch: Quick Look (kind %d)", qlKind);
+}
+
+static BOOL gDesk2;   // a second finger restored the windows during this drag
 static void soltar(double t) {  // all fingers lifted
     switch (est) {
-        case PEND: if (maxN == 1 && opt(@"scroll1")) toque1(p0); break;
+        case PEND: if (maxN == 1 && (opt(@"scroll1") || gImaPend)) toque1(p0); gImaPend = NO; break;
         case EDGER: case EDGEB: if (maxN == 1) toque1(p0); break;
         case SCROLL: scrollFim(YES, t); break;
         case HOLD: cliqueDireito(p0); break;
         case DRAG: mouse(kCGEventLeftMouseUp, pUlt, kCGMouseButtonLeft, 1); break;
-        case MULTI: if (mScroll) scrollFim(YES, t); lupaEsconder(); break;
+        case LASSO: lassoFim(); break;
+        case MULTI: {
+            if (mScroll) scrollFim(YES, t);
+            lupaEsconder(); w3Fim(); gPinchQL = 0; qlLimpar();
+            static double toque5;   // five-finger double tap: tile mode on/off
+            if (maxN >= 5 && !mFired && t - t0g < 0.35 && dist(pUlt, mC0) < 40 && opt(@"tile5")) {
+                if (t - toque5 < 0.6) { toque5 = 0; tileAlternar(); onda(pUlt, 1); }
+                else toque5 = t;
+            }
+            break;
+        }
     }
     if (claimed) gClaimUntil = t + 0.3;
-    setClaim(NO); gDropMoves = 0;
+    setClaim(NO); gDropMoves = 0; gDesk2 = NO; gMt4 = 0;
     est = IDLE;
 }
 
@@ -543,13 +949,25 @@ static void motor(Contato *c, int n, double t) {
         if (opt(@"edges") && m.x >= CGRectGetMaxX(B) - EDGE) est = EDGER;
         else if (opt(@"edges") && m.y >= CGRectGetMaxY(B) - EDGE) est = EDGEB;
         else est = PEND;
-        setClaim(opt(@"scroll1") || est != PEND);
+        gImaPend = NO;
+        if (est == PEND && n == 1 && !opt(@"scroll1") && opt(@"magnet") && AXIsProcessTrusted()) {
+            // native taps bypass the magnet; near a window's traffic lights keep the touch and decide on release
+            Ima r = imaProcurar(m);
+            if (r.ok) { gImaPend = YES; CFRelease(r.botao); }
+        }
+        setClaim(opt(@"scroll1") || est != PEND || gImaPend);
         return;
     }
     if (n > maxN) maxN = n;
+    if (n >= 2 && (est == NATIVE || est == DRAG) && (gDesk2 || (opt(@"desk2") && mesaAMostra()))) {
+        // dragging with the desktop shown: a second finger brings the windows back, the drag goes on
+        if (!gDesk2) { gDesk2 = YES; mesaAlternar(); onda(m, 1); xlog(@"desk2: windows back during a drag"); }
+        return;   // extra fingers are ignored until all are lifted (the centroid would jump)
+    }
     if (n >= 2 && est != MULTI && est != DONE) {
         if (est == SCROLL) scrollFim(NO, t);
         if (est == DRAG) mouse(kCGEventLeftMouseUp, pUlt, kCGMouseButtonLeft, 1);
+        if (est == LASSO) { lassoPts.length = 0; tela.needsDisplay = YES; }   // a second finger cancels the lasso
         if (est == NATIVE) { pUlt = m; entrarMulti(c, n, m, t); gDropMoves = 0; return; }
         setClaim(YES);
         entrarMulti(c, n, m, t);
@@ -559,8 +977,25 @@ static void motor(Contato *c, int n, double t) {
     double d = dist(m, p0);
     switch (est) {
         case PEND:
-            if (d > MOVE) {
+            if (d > MOVE && gImaPend) {   // it was a drag (e.g. the title bar), not a tap: replay it as our own drag
+                gImaPend = NO; est = DRAG; gDropMoves = 1;
+                mouse(kCGEventLeftMouseDown, p0, kCGMouseButtonLeft, 1);
+                mouse(kCGEventLeftMouseDragged, m, kCGMouseButtonLeft, 1);
+            } else if (d > MOVE) {
                 if (opt(@"scroll1")) { est = SCROLL; gDropMoves = 1; nam = 0; rolar(m.x - p0.x, m.y - p0.y, 1, 0); amostra(m, t); }
+                else if (lassoInicio(p0)) {   // one-finger drag from empty Finder space: lasso instead of the rectangle
+                    // the touchscreen's own mouse-down already reached Finder: end that rectangle where it began
+                    est = LASSO; setClaim(YES); gDropMoves = 1;
+                    mouse(kCGEventLeftMouseUp, p0, kCGMouseButtonLeft, 1);
+                    [lassoPts appendBytes:&p0 length:sizeof p0];
+                    [lassoPts appendBytes:&m length:sizeof m];
+                    tela.needsDisplay = YES;
+                }
+                else if (opt(@"desk2") && mesaAMostra()) {
+                    // desktop shown: take over the drag macOS began, so a second finger (windows back) cannot drop it
+                    est = DRAG; setClaim(YES); gDropMoves = 1;
+                    mouse(kCGEventLeftMouseDragged, m, kCGMouseButtonLeft, 1);
+                }
                 else { est = NATIVE; setClaim(NO); }
             } else if (t - t0g >= HOLD_T) {
                 if (opt(@"scroll1")) { est = HOLD; gDropMoves = 1; onda(p0, 1); }
@@ -572,7 +1007,12 @@ static void motor(Contato *c, int n, double t) {
             amostra(m, t);
             break;
         case HOLD:
-            if (d > MOVE) {
+            if (d > MOVE && lassoInicio(p0)) {
+                est = LASSO;
+                [lassoPts appendBytes:&p0 length:sizeof p0];
+                [lassoPts appendBytes:&m length:sizeof m];
+                tela.needsDisplay = YES;
+            } else if (d > MOVE) {
                 est = DRAG;
                 mouse(kCGEventLeftMouseDown, p0, kCGMouseButtonLeft, 1);
                 mouse(kCGEventLeftMouseDragged, m, kCGMouseButtonLeft, 1);
@@ -581,6 +1021,11 @@ static void motor(Contato *c, int n, double t) {
         case DRAG:
             if (dist(m, pUlt) > 0.3) mouse(kCGEventLeftMouseDragged, m, kCGMouseButtonLeft, 1);
             break;
+        case LASSO: {
+            const CGPoint *last = (const CGPoint *)lassoPts.bytes + lassoPts.length / sizeof(CGPoint) - 1;
+            if (dist(m, *last) > 3) { [lassoPts appendBytes:&m length:sizeof m]; tela.needsDisplay = YES; }
+            break;
+        }
         case EDGER: {
             double dx = p0.x - m.x, dy = m.y - p0.y;
             if (dx > EDGE_DIST && fabs(dy) < dx * 0.7) { centralNotificacoes(); onda(m, 1); est = DONE; gDropMoves = 1; }
@@ -596,6 +1041,7 @@ static void motor(Contato *c, int n, double t) {
         case MULTI: {
             if (n != mN) {  // finger count changed: start over from here
                 if (mScroll) { scrollFim(NO, t); mScroll = NO; }
+                if (gWin3) w3Fim();
                 if (n < 2) lupaEsconder();
                 mN = n; mC0 = m; mS0 = espalhamento(c, n, m); mT0 = t;
                 break;
@@ -603,6 +1049,33 @@ static void motor(Contato *c, int n, double t) {
             if (opt(@"lupa") && n == 2) {
                 if (!lupaOn && !mScroll && !mFired && dist(m, mC0) < 12 && fabs(espalhamento(c, n, m) - mS0) < 12 && t - mT0 > 0.6) lupaMostrar(m);
                 else if (lupaOn) { lupaC = m; lupaPedir(); }
+            }
+            if (n == 2 && opt(@"pinchQL")) {   // pinch a Finder file: Quick Look
+                if (!qlVisto) { qlVisto = YES; if (qlItemEm(mC0)) { gPinchQL = 1; setClaim(YES); } }
+                if (gPinchQL) {
+                    double r = mS0 > 20 ? espalhamento(c, n, m) / mS0 : 1;
+                    if (!qlAberto && r > 1.35) { qlAberto = YES; qlAbrir(); onda(m, 1); }
+                    else if (qlAberto && r < 0.8) { qlAberto = NO; tecla(49, 0); }   // pinched back in: close it
+                    else if (!qlAberto && dist(m, mC0) > 2 * MOVE && fabs(r - 1) < 0.15) {   // a scroll: give it back
+                        gPinchQL = 0; setClaim(gOwnMulti); qlLimpar();
+                    }
+                    break;
+                }
+            }
+            if (n >= 4 && !gMt4) { gMt4 = 1; setClaim(YES); }   // 4-5 fingers are ours: no native Show Desktop on 4
+            if (n == 4 && !mFired && opt(@"win3")) {   // four-finger window move / resize
+                if (!gWin3 && w3Inicio(mC0)) { gWin3 = 1; setClaim(YES); gDropMoves = 1; onda(m, 1); }
+                if (gWin3) {
+                    double sNow = espalhamento(c, n, m);
+                    w3Passo(mS0 > 30 ? sNow / mS0 : 1, CGPointMake(m.x - mC0.x, m.y - mC0.y), t);
+                    break;
+                }
+            }
+            if (n >= 5 && !mFired && mS0 > 20) {   // five fingers: spread = Show Desktop, pinch = Apps
+                double s = espalhamento(c, n, m);
+                if (s / mS0 > 1.4) { mesaAlternar(); onda(m, 1); mFired = YES; }
+                else if (s / mS0 < 0.6) { appsLaunchpad(); onda(m, 1); mFired = YES; }
+                break;
             }
             if (lupaOn || !gOwnMulti || mFired) break;
             if (n == 2) {
@@ -612,9 +1085,6 @@ static void motor(Contato *c, int n, double t) {
             } else if (n == 3) {
                 double dx = m.x - mC0.x, dy = m.y - mC0.y;
                 if (fabs(dx) > 100 && fabs(dx) > 2 * fabs(dy)) { trocarEspaco(dx < 0 ? +1 : -1); mFired = YES; }
-            } else if (n >= 5) {
-                double s = espalhamento(c, n, m);
-                if (mS0 > 20 && s / mS0 < 0.6) { appsLaunchpad(); onda(m, 1); mFired = YES; }
             }
             break;
         }
@@ -742,7 +1212,7 @@ static CGEventRef cbTap(CGEventTapProxy p, CGEventType type, CGEventRef e, void 
     double t = agora();
     if (t - gLastHID > 0.6 && t > gClaimUntil) return e;  // fail open when the touchscreen is idle
     if (gPen) return NULL;
-    if (mt) return gOwnMulti ? NULL : e;
+    if (mt) return (gOwnMulti || gWin3 || gPinchQL || gMt4) ? NULL : e;
     if (gClaim || t < gClaimUntil) {
         switch ((int)type) {
             case kCGEventLeftMouseDown: case kCGEventLeftMouseUp: case kCGEventLeftMouseDragged:
@@ -927,7 +1397,13 @@ static void atualizarMenu(void) {
                     @[@"xe-toque handles 2–5 fingers (else macOS)", @"ownMulti"],
                     @[@"Magnifier (two-finger hold)", @"lupa"],
                     @[@"Window buttons magnet (taps near close/minimize/zoom)", @"magnet"],
-                    @[@"Hide the pointer while touching (trackpad brings it back)", @"hideCursor"]];
+                    @[@"Hide the pointer while touching (trackpad brings it back)", @"hideCursor"],
+                    @[@"Lasso selection in Finder (hold, then draw on empty space)", @"lasso"],
+                    @[@"Four fingers on a window: move it, pinch/spread to resize (five-finger spread: Show Desktop)", @"win3"],
+                    @[@"Four-finger windows may go past the screen edges", @"win3Free"],
+                    @[@"Pinch out on a Finder file: Quick Look preview", @"pinchQL"],
+                    @[@"Dragging with the desktop shown: a second finger brings the windows back", @"desk2"],
+                    @[@"Five-finger double tap: tile mode on/off (windows kept in a grid)", @"tile5"]];
     for (NSArray *a in ts) add(m, a[0], @selector(alternar:), a[1], nil).state = opt(a[1]) ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:NSMenuItem.separatorItem];
     NSString *tt = [NSString stringWithFormat:@"Touch mode (larger UI, %ld pt wide)", (long)[ud integerForKey:@"touchWidth"]];
@@ -969,7 +1445,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     // default xe-res: tools/build/xe-res, next to tools/xe-toque.app (docs/INSTALL.md step 6)
     NSString *xeResDef = [NSBundle.mainBundle.bundlePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"build/xe-res"];
     [ud registerDefaults:@{@"trail": @YES, @"ripple": @YES, @"scroll1": @YES, @"edges": @YES, @"ownMulti": @NO,
-                           @"lupa": @NO, @"magnet": @YES, @"hideCursor": @YES, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": xeResDef}];
+                           @"lupa": @NO, @"magnet": @YES, @"hideCursor": @YES, @"lasso": @YES, @"win3": @YES, @"win3Free": @YES, @"pinchQL": @YES, @"desk2": @YES, @"tile5": @YES, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": xeResDef}];
     gOwnMulti = opt(@"ownMulti");
     src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     rastros = [NSMutableArray array];

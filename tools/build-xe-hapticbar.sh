@@ -16,8 +16,11 @@ cat > $A/Info.plist <<'PL'
 <key>CFBundleName</key><string>xe-hapticbar</string>
 <key>CFBundleExecutable</key><string>xe-hapticbar</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSUIElement</key><true/>
 </dict></plist>
 PL
+mkdir -p $A/Resources && cp icons/xe-hapticbar.icns $A/Resources/AppIcon.icns
+codesign -f -s - $A/MacOS/xe-haptic   # nested helper first, or the bundle signature fails
 codesign -f -s - -r='designated => identifier "local.xe.hapticbar"' xe-hapticbar.app
 echo "built $PWD/xe-hapticbar.app"

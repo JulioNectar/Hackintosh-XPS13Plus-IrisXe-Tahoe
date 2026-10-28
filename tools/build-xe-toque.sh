@@ -17,9 +17,11 @@ cat > $A/Info.plist <<'PL'
 <key>CFBundleExecutable</key><string>xe-toque</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>2.0</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSUIElement</key><true/>
 </dict></plist>
 PL
+mkdir -p $A/Resources && cp icons/xe-toque.icns $A/Resources/AppIcon.icns
 # Ad-hoc signature with a designated requirement on the bundle identifier only, so the privacy grants
 # (Input Monitoring, Accessibility, Screen Recording) survive rebuilds instead of being tied to the cdhash.
 codesign -f -s - -r='designated => identifier "local.xe.toque"' xe-toque.app
