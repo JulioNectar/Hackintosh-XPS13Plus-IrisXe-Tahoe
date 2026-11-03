@@ -936,6 +936,15 @@ static void soltar(double t) {  // all fingers lifted
             if (mScroll) scrollFim(YES, t);
             lupaEsconder(); w3Fim(); gPinchQL = 0; qlLimpar();
             static double toque5;   // five-finger double tap: tile mode on/off
+            if (maxN >= 6) xlog(@"multi release: max %d fingers", maxN);
+            if (maxN >= 10 && !mFired && dist(pUlt, mC0) < 60 && opt(@"shot10")) {   // ten fingers on the screen: screenshot
+                // after the trail/ripples fade (FADE), so they don't end up in the picture; ⌘⇧3 follows the system's
+                // screenshot target (clipboard here) and preview
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((FADE + 0.2) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    tecla(20, kCGEventFlagMaskCommand | kCGEventFlagMaskShift); xlog(@"ten fingers: screenshot");
+                });
+                break;
+            }
             if (maxN >= 5 && !mFired && t - t0g < 0.35 && dist(pUlt, mC0) < 40 && opt(@"tile5")) {
                 if (t - toque5 < 0.6) { toque5 = 0; tileAlternar(); onda(pUlt, 1); }
                 else toque5 = t;
@@ -1419,7 +1428,8 @@ static void atualizarMenu(void) {
                     @[@"Four-finger windows may go past the screen edges", @"win3Free"],
                     @[@"Pinch out on a Finder file: Quick Look preview", @"pinchQL"],
                     @[@"Dragging with the desktop shown: a second finger brings the windows back", @"desk2"],
-                    @[@"Five-finger double tap: tile mode on/off (windows kept in a grid)", @"tile5"]];
+                    @[@"Five-finger double tap: tile mode on/off (windows kept in a grid)", @"tile5"],
+                    @[@"Ten fingers on the screen: screenshot (when they lift)", @"shot10"]];
     for (NSArray *a in ts) add(m, a[0], @selector(alternar:), a[1], nil).state = opt(a[1]) ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:NSMenuItem.separatorItem];
     NSString *tt = [NSString stringWithFormat:@"Touch mode (larger UI, %ld pt wide)", (long)[ud integerForKey:@"touchWidth"]];
@@ -1461,7 +1471,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     // default xe-res: tools/build/xe-res, next to tools/xe-toque.app (docs/INSTALL.md step 6)
     NSString *xeResDef = [NSBundle.mainBundle.bundlePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"build/xe-res"];
     [ud registerDefaults:@{@"trail": @YES, @"ripple": @YES, @"scroll1": @YES, @"edges": @YES, @"ownMulti": @NO,
-                           @"lupa": @NO, @"magnet": @YES, @"hideCursor": @YES, @"lasso": @YES, @"win3": @YES, @"win3Free": @YES, @"pinchQL": @YES, @"desk2": @YES, @"tile5": @YES, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": xeResDef}];
+                           @"lupa": @NO, @"magnet": @YES, @"hideCursor": @YES, @"lasso": @YES, @"win3": @YES, @"win3Free": @YES, @"pinchQL": @YES, @"desk2": @YES, @"tile5": @YES, @"shot10": @YES, @"touchMode": @NO, @"touchWidth": @1152, @"xeRes": xeResDef}];
     gOwnMulti = opt(@"ownMulti");
     src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     rastros = [NSMutableArray array];
