@@ -79,6 +79,55 @@ static void xeTopoPublish(thread_call_param_t, thread_call_param_t) {
 }
 static thread_call_t gTopoTc = nullptr;
 
+// xe/portguard (#8, #22, #28): AppleIntelPort::probePortState() calls the port's probePortMode() through vtable slot
+// 0x190 right after "HPD is high" (16.0.32 debug FB: call *0x190(%rax) at 0x2eb0b, return address = +0x207). In the
+// abstract base AppleIntelPort vtable (__ZTV14AppleIntelPort) that slot, and getHPDState at 0x180, are
+// ___cxa_pure_virtual; in AppleIntelPortHAL / AppleIntelPortHALDiags it is AppleIntelPortHAL::probePortMode (HookCase).
+// Three machines (HDMI-only desktop, eDP MoDT, ADL-S VGA bridge) panic there from WindowServer's enableController; the
+// XPS never does (its eDP port takes the built-in branch, which never reaches the call). The wrapper checks the
+// object's vptr: if slot 0x190 is the pure-virtual stub it does what Apple does when the sink can't be probed
+// (setPortMode(0) through vtable slot 0x138, state 2 into this+0x554, return 2) instead of calling it; otherwise, and for
+// a port that would take the built-in branch, it calls the original untouched. Logged once per port. On by default on
+// the spoofed path; off: -ngreennoportguard. The old byte patch f13b (mov eax,1 for every port) stays disabled.
+static mach_vm_address_t gXePortGuardOrg = 0, gXePureVirtual = 0, gXePureVirtualBase = 0, gXeGControllerSym = 0;
+static volatile uint32_t gXePortGuardN = 0;
+static mach_vm_address_t gXeInitHwCaps = 0;   // xe/hwcaps114c (#5), see xeHwCapsFill
+static void *volatile gXePortGuardSeen[16] = {};
+static uint32_t xePortGuardProbe(void *that) {
+	if (that && (gXePureVirtual || gXePureVirtualBase)) {
+		auto *vt = *reinterpret_cast<mach_vm_address_t *const *>(that);
+		const mach_vm_address_t slot = vt ? vt[0x190 / 8] : 0;
+		if (slot && (slot == gXePureVirtual || slot == gXePureVirtualBase)) {
+			// Apple's built-in branch (portInfo+0x14 bit 3 and !(gController->0xd40->0xf8 & 0x20)): setPortMode(1),
+			// state 2, without the vcall. Leave that one to the original.
+			auto *info = getMember<uint8_t *>(that, 0x548);
+			bool builtin = false;
+			if (info && (info[0x14] & 0x8) && gXeGControllerSym) {
+				auto *ctl = *reinterpret_cast<uint8_t **>(gXeGControllerSym);
+				auto *sub = ctl ? *reinterpret_cast<uint8_t **>(ctl + 0xd40) : nullptr;
+				builtin = sub && !(sub[0xf8] & 0x20);
+			}
+			if (!builtin) {
+				const mach_vm_address_t spm = vt[0x138 / 8];
+				if (spm && spm != gXePureVirtual && spm != gXePureVirtualBase)
+					reinterpret_cast<void (*)(void *, uint32_t)>(spm)(that, 0);
+				getMember<uint32_t>(that, 0x554) = 2;
+				OSIncrementAtomic(&gXePortGuardN);
+				bool seen = false;
+				for (size_t i = 0; i < arrsize(gXePortGuardSeen) && !seen; i++) {
+					if (gXePortGuardSeen[i] == that) seen = true;
+					else if (!gXePortGuardSeen[i] && OSCompareAndSwapPtr(nullptr, that, &gXePortGuardSeen[i])) break;
+				}
+				if (!seen && gXePortGuardN <= 64)
+					IOLog("XeNG PORTGUARD: port %p ddi %u: probePortMode (vtable 0x190) is pure virtual -> setPortMode(0), state 2 (n=%u)\n",
+						  that, info ? *reinterpret_cast<uint32_t *>(info) : 0xFFFFFFFFU, gXePortGuardN);
+				return 2;
+			}
+		}
+	}
+	return FunctionCast(xePortGuardProbe, gXePortGuardOrg)(that);
+}
+
 // ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
 //trivial
 // ICL FB — com.apple (fallback path)
@@ -1392,6 +1441,28 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				}
 			}
 		}
+		// xe/portguard (#8, #22, #28): spoofed path only, not fatal if a symbol is missing (prod FB has no symbols)
+		if (NGreen::callback && !NGreen::callback->isRealTGL && !checkKernelArgument("-ngreennoportguard")) {
+			gXePureVirtual = patcher.solveSymbol(KernelPatcher::KernelID, "___cxa_pure_virtual");
+			patcher.clearError();
+			const mach_vm_address_t baseVt = patcher.solveSymbol(index, "__ZTV14AppleIntelPort", address, size);
+			patcher.clearError();
+			if (baseVt) gXePureVirtualBase = *reinterpret_cast<const mach_vm_address_t *>(baseVt + 0x10 + 0x190);
+			gXeGControllerSym = patcher.solveSymbol(index, "_gController", address, size);
+			patcher.clearError();
+			if (gXePureVirtual || gXePureVirtualBase) {
+				KernelPatcher::RouteRequest pgRoutes[] = {
+					{"__ZN14AppleIntelPort14probePortStateEv", xePortGuardProbe, gXePortGuardOrg},
+				};
+				if (!patcher.routeMultiple(index, pgRoutes, address, size)) gXePortGuardOrg = 0;
+				patcher.clearError();
+			}
+			SYSLOG("ngreen", "XE-PORTGUARD: route=%d pure_virtual=0x%llx base slot 0x190=0x%llx gController=%d",
+				   gXePortGuardOrg != 0, (unsigned long long)gXePureVirtual, (unsigned long long)gXePureVirtualBase, gXeGControllerSym != 0);
+			IOLog("XeNG PORTGUARD: armed %d (pure_virtual %s, base vtable slot %s)\n", gXePortGuardOrg != 0,
+				  gXePureVirtual ? "ok" : "missing",
+				  !gXePureVirtualBase ? "missing" : gXePureVirtualBase == gXePureVirtual ? "= pure_virtual" : "differs");
+		}
 		gOrgGcdm = this->ogetCurrentDisplayMode; gOrgGpi = this->ogetPixelInformation; gOrgVdm = this->ovalidateDisplayMode;
 		SYSLOG("ngreen", "TGL FB routes applied (fixbootmode: getCurrentDisplayMode org=0x%llx, arg=%d)",
 			   (unsigned long long)this->ogetCurrentDisplayMode, (int)checkKernelArgument("-ngreenfixbootmode"));
@@ -1687,6 +1758,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{activeKext, f13, r13, arrsize(f13),	1},
 				// f13b: mandatory. Without this bypass AppleIntelPort::probePortStateEv hits
 				// a pure-virtual call and panics in WindowServer during enableController.
+				// xe/portguard: stays disabled (commented out as inherited from upstream 95f8189): it forced
+				// mode 1 for every HPD-high port, real HAL ports too. XE-PORTGUARD (xePortGuardProbe) covers
+				// the panic and only acts when the port's slot 0x190 is ___cxa_pure_virtual.
 		//		{activeKext, f13b, r13b, arrsize(f13b),	1},
 				// f15: suppress getPathByPipe log flood at IGLogLevel=8.
 				// On platform 0x9a490000 all paths are on pipe 0; every scan cycle logs
@@ -2134,6 +2208,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{"__ZN16IntelAccelerator10getGPUInfoEv", getGPUInfo, this->ogetGPUInfo},
 			};
 			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, gpuInfoRoute, address, size), "ngreen", "Failed to route getGPUInfo");
+			// xe/hwcaps114c (#5): re-derives the subslice-dependent caps if the fuse read left them at 0 (see getGPUInfo)
+			gXeInitHwCaps = patcher.solveSymbol(index, "__ZN16IntelAccelerator16initHardwareCapsEv", address, size);
+			patcher.clearError();
 		}
 
 		// SKU/device-ID panic bypass (verified @ 0x23c1d in LE binary)
@@ -3514,12 +3591,15 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 		gXeDpcd340 = hdr;
 		const bool vesaOk = gXeDpcd700Ret == 0 && ((caps[0] >> 8) & 0x4) && ((caps[0] >> 16) & 0x2);
 		const bool hdrOk = gXeDpcd340Ret == 0 && ((hdr >> 8) & 0x10);
-		if (xeAuxBlMode() && gXeAuxBlWr && (xeAuxBlHdr() ? hdrOk : vesaOk)) {
+		// -ngreenauxblforce (#15): arm even if the panel doesn't advertise the interface (0x341 bit 4 / 0x701-0x702)
+		const bool force = xeAuxBlMode() && checkKernelArgument("-ngreenauxblforce");
+		if (xeAuxBlMode() && gXeAuxBlWr && (force || (xeAuxBlHdr() ? hdrOk : vesaOk))) {
 			gXeAuxBlRd = callback->orgICLReadAUX;
 			gXeAuxBlTc = thread_call_allocate(xeAuxBlApply, nullptr);
 			if (gXeAuxBlTc) gXeAuxBlPort = that;
 		}
-		IOLog("XeNG AUXBL: caps 0x700 %08x 0x340 %08x mode %d armed %d\n", caps[0], hdr, xeAuxBlMode(), gXeAuxBlPort ? 1 : 0);
+		IOLog("XeNG AUXBL: caps 0x700 %08x 0x340 %08x mode %d armed %d%s\n", caps[0], hdr, xeAuxBlMode(), gXeAuxBlPort ? 1 : 0,
+			  force ? " (forced)" : "");
 	}
 
 	// V97AUX: log first ~40 AUX reads to diagnose eDP link training failures.
@@ -3985,6 +4065,19 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 					gXeAuxBlLevel = l > 0xFFFF ? 0xFFFF : (uint32_t)l;
 					thread_call_enter(gXeAuxBlTc);
 					if ((xeAuxBlMode() == 2 || xeAuxBlMode() == 4) && val) val = gBlHwFreq;
+				} else if (xeAuxBlMode() && gXeAuxBlTc) {
+					// xe/auxbl (#15): no usable PWM period in 0xC8254 (0 or all-ones, e.g. OLED panels with no PWM
+					// backlight): the duty is still in Apple's units, so scale against ngreenblmax or Apple's own period.
+					// The PWM write itself goes through unchanged.
+					const uint32_t den = blmax > 0 ? (uint32_t)blmax : gBlAppleFreq;
+					if (den) {
+						uint64_t l = (uint64_t)val * 0xFFFF / den;
+						gXeAuxBlLevel = l > 0xFFFF ? 0xFFFF : (uint32_t)l;
+						thread_call_enter(gXeAuxBlTc);
+						static int nf = 0;
+						if (nf++ < 4) IOLog("XeNG AUXBL: PWM period 0x%x unusable, level from duty 0x%x / %s 0x%x -> 0x%x\n",
+											gBlHwFreq, val, blmax > 0 ? "ngreenblmax" : "Apple period", den, gXeAuxBlLevel);
+					}
 				}
 			}
 		}
@@ -6474,6 +6567,37 @@ void Gen11::getGPUInfoICL(void *that)
 		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU);
 }
 
+// xe/hwcaps114c (#5, #3): IntelAccelerator::getGPUInfo (16.0.2, 0x2847e) derives NumSlices (0x115c) and NumSubSlices
+// (0x1158 = popcount(DSS fuse) * 2, at 0x28654) from the fuses and then calls initHardwareCaps (0x2a666, call at 0x288bb),
+// which derives from them, for SKU 2 (0x1120): 0x114c = SS >> 1 (DSS count), 0x1128 = 2 * DSS, 0x1144 = (6 - DSS) * 2,
+// 0x1140 = 0x80 * DSS, 0x1168 = slices << 4 (SKU 1: DSS = SS, factor 1, max 12, 0x40). Our override below rewrites
+// 0x1158/0x115c only after all that, so when the fuse read returned 0 (TGL-H 9A68 in #5; the real-TGL path has no
+// NumSubSlices patch) those fields stay 0. get_hw_caps then copies 0x1110..0x118b to the Metal driver, where 0x114c
+// is mHWCaps+0x3c, the divisor of generate3DStatePS (WindowServer SIGFPE). When 0x114c is 0 after our override we
+// run initHardwareCaps again on the overridden counts (the same code Apple runs, so the SKU constants stay its own).
+// With a non-zero 0x114c (the XPS: 6) nothing is touched.
+static void xeHwCapsFill(void *that) {
+	if (getMember<uint32_t>(that, 0x114c) != 0) return;
+	const uint32_t b1128 = getMember<uint32_t>(that, 0x1128), b1144 = getMember<uint32_t>(that, 0x1144),
+				   b1140 = getMember<uint32_t>(that, 0x1140), b1168 = getMember<uint32_t>(that, 0x1168);
+	bool ok = false;
+	if (gXeInitHwCaps) ok = reinterpret_cast<bool (*)(void *)>(gXeInitHwCaps)(that);
+	const uint32_t ss = getMember<uint32_t>(that, 0x1158);
+	if (getMember<uint32_t>(that, 0x114c) == 0) {   // SKU not 1/2, or symbol missing: SKU 2 formula on our count
+		const uint32_t dss = (ss >> 1) ? (ss >> 1) : 1;
+		getMember<uint32_t>(that, 0x114c) = dss;
+		getMember<uint32_t>(that, 0x1128) = 2 * dss;
+		getMember<uint32_t>(that, 0x1144) = dss < 6 ? (6 - dss) * 2 : 0;
+		getMember<uint32_t>(that, 0x1140) = 0x80 * dss;
+		getMember<uint32_t>(that, 0x1168) = getMember<uint32_t>(that, 0x115c) << 4;
+	}
+	IOLog("XeNG HWCAPS: 0x114c was 0 (sku %u ss %u): initHardwareCaps %s -> 0x114c=%u 0x1128=%u->%u 0x1144=%u->%u "
+		  "0x1140=0x%x->0x%x 0x1168=0x%x->0x%x\n", getMember<uint32_t>(that, 0x1120), ss,
+		  !gXeInitHwCaps ? "missing" : ok ? "ok" : "failed", getMember<uint32_t>(that, 0x114c),
+		  b1128, getMember<uint32_t>(that, 0x1128), b1144, getMember<uint32_t>(that, 0x1144),
+		  b1140, getMember<uint32_t>(that, 0x1140), b1168, getMember<uint32_t>(that, 0x1168));
+}
+
 void Gen11::getGPUInfo(void *that)
 {
 
@@ -6525,6 +6649,7 @@ void Gen11::getGPUInfo(void *that)
 		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU, gTopoL3);
 	IOLog("XeNG TOPO: subslices=%u eu/ss=%u eu=%u l3=%u%s\n", numSubSlices, maxEUPerSubSlice, totalEU, gTopoL3,
 	      (numSubSlices == 12 && gTopoL3 == 8) ? " (default)" : " (boot-arg)");
+	xeHwCapsFill(that);
 	// published later from a thread_call, not from inside getGPUInfo
 	gTopoAcc = that;
 	if (!gTopoTc) gTopoTc = thread_call_allocate(xeTopoPublish, nullptr);

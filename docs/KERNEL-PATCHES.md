@@ -35,6 +35,8 @@ recovery, image corruption and topology), and the patches that were tried and dr
 | XE-FMT | `performTransaction` reads the frame format from `IOSurface+0xa4`; Tahoe moved it (now `+0x80`) → plane programmed as YUV 4:2:2 (green screen) | force `'BGRA'` | — |
 | fixbootmode | WindowServer aborted (no display mode / timings at start) | inject detailed timings early | `-ngreenfixbootmode` is opt-in |
 | XE-BLR | Brightness topped out at ~50 % | keep the hardware PWM period, rescale duty (`ngreenblmax`) | `-ngreennoblr` |
+| XE-PORTGUARD (testing) | Black screen at WindowServer start: `___cxa_pure_virtual` panic at `AppleIntelPort::probePortState()+0x207` on other machines (#8, #22, #28; not the XPS) | if the port's `probePortMode` slot (vtable 0x190) is pure virtual, `setPortMode(0)` and return state 2 instead of calling it | `-ngreennoportguard` |
+| XE-AUXBL (testing, opt-in) | OLED panels ignore the PWM backlight (#15) | `ngreenauxbl=N` also sends the level over eDP AUX; with no PWM period in 0xC8254 the level is scaled against `ngreenblmax` or Apple's period; `-ngreenauxblforce` arms it without the panel's capability bits | off unless `ngreenauxbl=N` |
 | XE-BOOTHOLD (v4) | ~1 s of garbage at the first mode set: Apple re-declares the boot buffer X-tiled and WindowServer's first ring buffers are shown before they are drawn | from Apple's first tiled PLANE_CTL write, keep plane A and the backlight (`BLC_PWM_PCH_CTL1` bit 31) off until a PLANE_SURF address repeats (WindowServer's ring has wrapped) and at least `xebbms` ms (default 600) have passed; safety release after `xebbms`+900 ms. One-shot per boot. Also logs `XeNG BOOTDIAG` register snapshots | `-xenobb` |
 
 ## Command submission (host scheduler, no GuC)
