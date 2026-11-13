@@ -1390,6 +1390,43 @@ private:
 
 	static void *igAccelTaskWithOptions(void *that);  // V132: cache successful task allocations for null-task fallback
 	mach_vm_address_t oigAccelTaskWithOptions {};
+
+	// XE-TASK / XE-GUARD / XE-ALLOC / XE-DPGUARD
+	static void *createKernelGPUTask(void *that);
+	mach_vm_address_t ocreateKernelGPUTask {};
+
+	static void *wrapGetStampMemory(void *that, uint32_t *outSize);
+	mach_vm_address_t owrapGetStampMemory {};
+
+	static bool igAccelTaskInitWithOptions(void *that, void *accel);
+	mach_vm_address_t oigAccelTaskInitWithOptions {};
+
+	static bool wrapInitStampAndScratchPages(void *that);
+	mach_vm_address_t owrapInitStampAndScratchPages {};
+
+	static void wrapReleaseSemaphoreWaitBuffers(void *that, void *task);
+	mach_vm_address_t owrapReleaseSemaphoreWaitBuffers {};
+
+	static bool wrapInitSegments(void *that);
+	mach_vm_address_t owrapInitSegments {};
+
+	static void *igMemoryManagerNewAddressRangeAllocatorForTask(void *that, void *task, uint32_t type);
+	mach_vm_address_t oigMemoryManagerNewAddressRangeAllocatorForTask {};
+
+	static uint32_t wrapDisplayModeWillChange(void *that);
+	mach_vm_address_t owrapDisplayModeWillChange {};
+
+	static uint32_t wrapDisplayModeDidChange(void *that);
+	mach_vm_address_t owrapDisplayModeDidChange {};
+
+	static uint64_t wrapGetScratchGPUVirtualAddress(const void *that);
+	mach_vm_address_t owrapGetScratchGPUVirtualAddress {};
+
+	static uint64_t wrapGetStampGPUVirtualAddress(const void *that);
+	mach_vm_address_t owrapGetStampGPUVirtualAddress {};
+
+	static void *wrapGetStamps(const void *that);
+	mach_vm_address_t owrapGetStamps {};
 	
 	static unsigned long submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4);
 	mach_vm_address_t osubmitBlit {};
