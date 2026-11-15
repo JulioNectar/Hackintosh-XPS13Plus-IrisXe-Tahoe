@@ -11,7 +11,9 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 
 ## Custom Fork Patches (NootedGreen)
 
-This fork adds the following patches to `src/NootedGreen/` (also exported as [patches/working-kext-fixes.diff](patches/working-kext-fixes.diff) and prebuilt in `EFI/OC/Kexts/NootedGreen.kext`):
+Patched using **Antigravity** for **Acer (13th Gen Intel Core i5-13420H, Raptor Lake-H)** with **Intel Iris Xe Graphics** (**48 EUs** / `ngreen-eu=48`, **6 L3 banks** / `ngreen-l3=6`, spoofed to Tiger Lake `0x9a49`).
+
+Merge / patch path: extracted missing hooks and binary patches from the working `NootedGreen.kext` into `src/NootedGreen/kern_gen11.hpp` and `src/NootedGreen/kern_gen11.cpp`, exported [patches/working-kext-fixes.diff](patches/working-kext-fixes.diff), and rebuilt `EFI/OC/Kexts/NootedGreen.kext` with `build-nootedgreen.sh`:
 
 - **`XE-STOLEN`**: Clamps `FBMemMgr_Init` `fStolenMemorySize` to 64 MB (`0x04000000`) in `AppleIntelTGLGraphicsFramebuffer`.
 - **`XE-ALLOC`** (`wrapInitSegments`, `igMemoryManagerNewAddressRangeAllocatorForTask`): Validates and repairs invalid segment 0 (`+0xa0..+0xb8`) and segment 1 (`+0xc0..+0xd8`) bounds.
