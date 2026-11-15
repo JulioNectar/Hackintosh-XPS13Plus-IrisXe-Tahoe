@@ -1783,7 +1783,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
-			{
+			if (checkKernelArgument("-ngreenstolen64")) {
 				// XE-STOLEN: clamp FBMemMgr_Init fStolenMemorySize to 64MB (0x04000000)
 				static const uint8_t f_stolen[] = {0xc1, 0xe0, 0x11, 0x25, 0x00, 0x00, 0x00, 0xfe};
 				static const uint8_t r_stolen[] = {0xb8, 0x00, 0x00, 0x00, 0x04, 0x90, 0x90, 0x90};
@@ -7068,8 +7068,16 @@ void Gen11::wrapReleaseSemaphoreWaitBuffers(void *that, void *task)
 
 bool Gen11::wrapInitSegments(void *that)
 {
-	FunctionCast(wrapInitSegments, callback->owrapInitSegments)(that);
+	bool ret = FunctionCast(wrapInitSegments, callback->owrapInitSegments)(that);
 	if (that) {
+		uint64_t seg0StartCur = getMember<uint64_t>(that, 0xb0);
+		uint64_t seg0SizeCur  = getMember<uint64_t>(that, 0xb8);
+		uint64_t seg1SizeCur  = getMember<uint64_t>(that, 0xc8);
+		bool seg0Valid = (seg0SizeCur >= 0x1000000ULL && seg0SizeCur <= 0x40000000ULL && seg0StartCur < 0x10000000ULL);
+		bool seg1Valid = (seg1SizeCur >= 0x1000000ULL && seg1SizeCur <= 0x100000000ULL);
+		if (ret && seg0Valid && seg1Valid) {
+			return ret;
+		}
 		void *fbMemMgr = getMember<void *>(that, 0x70);
 		uint64_t aperLen = 0x10000000ULL;
 		if (fbMemMgr) {

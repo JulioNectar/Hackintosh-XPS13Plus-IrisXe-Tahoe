@@ -15,8 +15,8 @@ Patched using **Antigravity** for **Acer (13th Gen Intel Core i5-13420H, Raptor 
 
 Merge / patch path: extracted missing hooks and binary patches from the working `NootedGreen.kext` into `src/NootedGreen/kern_gen11.hpp` and `src/NootedGreen/kern_gen11.cpp`, exported [patches/working-kext-fixes.diff](patches/working-kext-fixes.diff), and rebuilt `EFI/OC/Kexts/NootedGreen.kext` with `build-nootedgreen.sh`:
 
-- **`XE-STOLEN`**: Clamps `FBMemMgr_Init` `fStolenMemorySize` to 64 MB (`0x04000000`) in `AppleIntelTGLGraphicsFramebuffer`.
-- **`XE-ALLOC`** (`wrapInitSegments`, `igMemoryManagerNewAddressRangeAllocatorForTask`): Validates and repairs invalid segment 0 (`+0xa0..+0xb8`) and segment 1 (`+0xc0..+0xd8`) bounds.
+- **`XE-STOLEN`** (opt-in via `-ngreenstolen64` boot-arg): Clamps `FBMemMgr_Init` `fStolenMemorySize` to 64 MB (`0x04000000`) in `AppleIntelTGLGraphicsFramebuffer` without affecting machines with different BIOS DVMT settings.
+- **`XE-ALLOC`** (`wrapInitSegments`, `igMemoryManagerNewAddressRangeAllocatorForTask`): Only repairs segment 0 (`+0xa0..+0xb8`) and segment 1 (`+0xc0..+0xd8`) when Apple's `initSegments` fails or produces out-of-bounds values; valid layouts pass through untouched.
 - **`XE-TASK` & `XE-GUARD`** (`createKernelGPUTask`, `igAccelTaskInitWithOptions`, `wrapInitStampAndScratchPages`, `wrapGetStampMemory`, `wrapReleaseSemaphoreWaitBuffers`, `wrapGetScratchGPUVirtualAddress`, `wrapGetStampGPUVirtualAddress`, `wrapGetStamps`, plus `accel+0x150` fallback in `deviceStart` and `igAccelTaskWithOptions`): Guards against null `IGAccelTask`, null `accel+0x150`, null `+0x280`/`+0x288` stamp/scratch pointers, and null scheduler calls.
 - **`XE-DPGUARD`** (`wrapDisplayModeWillChange`, `wrapDisplayModeDidChange`): Skips display mode-change callbacks when the pipe, controller, workloop, or memory manager is uninitialized.
 - **`XE-BLR`**: Logs `XE-BLR: initialized blr=%d blmax=%d` in `xeFixFilterWrite`.
