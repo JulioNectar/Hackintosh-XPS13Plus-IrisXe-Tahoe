@@ -9,6 +9,29 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 > see [CHANGELOG.md](CHANGELOG.md) for what changed and what is still being tested, and the
 > [releases](../../releases) for the stable points.
 
+## Custom Fork Patches (NootedGreen)
+
+Patched using **Antigravity** for **Acer (13th Gen Intel Core i5-13420H, Raptor Lake-H)** with **Intel Iris Xe Graphics** (**48 EUs** / `ngreen-eu=48`, **6 L3 banks** / `ngreen-l3=6`, spoofed to Tiger Lake `0x9a49`).
+
+Merge / patch path: extracted missing hooks and binary patches from the working `NootedGreen.kext` into `src/NootedGreen/kern_gen11.hpp` and `src/NootedGreen/kern_gen11.cpp`, exported [patches/working-kext-fixes.diff](patches/working-kext-fixes.diff), and rebuilt `EFI/OC/Kexts/NootedGreen.kext` with `build-nootedgreen.sh`:
+
+- **`XE-STOLEN`** (opt-in via `-ngreenstolen64` boot-arg): Clamps `FBMemMgr_Init` `fStolenMemorySize` to 64 MB (`0x04000000`) in `AppleIntelTGLGraphicsFramebuffer` without affecting machines with different BIOS DVMT settings.
+- **`XE-ALLOC`** (`wrapInitSegments`, `igMemoryManagerNewAddressRangeAllocatorForTask`): Only repairs segment 0 (`+0xa0..+0xb8`) and segment 1 (`+0xc0..+0xd8`) when Apple's `initSegments` fails or produces out-of-bounds values; valid layouts pass through untouched.
+- **`XE-TASK` & `XE-GUARD`** (`createKernelGPUTask`, `igAccelTaskInitWithOptions`, `wrapInitStampAndScratchPages`, `wrapGetStampMemory`, `wrapReleaseSemaphoreWaitBuffers`, `wrapGetScratchGPUVirtualAddress`, `wrapGetStampGPUVirtualAddress`, `wrapGetStamps`, plus `accel+0x150` fallback in `deviceStart` and `igAccelTaskWithOptions`): Guards against null `IGAccelTask`, null `accel+0x150`, null `+0x280`/`+0x288` stamp/scratch pointers, and null scheduler calls.
+- **`XE-DPGUARD`** (`wrapDisplayModeWillChange`, `wrapDisplayModeDidChange`): Skips display mode-change callbacks when the pipe, controller, workloop, or memory manager is uninitialized.
+- **`XE-BLR`**: Logs `XE-BLR: initialized blr=%d blmax=%d` in `xeFixFilterWrite`.
+
+### How to use
+
+1. **Prebuilt kext:** Back up your current `NootedGreen.kext` (or test on a bootable USB EFI first), then copy `EFI/OC/Kexts/NootedGreen.kext` from this repo into your `EFI/OC/Kexts/` (no `config.plist` changes needed; add `-ngreennoportguard` to `boot-args` if you hit a black screen from `XE-PORTGUARD`).
+2. **Rebuild from source:**
+   ```sh
+   git clone https://github.com/youzonshiva008-alt/Hackintosh-XPS13Plus-IrisXe-Tahoe.git
+   cd Hackintosh-XPS13Plus-IrisXe-Tahoe
+   zsh build-nootedgreen.sh
+   ```
+   Copy `build/NootedGreen.kext` into your `EFI/OC/Kexts/`.
+
 ## New: full CPU turbo and lower idle power (`-ngreenpm`, 26 Oct)
 
 macOS power management (XCPM) predates Intel's hybrid CPUs, and on 12th/13th-gen laptops it holds the CPU back:

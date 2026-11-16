@@ -1783,6 +1783,17 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
+			if (checkKernelArgument("-ngreenstolen64")) {
+				// XE-STOLEN: clamp FBMemMgr_Init fStolenMemorySize to 64MB (0x04000000)
+				static const uint8_t f_stolen[] = {0xc1, 0xe0, 0x11, 0x25, 0x00, 0x00, 0x00, 0xfe};
+				static const uint8_t r_stolen[] = {0xb8, 0x00, 0x00, 0x00, 0x04, 0x90, 0x90, 0x90};
+				LookupPatchPlus const stolenPatch[] = {
+					{activeKext, f_stolen, r_stolen, arrsize(f_stolen), 1},
+				};
+				if (!LookupPatchPlus::applyAll(patcher, stolenPatch, address, size)) {
+					SYSLOG("ngreen", "XE-STOLEN: FBMemMgr_Init pattern not found on this FB build");
+				}
+			}
 			applyFixBootMode(patcher, activeKext, address, size);
 			if (enableTcon) {
 				LookupPatchPlus const tconPatches[] = {
@@ -1981,6 +1992,19 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 // V132: Hook task producers so submitBlit never sees a null IGAccelTask on spoofed RPL.
 			 {"__ZN16IntelAccelerator17createUserGPUTaskEv", createUserGPUTask, this->ocreateUserGPUTask},
 			 {"__ZN11IGAccelTask11withOptionsEP16IntelAccelerator", igAccelTaskWithOptions, this->oigAccelTaskWithOptions},
+			 // XE-TASK / XE-GUARD / XE-ALLOC / XE-DPGUARD
+			 {"__ZN16IntelAccelerator19createKernelGPUTaskEv", createKernelGPUTask, this->ocreateKernelGPUTask},
+			 {"__ZN16IntelAccelerator14getStampMemoryEPj", wrapGetStampMemory, this->owrapGetStampMemory},
+			 {"__ZN11IGAccelTask15initWithOptionsEP16IntelAccelerator", igAccelTaskInitWithOptions, this->oigAccelTaskInitWithOptions},
+			 {"__ZN11IGAccelTask24initStampAndScratchPagesEv", wrapInitStampAndScratchPages, this->owrapInitStampAndScratchPages},
+			 {"__ZN11IGScheduler27releaseSemaphoreWaitBuffersEP11IGAccelTask", wrapReleaseSemaphoreWaitBuffers, this->owrapReleaseSemaphoreWaitBuffers},
+			 {"__ZN15IGMemoryManager12initSegmentsEv", wrapInitSegments, this->owrapInitSegments},
+			 {"__ZN15IGMemoryManager31newAddressRangeAllocatorForTaskEP11IGAccelTaskj", igMemoryManagerNewAddressRangeAllocatorForTask, this->oigMemoryManagerNewAddressRangeAllocatorForTask},
+			 {"__ZN18IGAccelDisplayPipe21displayModeWillChangeEv", wrapDisplayModeWillChange, this->owrapDisplayModeWillChange},
+			 {"__ZN18IGAccelDisplayPipe20displayModeDidChangeEv", wrapDisplayModeDidChange, this->owrapDisplayModeDidChange},
+			 {"__ZNK11IGAccelTask27getScratchGPUVirtualAddressEv", wrapGetScratchGPUVirtualAddress, this->owrapGetScratchGPUVirtualAddress},
+			 {"__ZNK11IGAccelTask25getStampGPUVirtualAddressEv", wrapGetStampGPUVirtualAddress, this->owrapGetStampGPUVirtualAddress},
+			 {"__ZNK11IGAccelTask9getStampsEv", wrapGetStamps, this->owrapGetStamps},
 
 			 // V36: Hook readAndClearInterrupts to initialize Gen11 multi-engine GT interrupts.
 			 // Without this, RCS/BCS user interrupts and context-switch notifications may not
@@ -4045,7 +4069,11 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		uint32_t r = (uint32_t)(reg & 0xFFFFF);
 		if (r == 0xC8254 || r == 0xC8258) {
 			static int blr = -1, blmax = 0;
-			if (blr < 0) { blr = checkKernelArgument("-ngreennoblr") ? 0 : 1; PE_parse_boot_argn("ngreenblmax", &blmax, sizeof(blmax)); }
+			if (blr < 0) {
+				blr = checkKernelArgument("-ngreennoblr") ? 0 : 1;
+				PE_parse_boot_argn("ngreenblmax", &blmax, sizeof(blmax));
+				SYSLOG("ngreen", "XE-BLR: initialized blr=%d blmax=%d", blr, blmax);
+			}
 			if (!gBlHwFreq && NGreen::callback) gBlHwFreq = NGreen::callback->readReg32(0xC8254);
 			if (r == 0xC8254) {
 				gBlFreqWrites++;
@@ -6508,6 +6536,13 @@ unsigned long Gen11::start(void *that,void  *param_1)
 
 uint8_t Gen11::deviceStart(void *that)
 {
+	if (that && callback->v132CachedTask) {
+		void *accel = getMember<void *>(that, 0x108);
+		if (accel && !getMember<void *>(accel, 0x150)) {
+			*reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(accel) + 0x150) = callback->v132CachedTask;
+			SYSLOG("ngreen", "XE-GUARD: deviceStart restored accel->0x150 from v132CachedTask=%p", callback->v132CachedTask);
+		}
+	}
 	// V111: Force IGAccelDevice::deviceStart to succeed on spoofed RPL platform.
 	// The original checks encodeFailureStack[1] which is set when BCS ring fails to
 	// start. On RPL hardware with TGL driver, BCS init fails (RPL uses different
@@ -6929,6 +6964,9 @@ void *Gen11::igAccelTaskWithOptions(void *that)
 
 	if (task) {
 		callback->v132CachedTask = task;
+		if (that && !getMember<void *>(that, 0x150)) {
+			*reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(that) + 0x150) = task;
+		}
 		ensureTaskContext(task, "withOptions");
 		DBGLOG("ngreen", "V132: IGAccelTask::withOptions created task=%p", task);
 		return task;
@@ -6941,6 +6979,257 @@ void *Gen11::igAccelTaskWithOptions(void *that)
 	}
 
 	return nullptr;
+}
+
+void *Gen11::createKernelGPUTask(void *that)
+{
+	void *task = FunctionCast(createKernelGPUTask, callback->ocreateKernelGPUTask)(that);
+	if (!task)
+		task = callback->v132CachedTask;
+	if (that && task) {
+		*reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(that) + 0x150) = task;
+		callback->v132CachedTask = task;
+	}
+	SYSLOG("ngreen", "XE-TASK: createKernelGPUTask accel=%p -> task=%p (cached=%p)",
+		   that, task, callback->v132CachedTask);
+	return task;
+}
+
+void *Gen11::wrapGetStampMemory(void *that, uint32_t *outSize)
+{
+	if (outSize)
+		*outSize = 0;
+	if (!that) {
+		SYSLOG("ngreen", "XE-GUARD: getStampMemory called with NULL accel");
+		return nullptr;
+	}
+	void *task = getMember<void *>(that, 0x150);
+	if (!task) {
+		task = callback->v132CachedTask;
+		if (!task) {
+			SYSLOG("ngreen", "XE-GUARD: getStampMemory accel->0x150 and cachedTask are NULL, returning nullptr safely!");
+			return nullptr;
+		}
+		*reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(that) + 0x150) = task;
+		SYSLOG("ngreen", "XE-GUARD: getStampMemory restored accel->0x150 from v132CachedTask=%p", task);
+	}
+	void *stamps = getMember<void *>(task, 0x288);
+	if (!stamps) {
+		SYSLOG("ngreen", "XE-GUARD: kernelTask %p -> 0x288 is NULL, returning nullptr safely!", task);
+		return nullptr;
+	}
+	void *p1 = getMember<void *>(stamps, 0x30);
+	if (!p1) return nullptr;
+	void *p2 = getMember<void *>(p1, 0x18);
+	if (!p2) return nullptr;
+	void *desc = getMember<void *>(p2, 0xd0);
+	SYSLOG("ngreen", "XE-GUARD: getStampMemory SUCCESS returning descriptor=%p", desc);
+	return desc;
+}
+
+bool Gen11::igAccelTaskInitWithOptions(void *that, void *accel)
+{
+	if (that && accel) {
+		*reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(that) + 0x10) = accel;
+	}
+	bool ret = FunctionCast(igAccelTaskInitWithOptions, callback->oigAccelTaskInitWithOptions)(that, accel);
+	SYSLOG("ngreen", "XE-TASK: IGAccelTask::initWithOptions task=%p accel=%p -> %d", that, accel, (int)ret);
+	if (that && ret) {
+		callback->v132CachedTask = that;
+		if (accel && !getMember<void *>(accel, 0x150)) {
+			*reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(accel) + 0x150) = that;
+			SYSLOG("ngreen", "XE-TASK: populated accel->0x150 with task=%p", that);
+		}
+	}
+	return ret;
+}
+
+bool Gen11::wrapInitStampAndScratchPages(void *that)
+{
+	if (that) {
+		void *accel = getMember<void *>(that, 0x10);
+		if (accel && callback->v132CachedTask && !getMember<void *>(accel, 0x150)) {
+			*reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(accel) + 0x150) = callback->v132CachedTask;
+		}
+	}
+	bool ret = FunctionCast(wrapInitStampAndScratchPages, callback->owrapInitStampAndScratchPages)(that);
+	SYSLOG("ngreen", "XE-TASK: initStampAndScratchPages task=%p -> %d", that, (int)ret);
+	return ret;
+}
+
+void Gen11::wrapReleaseSemaphoreWaitBuffers(void *that, void *task)
+{
+	if (!that) {
+		SYSLOG("ngreen", "XE-GUARD: releaseSemaphoreWaitBuffers called with NULL scheduler, ignoring!");
+		return;
+	}
+	FunctionCast(wrapReleaseSemaphoreWaitBuffers, callback->owrapReleaseSemaphoreWaitBuffers)(that, task);
+}
+
+bool Gen11::wrapInitSegments(void *that)
+{
+	bool ret = FunctionCast(wrapInitSegments, callback->owrapInitSegments)(that);
+	if (that) {
+		uint64_t seg0StartCur = getMember<uint64_t>(that, 0xb0);
+		uint64_t seg0SizeCur  = getMember<uint64_t>(that, 0xb8);
+		uint64_t seg1SizeCur  = getMember<uint64_t>(that, 0xc8);
+		bool seg0Valid = (seg0SizeCur >= 0x1000000ULL && seg0SizeCur <= 0x40000000ULL && seg0StartCur < 0x10000000ULL);
+		bool seg1Valid = (seg1SizeCur >= 0x1000000ULL && seg1SizeCur <= 0x100000000ULL);
+		if (ret && seg0Valid && seg1Valid) {
+			return ret;
+		}
+		void *fbMemMgr = getMember<void *>(that, 0x70);
+		uint64_t aperLen = 0x10000000ULL;
+		if (fbMemMgr) {
+			void **vtbl = getMember<void **>(fbMemMgr, 0x0);
+			if (vtbl) {
+				auto fn = reinterpret_cast<uint64_t (*)(void *)>(vtbl[0x1c8 / sizeof(void *)]);
+				if (fn) {
+					uint64_t len = fn(fbMemMgr);
+					if (len >= 0x4000000ULL && len <= 0x40000000ULL)
+						aperLen = len;
+				}
+			}
+		}
+		uint64_t fbReserved = getMember<uint64_t>(that, 0x38);
+		uint64_t seg0Start = (fbReserved + 0xfffULL) & ~0xfffULL;
+		if (fbReserved >= aperLen || fbReserved < 0x4000000ULL)
+			seg0Start = 0x04200000ULL;
+		uint64_t effectiveAper = (aperLen > seg0Start) ? aperLen : 0x10000000ULL;
+		uint64_t seg0Size = effectiveAper - seg0Start;
+		auto *base = reinterpret_cast<uint8_t *>(that);
+		*reinterpret_cast<uint64_t *>(base + 0xa0) = 0;
+		*reinterpret_cast<uint64_t *>(base + 0xa8) = seg0Start;
+		*reinterpret_cast<uint64_t *>(base + 0xb0) = seg0Start;
+		*reinterpret_cast<uint64_t *>(base + 0xb8) = seg0Size;
+		*reinterpret_cast<uint64_t *>(base + 0xc0) = 0x40000000ULL;
+		*reinterpret_cast<uint64_t *>(base + 0xc8) = 0xbe000000ULL;
+		*reinterpret_cast<uint64_t *>(base + 0xd0) = 0x40000000ULL;
+		*reinterpret_cast<uint64_t *>(base + 0xd8) = 0xffffffffc0000000ULL;
+		SYSLOG("ngreen", "XE-ALLOC: initSegments aperLen=0x%llx fbReserved=0x%llx seg0Start=0x%llx seg0Size=0x%llx",
+			   aperLen, fbReserved, seg0Start, seg0Size);
+	}
+	return true;
+}
+
+void *Gen11::igMemoryManagerNewAddressRangeAllocatorForTask(void *that, void *task, uint32_t type)
+{
+	if (that) {
+		auto *base = reinterpret_cast<uint8_t *>(that);
+		if (type == 0) {
+			uint64_t seg0Size = getMember<uint64_t>(that, 0xb8);
+			if (seg0Size < 0x1000000ULL || seg0Size > 0x40000000ULL) {
+				uint64_t seg0Start = getMember<uint64_t>(that, 0xb0);
+				if (seg0Start < 0x04000000ULL || seg0Start >= 0x10000000ULL)
+					seg0Start = 0x04200000ULL;
+				uint64_t fixedSize = 0x10000000ULL - seg0Start;
+				SYSLOG("ngreen", "XE-ALLOC: fixing invalid seg0Size=0x%llx -> seg0Start=0x%llx seg0Size=0x%llx",
+					   seg0Size, seg0Start, fixedSize);
+				*reinterpret_cast<uint64_t *>(base + 0xb0) = seg0Start;
+				*reinterpret_cast<uint64_t *>(base + 0xb8) = fixedSize;
+			}
+		} else if (type == 1) {
+			uint64_t seg1Size = getMember<uint64_t>(that, 0xc8);
+			if (seg1Size < 0x1000000ULL || seg1Size > 0x100000000ULL) {
+				SYSLOG("ngreen", "XE-ALLOC: fixing invalid seg1Size=0x%llx", seg1Size);
+				*reinterpret_cast<uint64_t *>(base + 0xc0) = 0x40000000ULL;
+				*reinterpret_cast<uint64_t *>(base + 0xc8) = 0xbe000000ULL;
+				*reinterpret_cast<uint64_t *>(base + 0xd0) = 0x40000000ULL;
+				*reinterpret_cast<uint64_t *>(base + 0xd8) = 0xffffffffc0000000ULL;
+			}
+		}
+	}
+	void *alloc = FunctionCast(igMemoryManagerNewAddressRangeAllocatorForTask, callback->oigMemoryManagerNewAddressRangeAllocatorForTask)(that, task, type);
+	SYSLOG("ngreen", "XE-ALLOC: newAddressRangeAllocatorForTask mm=%p task=%p type=%u -> alloc=%p", that, task, type, alloc);
+	return alloc;
+}
+
+uint32_t Gen11::wrapDisplayModeWillChange(void *that)
+{
+	if (!that) {
+		SYSLOG("ngreen", "XE-DPGUARD: displayModeWillChange called with NULL pipe");
+		return 0;
+	}
+	void *accel = getMember<void *>(that, 0x88);
+	void *fb = getMember<void *>(that, 0x98);
+	uint32_t idx = getMember<uint32_t>(that, 0x284);
+	void *fPriv = fb ? getMember<void *>(fb, 0x1c8) : nullptr;
+	void *ctrl = fPriv ? getMember<void *>(fPriv, 0x0) : nullptr;
+	void *wl = ctrl ? getMember<void *>(ctrl, 0x120) : nullptr;
+	if (!accel || !wl) {
+		SYSLOG("ngreen", "XE-DPGUARD: displayModeWillChange skipped uninitialized pipe=%p idx=%u accel=%p fb=%p fPriv=%p ctrl=%p wl=%p",
+			   that, idx, accel, fb, fPriv, ctrl, wl);
+		return 0;
+	}
+	return FunctionCast(wrapDisplayModeWillChange, callback->owrapDisplayModeWillChange)(that);
+}
+
+uint32_t Gen11::wrapDisplayModeDidChange(void *that)
+{
+	if (!that) {
+		SYSLOG("ngreen", "XE-DPGUARD: displayModeDidChange called with NULL pipe");
+		return 0;
+	}
+	void *accel = getMember<void *>(that, 0x88);
+	void *fb = getMember<void *>(that, 0x98);
+	uint32_t idx = getMember<uint32_t>(that, 0x284);
+	void *fPriv = fb ? getMember<void *>(fb, 0x1c8) : nullptr;
+	void *ctrl = fPriv ? getMember<void *>(fPriv, 0x0) : nullptr;
+	void *wl = ctrl ? getMember<void *>(ctrl, 0x120) : nullptr;
+	void *memMgr = accel ? getMember<void *>(accel, 0x1260) : nullptr;
+	if (!accel || !fb || !fPriv || !ctrl || !wl || !memMgr) {
+		SYSLOG("ngreen", "XE-DPGUARD: displayModeDidChange skipped uninitialized pipe=%p idx=%u accel=%p fb=%p fPriv=%p ctrl=%p wl=%p memMgr=%p",
+			   that, idx, accel, fb, fPriv, ctrl, wl, memMgr);
+		return 0;
+	}
+	if (!getMember<void *>(accel, 0x150) && callback->v132CachedTask) {
+		*reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(accel) + 0x150) = callback->v132CachedTask;
+	}
+	uint32_t ret = FunctionCast(wrapDisplayModeDidChange, callback->owrapDisplayModeDidChange)(that);
+	SYSLOG("ngreen", "XE-DPGUARD: displayModeDidChange pipe=%p idx=%u fb=%p -> ret=%d", that, idx, fb, (int)ret);
+	return ret;
+}
+
+uint64_t Gen11::wrapGetScratchGPUVirtualAddress(const void *that)
+{
+	void *task = const_cast<void *>(that ? that : callback->v132CachedTask);
+	if (!task) {
+		SYSLOG("ngreen", "XE-GUARD: getScratchGPUVirtualAddress called with NULL task and no cachedTask");
+		return 0;
+	}
+	if (!getMember<void *>(task, 0x280)) {
+		SYSLOG("ngreen", "XE-GUARD: getScratchGPUVirtualAddress task=%p -> +0x280 is NULL", task);
+		return 0;
+	}
+	return FunctionCast(wrapGetScratchGPUVirtualAddress, callback->owrapGetScratchGPUVirtualAddress)(task);
+}
+
+uint64_t Gen11::wrapGetStampGPUVirtualAddress(const void *that)
+{
+	void *task = const_cast<void *>(that ? that : callback->v132CachedTask);
+	if (!task) {
+		SYSLOG("ngreen", "XE-GUARD: getStampGPUVirtualAddress called with NULL task and no cachedTask");
+		return 0;
+	}
+	if (!getMember<void *>(task, 0x288)) {
+		SYSLOG("ngreen", "XE-GUARD: getStampGPUVirtualAddress task=%p -> +0x288 is NULL", task);
+		return 0;
+	}
+	return FunctionCast(wrapGetStampGPUVirtualAddress, callback->owrapGetStampGPUVirtualAddress)(task);
+}
+
+void *Gen11::wrapGetStamps(const void *that)
+{
+	void *task = const_cast<void *>(that ? that : callback->v132CachedTask);
+	if (!task) {
+		SYSLOG("ngreen", "XE-GUARD: getStamps called with NULL task and no cachedTask");
+		return nullptr;
+	}
+	if (!getMember<void *>(task, 0x288)) {
+		SYSLOG("ngreen", "XE-GUARD: getStamps task=%p -> +0x288 is NULL", task);
+		return nullptr;
+	}
+	return FunctionCast(wrapGetStamps, callback->owrapGetStamps)(task);
 }
 
 void * Gen11::getBlit3DContext(void *that,bool param_1)
